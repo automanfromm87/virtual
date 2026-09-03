@@ -40,7 +40,11 @@ enum class Format : std::uint8_t {
 };
 enum class Cull : std::uint8_t { None, Back, Front };
 enum class Winding : std::uint8_t { Clockwise, CounterClockwise };
-enum class Compare : std::uint8_t { Never, Less, Greater, Always };
+// GreaterEqual is not a rounding-out of the enum -- it is the only compare a
+// reversed-Z SKY can use. The sky is drawn at the far plane, which is depth 0,
+// against a buffer cleared to exactly 0, and `0 > 0` is false: with Greater the
+// sky is discarded on precisely the pixels it exists to fill.
+enum class Compare : std::uint8_t { Never, Less, Greater, GreaterEqual, Always };
 enum class Filter : std::uint8_t { Nearest, Linear };
 enum class Wrap : std::uint8_t { Clamp, Repeat };
 

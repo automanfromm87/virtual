@@ -349,7 +349,19 @@ vertex SkyVertexOut vs_sky(uint vid [[vertex_id]],
     // the eye is not on any of them.
     const float4 near_h = p.invViewProj * float4(pos[vid], 1.0, 1.0);
     const float4 far_h = p.invViewProj * float4(pos[vid], 0.0, 1.0);
-    o.dir = far_h.xyz / far_h.w - near_h.xyz / near_h.w;
+    // CROSS-MULTIPLIED, not two perspective divides. The obvious form is
+    //     far.xyz / far.w - near.xyz / near.w
+    // and under this projection far.w is EXACTLY ZERO for every pixel of every
+    // camera: reversed-Z with an infinite far plane puts the far plane at
+    // w = 0, which is the definition of a point at infinity. That divide is
+    // 0/0 and +inf/-inf, the varying interpolates to NaN, and a cube sampled at
+    // NaN returns one arbitrary texel -- a sky of a single flat colour.
+    //
+    // Multiplying through by far.w * near.w clears both divides. The result is
+    // the same vector scaled by a positive number, and the fragment normalises
+    // anyway, so the scale is free. Still correct under an orthographic
+    // projection, where both w are finite and neither term drops out.
+    o.dir = far_h.xyz * near_h.w - near_h.xyz * far_h.w;
     return o;
 }
 

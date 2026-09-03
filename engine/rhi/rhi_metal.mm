@@ -34,6 +34,7 @@ MTLCompareFunction ToMTL(Compare c) {
         case Compare::Never: return MTLCompareFunctionNever;
         case Compare::Less: return MTLCompareFunctionLess;
         case Compare::Greater: return MTLCompareFunctionGreater;
+        case Compare::GreaterEqual: return MTLCompareFunctionGreaterEqual;
         case Compare::Always: return MTLCompareFunctionAlways;
     }
     return MTLCompareFunctionAlways;

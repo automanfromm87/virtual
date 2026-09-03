@@ -503,6 +503,100 @@ int main() {
         Check(colours_ok, "and reflects the environment's colour, not another one");
     }
 
+    {
+        // THE SKY, ON SCREEN.
+        //
+        // Everything above reads the PROBE. That is the right way to test the
+        // bake, and it is exactly why the sky could be invisible for the whole
+        // life of this system without a single check going red: two separate
+        // faults sat between a correct probe and the frame.
+        //
+        //   1. The sky is drawn AT the far plane -- depth 0 under reversed-Z --
+        //      into a buffer cleared to 0, and the pipeline compared Greater.
+        //      0 > 0 is false, so it was discarded on every pixel it existed to
+        //      fill. The background stayed at the clear colour.
+        //   2. Environment::Create takes the format of the target DrawSky will
+        //      render into. Handed the 8-bit one instead of the half-float
+        //      scene target, Metal builds the pipeline anyway and writes 8-bit
+        //      output into a 16-bit attachment: the sky came back with green
+        //      and blue at exactly zero.
+        //
+        // So this asserts the two things a probe readback cannot: that the
+        // background is NOT the clear colour, and that its channels are ordered
+        // the way a daytime sky's are.
+        std::printf("\nthe sky reaches the frame\n");
+        constexpr int kW = 160, kH = 120;
+        const auto kFmt = eng::rhi::Format::RGBA8Unorm;
+        auto r = eng::Renderer::Create(*dev, kFmt, error, 1);
+        auto probe = eng::Environment::Create(*dev, error, 128,
+                                              eng::Renderer::kSceneFormat, 1);
+        if (!r || !probe) { std::fprintf(stderr, "FAIL: %s\n", error.c_str()); return 1; }
+
+        eng::SkyConfig sky;
+        sky.sun_direction = eng::Vec3{0.2f, 0.5f, 0.4f};
+        eng::Camera cam;
+        cam.eye = eng::Vec3{0.0f, 1.0f, 0.0f};
+        cam.target = eng::Vec3{0.0f, 1.2f, -1.0f};  // a little above the horizon
+
+        const eng::rhi::TextureId hdr =
+            dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
+        const eng::rhi::TextureId out =
+            dev->CreateRenderTarget(kW, kH, kFmt, /*cpu_readable=*/true);
+        const eng::rhi::TextureId dep = dev->CreateDepthTarget(kW, kH);
+
+        dev->BeginFrame();
+        { auto e = dev->BeginCompute({}); probe->BakeSky(e, sky); dev->EndCompute(); }
+        {
+            eng::rhi::PassDesc pd;
+            pd.color = hdr;
+            pd.depth = dep;
+            // The clear that made the bug: nothing is drawn, so every pixel
+            // keeps this depth, and the sky has to pass the test against it.
+            pd.clear_depth = 0.0f;
+            auto e = dev->BeginPass(pd);
+            probe->DrawSky(e, cam, kW, kH);
+            dev->EndPass();
+        }
+        {
+            eng::rhi::PassDesc pd;
+            pd.color = out;
+            auto e = dev->BeginPass(pd);
+            r->DrawComposite(e, hdr, {}, {}, 0.0f, /*vignette=*/0.0f);
+            dev->EndPass();
+        }
+        if (!dev->CommitAndWait(error)) {
+            std::fprintf(stderr, "FAIL: submit: %s\n", error.c_str());
+            return 1;
+        }
+        std::vector<std::uint8_t> px(std::size_t(kW) * kH * 4);
+        if (!dev->ReadPixels(out, kW, kH, px)) {
+            std::fprintf(stderr, "FAIL: readback\n");
+            return 1;
+        }
+        for (int band = 0; band < 4; ++band) {
+            double s3[3] = {};
+            int cnt = 0;
+            for (int y = band * kH / 4; y < (band + 1) * kH / 4; ++y)
+                for (int x = 0; x < kW; ++x, ++cnt)
+                    for (int c = 0; c < 3; ++c)
+                        s3[c] += px[(std::size_t(y) * kW + x) * 4 + c];
+            std::printf("    band %d rgb %.1f %.1f %.1f\n", band, s3[0]/cnt, s3[1]/cnt, s3[2]/cnt);
+        }
+        double sum[3] = {};
+        for (int i = 0; i < kW * kH; ++i)
+            for (int c = 0; c < 3; ++c) sum[c] += px[std::size_t(i) * 4 + c];
+        const double n = double(kW) * kH;
+        const double r_mean = sum[0] / n, g_mean = sum[1] / n, b_mean = sum[2] / n;
+        std::printf("    mean rgb %.1f %.1f %.1f\n", r_mean, g_mean, b_mean);
+
+        Check(r_mean + g_mean + b_mean > 60.0,
+              "the sky is drawn at all, not discarded by the depth test");
+        Check(g_mean > 4.0 && b_mean > 4.0,
+              "and every channel arrived, not just the red one");
+        Check(b_mean > r_mean * 1.15 && b_mean > g_mean,
+              "and it is blue, the way a daytime sky is");
+    }
+
     std::printf(g_failures == 0 ? "\nibl_test: all checks passed\n"
                                 : "\nibl_test: %d FAILED\n", g_failures);
     return g_failures == 0 ? 0 : 1;

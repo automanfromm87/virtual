@@ -216,7 +216,12 @@ std::unique_ptr<Environment> Environment::Create(rhi::Device& dev,
     // where nothing else was drawn -- which means it shades exactly the pixels
     // that need it and none of the ones already covered by geometry.
     pd.depth_write = false;
-    pd.depth_compare = rhi::Compare::Greater;
+    // GreaterEqual, not Greater. The sky sits AT the far plane -- depth 0 in
+    // reversed-Z -- and the depth buffer is cleared to 0, so a strict Greater
+    // fails on every untouched pixel and the sky never appears. It cost a
+    // rendered screenshot to notice, because every numeric test of this system
+    // reads the probe rather than the frame.
+    pd.depth_compare = rhi::Compare::GreaterEqual;
     im.sky_draw = dev.CreatePipeline(pd, error);
     if (!Valid(im.sky_draw)) return nullptr;
 

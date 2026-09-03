@@ -35,6 +35,22 @@ namespace eng::png {
 
 [[nodiscard]] Texture2D DecodeFile(const std::string& path, std::string& error);
 
+// Encodes 8-bit RGBA — `rgba` is width*height*4, top row first — into a PNG
+// byte stream.
+//
+// The DEFLATE stream is STORED blocks: the framing a zlib reader expects, with
+// no compression inside it. Writing a Huffman coder is a project of its own and
+// this exists for exactly one job — getting a rendered frame out of the GPU and
+// onto disk where a human can look at it. A screenshot 1.0004x the size of its
+// raw pixels costs nothing. A subtly wrong compressor costs an afternoon, and
+// the failure mode is a file that opens fine in one viewer and not another.
+[[nodiscard]] std::vector<std::uint8_t> Encode(std::span<const std::uint8_t> rgba,
+                                               int width, int height);
+
+[[nodiscard]] bool EncodeFile(const std::string& path,
+                              std::span<const std::uint8_t> rgba, int width,
+                              int height, std::string& error);
+
 // True if `bytes` starts with the PNG signature. Cheap enough to call before
 // deciding what a blob is.
 [[nodiscard]] bool IsPng(std::span<const std::uint8_t> bytes);

@@ -770,4 +770,109 @@ Texture2D DecodeFile(const std::string& path, std::string& error) {
     return Decode(bytes, error);
 }
 
+// ------------------------------------------------------------------ encode --
+
+namespace {
+
+void PutBE32(std::vector<std::uint8_t>& out, std::uint32_t v) {
+    out.push_back(std::uint8_t(v >> 24));
+    out.push_back(std::uint8_t(v >> 16));
+    out.push_back(std::uint8_t(v >> 8));
+    out.push_back(std::uint8_t(v));
+}
+
+// A PNG chunk is length, type, payload, then a CRC over TYPE AND PAYLOAD --
+// not over the length. Getting that boundary wrong produces a file every
+// decoder rejects, which at least fails loudly.
+void PutChunk(std::vector<std::uint8_t>& out, const char type[4],
+              std::span<const std::uint8_t> payload) {
+    PutBE32(out, std::uint32_t(payload.size()));
+    const std::size_t crc_start = out.size();
+    out.insert(out.end(), type, type + 4);
+    out.insert(out.end(), payload.begin(), payload.end());
+    PutBE32(out, Crc32({out.data() + crc_start, out.size() - crc_start}));
+}
+
+}  // namespace
+
+std::vector<std::uint8_t> Encode(std::span<const std::uint8_t> rgba, int width,
+                                 int height) {
+    if (width <= 0 || height <= 0 ||
+        rgba.size() < std::size_t(width) * std::size_t(height) * 4)
+        return {};
+
+    // Every scanline is prefixed with its filter type. 0 is "none" — the raw
+    // bytes. Filtering exists to make the following DEFLATE pass compress
+    // better, and there is no DEFLATE pass here, so it would be pure cost.
+    const std::size_t stride = std::size_t(width) * 4;
+    std::vector<std::uint8_t> raw;
+    raw.reserve((stride + 1) * std::size_t(height));
+    for (int y = 0; y < height; ++y) {
+        raw.push_back(0);
+        const std::uint8_t* row = rgba.data() + std::size_t(y) * stride;
+        raw.insert(raw.end(), row, row + stride);
+    }
+
+    // zlib wrapper. 0x78 0x01 is a 32 KB window with the "fastest" level, and
+    // 0x7801 % 31 == 0, which is the check the two header bytes have to satisfy.
+    std::vector<std::uint8_t> z{0x78, 0x01};
+    // Stored DEFLATE blocks. Each carries a 5-byte header — final flag plus
+    // BTYPE 00, then LEN and its ones-complement — and at most 65535 bytes,
+    // because LEN is 16 bits.
+    constexpr std::size_t kMaxBlock = 65535;
+    std::size_t pos = 0;
+    do {
+        const std::size_t n = std::min(kMaxBlock, raw.size() - pos);
+        const bool final_block = pos + n >= raw.size();
+        z.push_back(final_block ? 1 : 0);
+        z.push_back(std::uint8_t(n));
+        z.push_back(std::uint8_t(n >> 8));
+        z.push_back(std::uint8_t(~n));
+        z.push_back(std::uint8_t(~n >> 8));
+        z.insert(z.end(), raw.begin() + std::ptrdiff_t(pos),
+                 raw.begin() + std::ptrdiff_t(pos + n));
+        pos += n;
+    } while (pos < raw.size());  // do/while: a zero-byte image still needs one
+                                 // block carrying the final flag
+    PutBE32(z, Adler32(raw));
+
+    std::vector<std::uint8_t> out{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    std::vector<std::uint8_t> ihdr;
+    PutBE32(ihdr, std::uint32_t(width));
+    PutBE32(ihdr, std::uint32_t(height));
+    ihdr.push_back(8);  // bit depth
+    ihdr.push_back(6);  // colour type 6 = RGBA
+    ihdr.push_back(0);  // compression: DEFLATE, the only value PNG defines
+    ihdr.push_back(0);  // filter method
+    ihdr.push_back(0);  // not interlaced
+    PutChunk(out, "IHDR", ihdr);
+    PutChunk(out, "IDAT", z);
+    PutChunk(out, "IEND", {});
+    return out;
+}
+
+bool EncodeFile(const std::string& path, std::span<const std::uint8_t> rgba,
+                int width, int height, std::string& error) {
+    const std::vector<std::uint8_t> bytes = Encode(rgba, width, height);
+    if (bytes.empty()) {
+        error = "png: nothing to encode (bad size, or too few pixels for " +
+                std::to_string(width) + "x" + std::to_string(height) + ")";
+        return false;
+    }
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        error = "cannot open " + path + " for writing";
+        return false;
+    }
+    const std::size_t wrote = std::fwrite(bytes.data(), 1, bytes.size(), f);
+    // fclose can fail on its own: a buffered write may only reach the disk
+    // here, so a short write is not the only way to lose the file.
+    const bool closed = std::fclose(f) == 0;
+    if (wrote != bytes.size() || !closed) {
+        error = "short write to " + path;
+        return false;
+    }
+    return true;
+}
+
 }  // namespace eng::png

@@ -57,7 +57,15 @@ fragment float4 fs_ssao(SsaoOut in [[stage_in]],
     // Normal from the depth derivatives. Wrong across a silhouette, where the
     // derivative jumps between two surfaces — which is why the range check
     // below throws out samples that are implausibly far away.
-    const float3 N = normalize(cross(dfdx(P), dfdy(P)));
+    //
+    // dfdy FIRST. UV runs DOWN the screen while view-space Y runs up, so
+    // dfdy(P) is -Y_view and cross(dfdx, dfdy) = X x -Y = -Z: a normal pointing
+    // away from the camera. With it flipped, every sample in FRONT of the
+    // surface scores a negative cosine and is discarded, so a floor beside a
+    // ball collects no occlusion at all and the ball darkens itself instead.
+    // The buffer still looked plausible -- faint, grey, vaguely shaped like the
+    // geometry -- which is how it survived.
+    const float3 N = normalize(cross(dfdy(P), dfdx(P)));
 
     const float radius = u.ssao.w;
     const float2 texel = 1.0f / float2(depthMap.get_width(), depthMap.get_height());

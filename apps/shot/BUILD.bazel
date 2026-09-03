@@ -1,0 +1,18 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# One frame, offscreen, straight to a PNG. Not a test — it asserts nothing.
+# Its job is to make the output LOOKABLE, which is the only way to find the
+# faults that are not wrong numbers.
+cc_binary(
+    name = "shot",
+    srcs = ["main.cpp"],
+    deps = [
+        "//engine/asset:png",
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+    ],
+)

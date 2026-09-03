@@ -274,6 +274,66 @@ int main() {
         CHECK(out.size() <= 4);
     }
 
+    {
+        // ENCODE, round-tripped through our own decoder.
+        //
+        // Round-tripping through the thing that wrote it is a weak test on its
+        // own -- two matching bugs cancel. It is not weak here, because the
+        // decoder was written first, against fixtures produced by other
+        // encoders, and every one of those still passes above. So the decoder
+        // is pinned to the format by external evidence, and agreeing with it is
+        // evidence about the encoder.
+        std::printf("png encode\n");
+
+        // A gradient with a hard edge and a varying alpha: a solid fill would
+        // pass with the width and height transposed, and an opaque one would
+        // pass with the alpha channel dropped.
+        constexpr int kW = 61, kH = 37;  // both prime-ish and neither a
+                                         // multiple of 4, so a stride bug shows
+        std::vector<std::uint8_t> src(std::size_t(kW) * kH * 4);
+        for (int y = 0; y < kH; ++y)
+            for (int x = 0; x < kW; ++x) {
+                const std::size_t i = (std::size_t(y) * kW + x) * 4;
+                src[i + 0] = std::uint8_t(x * 4);
+                src[i + 1] = std::uint8_t(y * 7);
+                src[i + 2] = std::uint8_t(x > kW / 2 ? 240 : 12);
+                src[i + 3] = std::uint8_t(255 - y * 3);
+            }
+
+        const std::vector<std::uint8_t> encoded = png::Encode(src, kW, kH);
+        CHECK(!encoded.empty());
+        CHECK(png::IsPng(encoded));
+
+        std::string error;
+        const Texture2D back = png::Decode(encoded, error);
+        CHECK(error.empty());
+        CHECK(back.width == kW);
+        CHECK(back.height == kH);
+        CHECK(back.rgba == src);  // lossless: not "close", identical
+
+        // Bigger than one stored block. LEN is 16 bits, so anything over 65535
+        // bytes of raw scanline has to split, and a split written wrong gives a
+        // file that decodes the first 64 KB and then fails -- which a small
+        // fixture would never reach.
+        constexpr int kBigW = 200, kBigH = 200;  // 200*4+1 = 801 bytes a row,
+                                                 // 160200 total: three blocks
+        std::vector<std::uint8_t> big(std::size_t(kBigW) * kBigH * 4);
+        for (std::size_t i = 0; i < big.size(); ++i)
+            big[i] = std::uint8_t((i * 37 + i / 331) & 0xFF);
+        const std::vector<std::uint8_t> big_png = png::Encode(big, kBigW, kBigH);
+        CHECK(big_png.size() > 65535 * 2);
+        error.clear();
+        const Texture2D big_back = png::Decode(big_png, error);
+        CHECK(error.empty());
+        CHECK(big_back.width == kBigW && big_back.height == kBigH);
+        CHECK(big_back.rgba == big);
+
+        // Refused, rather than writing a header that promises pixels it does
+        // not have.
+        CHECK(png::Encode(src, 0, kH).empty());
+        CHECK(png::Encode(src, kW, kH + 1).empty());  // too few pixels supplied
+    }
+
     if (g_failures == 0) std::printf("png_test: all checks passed\n");
     return g_failures == 0 ? 0 : 1;
 }

@@ -316,7 +316,15 @@ struct Renderer::Impl {
     rhi::TextureId black;
     rhi::PipelineId bloom_bright;
     rhi::PipelineId bloom_blur;
+    // TWO samplers, and the split is not cosmetic. `sampler` wraps, which is
+    // what a tiling albedo map needs. Every FULLSCREEN pass wants the opposite:
+    // a separable blur, an SSAO kernel and a depth lookup all tap at an offset,
+    // and near the border that offset leaves the image -- with Repeat it comes
+    // back on the far side. A bright object at the top of the frame then bleeds
+    // a blurred copy of itself along the bottom, which is what this cost to
+    // find: it is invisible in a dark scene and unmistakable in a bright one.
     rhi::SamplerId sampler;
+    rhi::SamplerId clamp_sampler;
 
     // One uniform ring covering every frame slot. Writing slot N is safe only
     // because Device::BeginFrame blocks until the frame that last used slot N
@@ -750,8 +758,9 @@ std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
     const float kUnitExposure = 1.0f;
     r->impl_->unit_exposure = dev.CreateBuffer(&kUnitExposure, sizeof(float));
     r->impl_->sampler = dev.CreateSampler(rhi::Filter::Linear, rhi::Wrap::Repeat);
+    r->impl_->clamp_sampler = dev.CreateSampler(rhi::Filter::Linear, rhi::Wrap::Clamp);
     if (!Valid(r->impl_->white) || !Valid(r->impl_->black) ||
-        !Valid(r->impl_->sampler)) {
+        !Valid(r->impl_->sampler) || !Valid(r->impl_->clamp_sampler)) {
         error = "failed to create the default texture or sampler";
         return nullptr;
     }
@@ -1541,7 +1550,7 @@ void Renderer::DrawComposite(rhi::Encoder& enc, rhi::TextureId src,
     // The bloom slot needs SOMETHING bound. Black, not white: an absent bloom
     // has to add nothing, and the strength above is already zero.
     enc.SetFragmentTexture(Valid(bloom) ? bloom : impl_->black, 2);
-    enc.SetFragmentSampler(impl_->sampler, 0);
+    enc.SetFragmentSampler(impl_->clamp_sampler, 0);
     enc.Draw(3);  // one oversized triangle, generated from the vertex id
 }
 
@@ -1609,6 +1618,17 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
     enc.SetFragmentTexture(
         Valid(impl_->shadow_atlas) ? impl_->shadow_atlas : impl_->dummy_shadow, 3);
     enc.SetFragmentTexture(depth, 4);
+    // The WRAPPING sampler, deliberately, even though this is a fullscreen
+    // pass. Slot 0 serves double duty in both lighting paths: it filters the
+    // material maps AND the shadow map, and the forward path binds the wrapping
+    // one. Clamping only here makes the two disagree wherever a shadow lookup
+    // leaves the light's box -- 58 pixels of the gallery comparison, which is
+    // what caught it.
+    //
+    // The real fix is a shadow sampler of its own: a shadow map wants Clamp and
+    // a tiling albedo wants Repeat, and one slot cannot be both. That is a
+    // signature change in two shaders, so it is written down rather than
+    // smuggled in here.
     enc.SetFragmentSampler(impl_->sampler, 0);
     // The environment probe. All three may be null handles, which binds
     // nothing -- and nothing is exactly what the shader's is_null_texture
@@ -2129,7 +2149,7 @@ void Renderer::DrawRayShadows(rhi::Encoder& enc, const Scene& scene, int width,
     enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
     enc.SetFragmentTexture(depth, 0);
     enc.SetFragmentTexture(normals, 1);
-    enc.SetFragmentSampler(impl_->sampler, 0);
+    enc.SetFragmentSampler(impl_->clamp_sampler, 0);
     enc.SetFragmentAccel(impl_->scene_tlas, 4);
     enc.Draw(3);
 }
@@ -2147,7 +2167,7 @@ void Renderer::DrawBloomBright(rhi::Encoder& enc, rhi::TextureId src,
     enc.SetCull(rhi::Cull::None, rhi::Winding::CounterClockwise);
     enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
     enc.SetFragmentTexture(src, 0);
-    enc.SetFragmentSampler(impl_->sampler, 0);
+    enc.SetFragmentSampler(impl_->clamp_sampler, 0);
     enc.Draw(3);
 }
 
@@ -2164,7 +2184,7 @@ void Renderer::DrawBloomBlur(rhi::Encoder& enc, rhi::TextureId src,
     enc.SetCull(rhi::Cull::None, rhi::Winding::CounterClockwise);
     enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
     enc.SetFragmentTexture(src, 0);
-    enc.SetFragmentSampler(impl_->sampler, 0);
+    enc.SetFragmentSampler(impl_->clamp_sampler, 0);
     enc.Draw(3);
 }
 
@@ -2185,7 +2205,7 @@ void Renderer::DrawSsao(rhi::Encoder& enc, const Camera& cam, int width,
     enc.SetCull(rhi::Cull::None, rhi::Winding::CounterClockwise);
     enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
     enc.SetFragmentTexture(depth, 0);
-    enc.SetFragmentSampler(impl_->sampler, 0);
+    enc.SetFragmentSampler(impl_->clamp_sampler, 0);
     enc.Draw(3);
 }
 
