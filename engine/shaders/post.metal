@@ -439,3 +439,171 @@ fragment float4 fs_taa(PostOut in [[stage_in]],
     const float feedback = saturate(p.tune.w);
     return float4(mix(now, YCoCgToRgb(old), feedback), 1.0);
 }
+
+// -------------------------------------------------- screen-space reflections --
+//
+// WHAT IT ADDS OVER THE PROBE. An environment probe is captured from one point
+// and has no idea what is in the room: a floor reflects the sky rather than the
+// object standing on it, and a puddle shows no sign of the wall beside it.
+// Marching the depth buffer finds the actual pixels, so the reflection contains
+// the scene.
+//
+// WHAT IT CANNOT DO, and this is not a quality setting -- it is the shape of the
+// technique. A screen-space march can only find what is ON the screen. A
+// reflection of something behind the camera, off the side of the frame, or
+// hidden behind the object doing the reflecting has no pixels to find. So SSR is
+// always a LAYER over a probe, never a replacement: where the march fails it
+// fades out and the probe shows through, and the fade is most of the work.
+//
+// It also reflects the front surfaces only. The depth buffer records how far
+// away each pixel is and nothing about how THICK it is, so the march cannot tell
+// "the ray passed behind this object" from "the ray hit it". The thickness
+// constant below is the guess that stands in for that, and it is why a ray
+// grazing a thin railing sometimes attaches to it.
+
+struct SsrParams {
+    float4x4 viewProj;         // world -> clip, this frame
+    float4x4 invViewProj;
+    float4 eye;                // .xyz camera, .w near plane
+    float4 screen;             // .xy size, .zw 1/size
+    // .x max ray length in world units, .y thickness, .z stride in pixels,
+    // .w max roughness that still reflects
+    float4 march;
+    // .x step count, .y refine steps, .z intensity, .w edge fade width in uv
+    float4 tune;
+};
+
+fragment float4 fs_ssr(PostOut in [[stage_in]],
+                       texture2d<float> scene [[texture(0)]],
+                       depth2d<float> depth [[texture(1)]],
+                       texture2d<float> normal_metal [[texture(2)]],
+                       texture2d<float> albedo_rough [[texture(3)]],
+                       constant SsrParams& p [[buffer(0)]],
+                       sampler smp [[sampler(0)]]) {
+    const float d = depth.sample(smp, in.uv);
+    if (d <= 0.0) discard_fragment();  // nothing was drawn here
+
+    const float4 nm = normal_metal.sample(smp, in.uv);
+    // NORMALIZED, not decoded from 0..1. The G-buffer is half-float, so it
+    // stores the world normal directly with its signs intact -- there is no
+    // range compression to undo. Applying the usual `* 2 - 1` to a value that
+    // is already in -1..1 maps a normal of +Y to +Y doubled minus one, which is
+    // a different direction entirely, and every reflection ray points
+    // somewhere plausible and wrong.
+    const float3 n = normalize(nm.xyz);
+    const float metallic = nm.a;
+    const float roughness = albedo_rough.sample(smp, in.uv).a;
+
+    // ROUGH SURFACES DO NOT GET A SHARP REFLECTION, and a single mirror ray is
+    // the only kind this can produce. Rather than blur the result -- which
+    // needs another pass and a mip chain of the scene -- rough surfaces are
+    // faded out and left to the probe, which already has correctly prefiltered
+    // roughness. The cutoff is where the two stop being distinguishable.
+    const float max_rough = max(p.march.w, 1e-3);
+    const float rough_fade = 1.0 - smoothstep(max_rough * 0.5, max_rough, roughness);
+    if (rough_fade <= 0.0) discard_fragment();
+    const float3 world = WorldFromDepth(in.uv, d, p.invViewProj);
+    const float3 v = normalize(p.eye.xyz - world);
+    const float3 r = reflect(-v, n);
+
+    // A ray heading toward the camera cannot be traced forward on screen.
+    if (dot(r, v) > 0.98) discard_fragment();
+
+    const int steps = int(max(p.tune.x, 1.0));
+    const float max_distance = p.march.x;
+    const float thickness = p.march.y;
+
+    // MARCHED IN WORLD SPACE and projected each step, rather than interpolated
+    // in screen space.
+    //
+    // Screen-space DDA is the faster formulation and it is harder to get right:
+    // the perspective divide makes equal steps in screen space unequal in
+    // depth, so the comparison against the depth buffer needs the reciprocal
+    // interpolation done by hand. Marching in world space costs a matrix
+    // multiply per step and cannot get that wrong.
+    float3 hit_uv = float3(0.0);
+    bool found = false;
+    float t = 0.0;
+    const float step_size = max_distance / float(steps);
+    // JITTERED START, by a hash of the pixel. Without it every ray samples the
+    // same distances and a surface at a shallow angle shows the step size as
+    // banding; with it the error becomes noise, which the temporal resolve
+    // removes for free.
+    const float2 pix = in.uv * p.screen.xy;
+    const float jitter = fract(sin(dot(pix, float2(12.9898, 78.233))) * 43758.5453);
+    t = step_size * jitter;
+
+    for (int i = 0; i < steps; ++i) {
+        t += step_size;
+        const float3 sample_pos = world + r * t;
+        const float4 clip = p.viewProj * float4(sample_pos, 1.0);
+        if (clip.w <= 0.0) break;
+        const float3 ndc = clip.xyz / clip.w;
+        const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
+
+        const float scene_depth = depth.sample(smp, uv);
+        if (scene_depth <= 0.0) continue;
+        // Reversed-Z: a LARGER depth value is nearer. The ray is behind the
+        // surface when its own depth is smaller than what the buffer holds.
+        if (ndc.z < scene_depth) {
+            // How far behind, in world units, using the linear distance rather
+            // than the depth values -- the difference between two reversed-Z
+            // values is meaningless as a distance.
+            const float ray_dist = p.eye.w / max(ndc.z, 1e-7);
+            const float surf_dist = p.eye.w / max(scene_depth, 1e-7);
+            if (ray_dist - surf_dist > thickness) continue;  // passed behind it
+
+            // BINARY REFINEMENT. The march found the step that crossed the
+            // surface; without this the reflection is quantised to the step
+            // size, which on a floor reads as concentric rings.
+            float lo = t - step_size, hi = t;
+            for (int k = 0; k < int(p.tune.y); ++k) {
+                const float mid = (lo + hi) * 0.5;
+                const float4 c = p.viewProj * float4(world + r * mid, 1.0);
+                const float3 m = c.xyz / c.w;
+                const float2 muv = float2(m.x * 0.5 + 0.5, 0.5 - m.y * 0.5);
+                if (m.z < depth.sample(smp, muv)) hi = mid;
+                else lo = mid;
+            }
+            const float4 c = p.viewProj * float4(world + r * hi, 1.0);
+            const float3 m = c.xyz / c.w;
+            hit_uv = float3(m.x * 0.5 + 0.5, 0.5 - m.y * 0.5, hi);
+            found = true;
+            break;
+        }
+    }
+    if (!found) discard_fragment();
+
+    // --- the fades, which are most of what makes this usable ------------------
+    //
+    // Every one of them exists because the march succeeded somewhere it should
+    // not be trusted, and a hard cutoff at each boundary is a visible edge.
+
+    // AT THE SCREEN'S EDGE. A reflection that runs off the side of the frame
+    // has to fade, or the boundary of the viewport appears in the reflection --
+    // which is the single most recognisable SSR artefact.
+    const float2 edge = smoothstep(0.0, p.tune.w, hit_uv.xy) *
+                        (1.0 - smoothstep(1.0 - p.tune.w, 1.0, hit_uv.xy));
+    float fade = edge.x * edge.y;
+
+    // AT THE RAY'S LIMIT, so a reflection does not stop dead at the maximum
+    // distance.
+    fade *= 1.0 - saturate(hit_uv.z / max_distance);
+
+    // TOWARD THE CAMERA. A ray pointing back at the viewer is reflecting
+    // something behind them, which is by definition off screen; the march may
+    // still have found a plausible-looking pixel, and it is the wrong one.
+    fade *= saturate(1.0 - dot(r, v) * 1.6);
+
+    // BY MATERIAL. A dielectric only reflects at glancing angles -- Schlick
+    // with F0 = 0.04 -- while a metal reflects everything.
+    const float fresnel = 0.04 + 0.96 * pow(1.0 - saturate(dot(n, v)), 5.0);
+    const float strength = mix(fresnel, 1.0, metallic) * p.tune.z;
+    fade *= strength * rough_fade;
+
+    const float3 reflected = scene.sample(smp, hit_uv.xy).rgb;
+    // ADDITIVE with the fade as its weight, so where the march fails nothing is
+    // added and the probe's reflection -- already in `scene` -- is what remains.
+    return float4(reflected * saturate(fade), 1.0);
+}

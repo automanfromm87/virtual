@@ -87,6 +87,42 @@ struct PostConfig {
     // which is the film convention and what most footage looks like.
     float shutter = 0.5f;
 
+    // --- screen-space reflections ----------------------------------------------
+    //
+    // A LAYER over the environment probe, not a replacement. A screen-space
+    // march can only reflect what is on the screen, so where it fails -- off
+    // the edge of the frame, behind the reflector, behind the camera -- it
+    // fades out and the probe shows through. Running it without a probe leaves
+    // holes wherever the march misses.
+    //
+    // Needs the deferred path's normal buffer. There is no reconstruct-from-
+    // depth fallback on purpose: depth derivatives give a normal that is wrong
+    // along every silhouette, and a reflection is at its most visible exactly
+    // there.
+    bool ssr = false;
+    // How far a ray travels, in world metres. The cost is linear in this and in
+    // the step count together.
+    float ssr_distance = 30.0f;
+    int ssr_steps = 40;
+    // How many halvings after the crossing step. Four takes the error to a
+    // sixteenth of a step, below which the banding is gone.
+    int ssr_refine_steps = 4;
+    // How thick the depth buffer's surfaces are assumed to be. The depth buffer
+    // says how far away a surface is and nothing about its depth, so this is
+    // the guess that decides whether a ray passed BEHIND something or hit it.
+    // Too small and reflections drop out behind thin geometry; too large and
+    // rays attach to things they passed by.
+    float ssr_thickness = 0.6f;
+    float ssr_intensity = 1.0f;
+    // Above this roughness a surface is left entirely to the probe: one mirror
+    // ray cannot represent a wide lobe, and the probe's prefiltered chain
+    // already can.
+    float ssr_max_roughness = 0.4f;
+    // How far from the edge of the frame the fade starts, in uv. A reflection
+    // that stops dead at the viewport boundary is the most recognisable SSR
+    // artefact there is.
+    float ssr_edge_fade = 0.12f;
+
     // --- temporal antialiasing -------------------------------------------------
     //
     // Needs Camera::jitter to be driven from Jitter() below. Without the jitter
@@ -127,6 +163,10 @@ class PostStack {
     void DrawFog(rhi::Encoder&, rhi::TextureId depth);
     void DrawDepthOfField(rhi::Encoder&, rhi::TextureId src, rhi::TextureId depth);
     void DrawMotionBlur(rhi::Encoder&, rhi::TextureId src);
+    // ADDITIVE over the pass's existing colour, so it needs a pass with
+    // `load` set. `normal_metal` is the deferred G-buffer's second attachment.
+    void DrawSsr(rhi::Encoder&, rhi::TextureId scene, rhi::TextureId depth,
+                 rhi::TextureId normal_metal, rhi::TextureId albedo_rough);
     // Resolves `src` against the history and writes the result. The caller must
     // target Output() so the history stays owned here.
     void DrawTaa(rhi::Encoder&, rhi::TextureId src);

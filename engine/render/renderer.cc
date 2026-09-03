@@ -598,6 +598,23 @@ int Renderer::JointCount(MeshHandle m) const {
 
 MaterialHandle Renderer::CreateMaterial(const MaterialDesc& desc,
                                         std::string& error) {
+    // DERIVED SHADING MODES ARE NOT ASKABLE-FOR. GBuffer and LitInstanced are
+    // variants the renderer builds from a Lit material -- DrawGBuffer and
+    // DrawSceneIndirect reach for `gbuffer_pipeline` and `instanced_pipeline`,
+    // which are only filled in for Lit.
+    //
+    // Asking for one directly used to succeed and produce a material that drew
+    // NOTHING: its `pipeline` was the G-buffer program, its `gbuffer_pipeline`
+    // was null, and DrawGBuffer skipped it as incompatible. An empty frame with
+    // no error is the worst possible answer, and it cost a long debugging
+    // session to find. Rejecting it says so at the call site instead.
+    if (desc.shading == Shading::GBuffer || desc.shading == Shading::LitInstanced) {
+        error =
+            "Shading::GBuffer and Shading::LitInstanced are variants the "
+            "renderer derives from Shading::Lit, not modes to ask for: create "
+            "the material as Lit and call DrawGBuffer or DrawSceneIndirect";
+        return {};
+    }
     GpuMaterial m;
     m.pipeline = impl_->GetOrCreatePipeline(desc.shading, desc.depth_test,
                                             desc.transparent, error);

@@ -540,6 +540,149 @@ int main() {
         scene.camera.jitter = eng::Vec2{0.0f, 0.0f};
     }
 
+    {
+        // SCREEN-SPACE REFLECTIONS, checked by putting something in the scene
+        // that a probe could not possibly reflect.
+        //
+        // A probe is captured from one point and knows nothing about the
+        // objects in the room, so a reflection OF A SCENE OBJECT can only have
+        // come from the march. A bright red box hovering over a dark metal
+        // floor: if a red patch appears in the floor beneath it, the march
+        // found the box.
+        std::printf("\nscreen-space reflections find the scene\n");
+        const eng::rhi::TextureId albedo_rough =
+            dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
+        const eng::rhi::TextureId normal_metal =
+            dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
+
+        eng::Scene mirror;
+        mirror.lightDir = eng::Vec4{0.2f, 0.95f, 0.2f, 0.0f};
+        mirror.lightColor = eng::Vec4{2.0f, 2.0f, 2.0f, 1.0f};
+        mirror.ambientSky = eng::Vec3{0.05f, 0.05f, 0.06f};
+        mirror.ambientGround = eng::Vec3{0.01f, 0.01f, 0.01f};
+        mirror.camera.eye = eng::Vec3{0.0f, 1.4f, 5.0f};
+        mirror.camera.target = eng::Vec3{0.0f, 0.35f, 0.0f};
+
+        eng::MaterialDesc floor_md;
+        // Shading::Lit, NOT Shading::GBuffer -- the renderer derives the
+        // G-buffer variant from a Lit material, and asking for the variant
+        // directly is now an error rather than a silently empty frame.
+        floor_md.shading = eng::Shading::Lit;
+        floor_md.base_color = eng::Vec4{0.04f, 0.04f, 0.05f, 1.0f};
+        floor_md.roughness = 0.05f;
+        floor_md.metallic = 1.0f;
+        eng::MaterialDesc box_md;
+        box_md.shading = eng::Shading::Lit;
+        box_md.base_color = eng::Vec4{1.0f, 0.05f, 0.05f, 1.0f};
+        box_md.roughness = 0.9f;
+        box_md.metallic = 0.0f;
+        const eng::MaterialHandle floor_mat = r->CreateMaterial(floor_md, error);
+        const eng::MaterialHandle box_mat = r->CreateMaterial(box_md, error);
+        const eng::MeshHandle plate = r->UploadMesh(
+            eng::MakeBox(eng::Vec3{8.0f, 0.1f, 8.0f}, eng::Vec4{1, 1, 1, 1}));
+        const eng::MeshHandle box = r->UploadMesh(
+            eng::MakeBox(eng::Vec3{0.7f, 0.7f, 0.7f}, eng::Vec4{1, 1, 1, 1}));
+        if (!eng::Valid(floor_mat) || !eng::Valid(box_mat)) {
+            std::fprintf(stderr, "FAIL: %s\n", error.c_str());
+            return 1;
+        }
+        // The rejection above, checked: a silently empty frame is what this
+        // replaced.
+        eng::MaterialDesc bad;
+        bad.shading = eng::Shading::GBuffer;
+        std::string bad_error;
+        Check(!eng::Valid(r->CreateMaterial(bad, bad_error)) && !bad_error.empty(),
+              "asking for a derived shading mode is refused with a message");
+        {
+            eng::Instance f;
+            f.mesh = plate;
+            f.material = floor_mat;
+            f.model = eng::Mat4::Translation(eng::Vec3{0.0f, -0.1f, 0.0f});
+            mirror.instances.push_back(f);
+            eng::Instance b;
+            b.mesh = box;
+            b.material = box_mat;
+            b.model = eng::Mat4::Translation(eng::Vec3{0.0f, 1.5f, -1.0f});
+            mirror.instances.push_back(b);
+        }
+
+        const auto mirror_frame = [&](bool with_ssr) -> bool {
+            post->config.ssr = with_ssr;
+            post->config.ssr_intensity = 1.0f;
+            post->config.ssr_distance = 40.0f;
+            post->BeginFrame(mirror.camera, kW, kH, 0.016f);
+            dev->BeginFrame();
+            {
+                eng::rhi::PassDesc pd;
+                pd.color = albedo_rough;
+                pd.extra_colors = {normal_metal};
+                pd.depth = depth;
+                pd.keep_depth = true;
+                auto e = dev->BeginPass(pd);
+                r->DrawGBuffer(e, mirror, kW, kH);
+                dev->EndPass();
+            }
+            {
+                eng::rhi::PassDesc pd;
+                pd.color = hdr;
+                auto e = dev->BeginPass(pd);
+                r->DrawDeferredLight(e, mirror, kW, kH, albedo_rough, normal_metal,
+                                     depth, {});
+                dev->EndPass();
+            }
+            {
+                eng::rhi::PassDesc pd;
+                pd.color = hdr;
+                pd.load = true;  // additive over the lit scene
+                auto e = dev->BeginPass(pd);
+                post->DrawSsr(e, hdr, depth, normal_metal, albedo_rough);
+                dev->EndPass();
+            }
+            {
+                eng::rhi::PassDesc pd;
+                pd.color = out;
+                auto e = dev->BeginPass(pd);
+                r->DrawComposite(e, hdr);
+                dev->EndPass();
+            }
+            if (!dev->CommitAndWait(error)) {
+                std::fprintf(stderr, "FAIL submit: %s\n", error.c_str());
+                return false;
+            }
+            post->EndFrame();
+            return dev->ReadPixels(out, kW, kH, px);
+        };
+
+        if (!mirror_frame(false)) return 1;
+        // The floor below the box. The box itself sits well above the horizon;
+        // this band is floor.
+        const float off_r = Mean(px, 0, 100, 168, 156, 200);
+        const float off_g = Mean(px, 1, 100, 168, 156, 200);
+        if (!mirror_frame(true)) return 1;
+        const float on_r = Mean(px, 0, 100, 168, 156, 200);
+        const float on_g = Mean(px, 1, 100, 168, 156, 200);
+        std::printf("    floor under the box: SSR off r %.1f g %.1f, on r %.1f g %.1f\n",
+                    off_r, off_g, on_r, on_g);
+        Check(on_r > off_r + 6.0f, "a red object appears in the metal floor below it");
+        // RED, specifically. A march that simply brightened the floor -- a fade
+        // computed wrongly, a sample taken from the wrong place -- would raise
+        // every channel together.
+        Check((on_r - off_r) > (on_g - off_g) * 3.0f,
+              "and it arrives as red, not as a general brightening");
+
+        // AWAY from the box the floor must be nearly unchanged: SSR that
+        // brightens the whole surface is not a reflection, it is an ambient
+        // term with extra steps.
+        const float corner_on = Mean(px, 0, 6, 236, 46, 252);
+        if (!mirror_frame(false)) return 1;
+        const float corner_off = Mean(px, 0, 6, 236, 46, 252);
+        std::printf("    bottom-left corner: off %.1f, on %.1f\n", corner_off,
+                    corner_on);
+        Check(corner_on - corner_off < (on_r - off_r) * 0.25f,
+              "and the floor away from it is barely affected");
+        post->config.ssr = false;
+    }
+
     std::printf(g_failures == 0 ? "\npost_test: all checks passed\n"
                                 : "\npost_test: %d FAILED\n", g_failures);
     return g_failures == 0 ? 0 : 1;

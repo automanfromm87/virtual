@@ -33,6 +33,16 @@ struct PostParams {
 };
 static_assert(sizeof(PostParams) == 256, "PostParams layout drifted");
 
+struct SsrParams {
+    Mat4 viewProj;
+    Mat4 invViewProj;
+    Vec4 eye;
+    Vec4 screen;
+    Vec4 march;
+    Vec4 tune;
+};
+static_assert(sizeof(SsrParams) == 192, "SsrParams layout drifted");
+
 constexpr int kBins = 256;
 
 // A HALTON sequence, base 2 and base 3.
@@ -61,7 +71,7 @@ struct PostStack::Impl {
     int width = 0, height = 0;
 
     rhi::ComputePipelineId histogram, resolve, velocity_cs;
-    rhi::PipelineId fog, dof, motion_blur, taa;
+    rhi::PipelineId fog, dof, motion_blur, taa, ssr;
     rhi::SamplerId sampler;
 
     rhi::BufferId histogram_buf, exposure_buf;
@@ -73,6 +83,7 @@ struct PostStack::Impl {
     int history_index = 0;
 
     PostParams params{};
+    Mat4 view_proj = Mat4::Identity();
     Mat4 prev_view_proj = Mat4::Identity();
     bool have_prev = false;
     std::uint64_t frame = 0;
@@ -123,6 +134,11 @@ std::unique_ptr<PostStack> PostStack::Create(rhi::Device& dev, std::string& erro
     if (!Valid(im.motion_blur)) return nullptr;
     im.taa = make("fs_taa", rhi::Blend::None);
     if (!Valid(im.taa)) return nullptr;
+    // ADDITIVE, so a ray that found nothing adds nothing and whatever the probe
+    // already put there survives. Alpha blending would replace the probe's
+    // reflection with black wherever the march missed.
+    im.ssr = make("fs_ssr", rhi::Blend::Additive);
+    if (!Valid(im.ssr)) return nullptr;
 
     im.sampler = dev.CreateSampler(rhi::Filter::Linear, rhi::Wrap::Clamp);
     const std::vector<std::uint32_t> zeros(kBins, 0u);
@@ -170,6 +186,7 @@ void PostStack::BeginFrame(const Camera& camera, int width, int height, float dt
     // answer as motion, and TAA would chase its own jitter.
     const Mat4 vp = camera.ViewProjNoJitter(aspect);
     im.params.invViewProj = Inverse(vp);
+    im.view_proj = vp;
     im.params.prevViewProj = im.have_prev ? im.prev_view_proj : vp;
     im.prev_view_proj = vp;
     im.have_prev = true;
@@ -280,6 +297,34 @@ void PostStack::DrawTaa(rhi::Encoder& enc, rhi::TextureId src) {
     enc.SetFragmentTexture(im.history[im.history_index ^ 1], 1);
     enc.SetFragmentTexture(im.velocity, 2);
     enc.SetFragmentBytes(&im.params, sizeof(im.params), 0);
+    enc.SetFragmentSampler(im.sampler, 0);
+    enc.Draw(3);
+}
+
+void PostStack::DrawSsr(rhi::Encoder& enc, rhi::TextureId scene,
+                        rhi::TextureId depth, rhi::TextureId normal_metal,
+                        rhi::TextureId albedo_rough) {
+    Impl& im = *impl_;
+    if (!config.ssr || !Valid(im.ssr) || !Valid(scene) || !Valid(depth) ||
+        !Valid(normal_metal) || !Valid(albedo_rough))
+        return;
+    SsrParams sp{};
+    sp.viewProj = im.view_proj;
+    sp.invViewProj = im.params.invViewProj;
+    sp.eye = im.params.eye;
+    sp.screen = im.params.screen;
+    sp.march = Vec4{config.ssr_distance, config.ssr_thickness, 1.0f,
+                    config.ssr_max_roughness};
+    sp.tune = Vec4{float(config.ssr_steps), float(config.ssr_refine_steps),
+                   config.ssr_intensity, config.ssr_edge_fade};
+
+    enc.SetPipeline(im.ssr);
+    enc.SetCull(rhi::Cull::None, rhi::Winding::CounterClockwise);
+    enc.SetFragmentTexture(scene, 0);
+    enc.SetFragmentTexture(depth, 1);
+    enc.SetFragmentTexture(normal_metal, 2);
+    enc.SetFragmentTexture(albedo_rough, 3);
+    enc.SetFragmentBytes(&sp, sizeof(sp), 0);
     enc.SetFragmentSampler(im.sampler, 0);
     enc.Draw(3);
 }
