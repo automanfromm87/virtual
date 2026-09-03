@@ -97,6 +97,14 @@ struct FrameUniforms {
     ENG_VEC4 probeBoxMin;
     ENG_VEC4 probeBoxMax;   // xyz, w unused
     ENG_VEC4 probePosition; // where the cube was captured from
+    // STEREO. The RIGHT eye's view-projection and its eye position; the left
+    // eye's are the ordinary viewProj and eyePos above.
+    //
+    // Both in the per-draw block rather than a second one, because a stereo
+    // pass needs them on the same draw as the left eye's -- the whole point of
+    // vertex amplification is that there IS only one draw.
+    ENG_MAT4 viewProjRight;
+    ENG_VEC4 eyePosRight;
 };
 
 // A local light. Sixteen bytes times four, so the array packs with no padding

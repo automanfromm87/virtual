@@ -373,6 +373,10 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
                                   // CLUSTERED light lists. Both null when
                                   // clustering is off, and the loop below falls
                                   // back to walking the whole buffer.
+                                  // WHERE THE VIEWER IS. Passed in rather than
+                                  // read from u.eyePos, because a stereo draw
+                                  // has two of them and one uniform block.
+                                  float3 eye = float3(0.0f),
                                   constant GpuClusters* clusters = nullptr,
                                   device const uint* cluster_counts = nullptr,
                                   device const uint* cluster_indices = nullptr,
@@ -395,7 +399,7 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
     // Renormalize per fragment: interpolating unit vectors across a triangle
     // does not preserve length, and the error is worst mid-face.
     const float3 N = normalize(Nin);
-    const float3 V = normalize(u.eyePos.xyz - worldPos);
+    const float3 V = normalize(eye - worldPos);
 
     // --- the key light: directional, and the only one with cascades ----------
     const float3 Lsun = normalize(u.lightDir.xyz);

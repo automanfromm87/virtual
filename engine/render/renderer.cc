@@ -79,7 +79,7 @@ constexpr char kOitSrc[] = {
     , 0};
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
-static_assert(sizeof(FrameUniforms) == 544, "FrameUniforms layout drifted");
+static_assert(sizeof(FrameUniforms) == 624, "FrameUniforms layout drifted");
 static_assert(sizeof(GpuClusters) == 64, "GpuClusters layout drifted");
 static_assert(sizeof(GpuLight) == 144, "GpuLight layout drifted");
 static_assert(sizeof(GpuCascades) == 288, "GpuCascades layout drifted");
@@ -208,6 +208,7 @@ struct GpuMaterial {
     rhi::TextureId metallic_map;
     rhi::TextureId emissive_map;
     rhi::TextureId occlusion_map;
+    rhi::PipelineId stereo_pipeline;
     rhi::PipelineId oit_pipeline;
     rhi::PipelineId oit_skinned_pipeline;
     rhi::TextureId normal_map;
@@ -355,6 +356,8 @@ struct Renderer::Impl {
     // --- clustered lighting ---------------------------------------------------
     bool clustered = false;
     bool oit_enabled = false;
+    Mat4 right_view_proj = Mat4::Identity();
+    Vec4 right_eye{0, 0, 0, 1};
     // Set by BinLights and cleared by nothing: a frame that shades without
     // having binned falls back to the whole light buffer, which is correct and
     // merely slow. Tracked so the bindings are not made from stale bins on the
@@ -460,7 +463,7 @@ struct Renderer::Impl {
 
     // Which of the three geometry passes is running. A bool was enough for
     // two; a third makes every call site read `false, true` and mean nothing.
-    enum class GeometryPass { Forward, GBuffer, Oit };
+    enum class GeometryPass { Forward, GBuffer, Oit, Stereo };
     void DrawGeometry(rhi::Encoder&, const Scene&, int width, int height,
                       rhi::TextureId shadow_map, GeometryPass pass);
     void UploadLights(const Scene&, std::size_t light_offset, int light_count);
@@ -472,6 +475,7 @@ struct Renderer::Impl {
             case Shading::Lit:
             case Shading::Flat:
             case Shading::LitInstanced:
+            case Shading::LitStereo:
                 return samples;
             // A shadow map is never multisampled: it stores a distance, and
             // averaging two distances across a silhouette gives a value that
@@ -520,6 +524,7 @@ rhi::Format Renderer::Impl::FormatFor(Shading shading) const {
         // the weights reach a few thousand -- an 8-bit target saturates on the
         // first surface and the average that comes out of the resolve is white.
         case Shading::OitAccumulate:
+        case Shading::LitStereo:
             return Renderer::kSceneFormat;
         // The resolve writes premultiplied colour to be blended over the HDR
         // scene, so it is half-float too. It is the composite, later, that
@@ -573,6 +578,15 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
         desc.vertex_fn = skinned ? "vs_skinned" : "vs_lit";
         desc.fragment_fn = "fs_gbuffer";
         desc.extra_colors = {kSceneFormat};  // attachment 1: normal + metallic
+    } else if (shading == Shading::LitStereo) {
+        // Same fragment stage as Lit, so both eyes are shaded by exactly the
+        // code a monoscopic frame uses. A second copy is how a stereo path
+        // starts differing from the mono one in ways nobody notices until
+        // somebody looks through the headset.
+        desc.source = ShadingSource(kLitSrc);
+        desc.vertex_fn = "vs_lit_stereo";
+        desc.fragment_fn = "fs_lit";
+        desc.amplification = 2;
     } else if (shading == Shading::OitAccumulate) {
         // The LIT vertex stage and a fragment stage that writes the two
         // commutative buffers instead of a colour. Same ShadeSurface, so a
@@ -838,6 +852,11 @@ MaterialHandle Renderer::CreateMaterial(const MaterialDesc& desc,
         // order-independent transparency is currently on. Building it lazily
         // when the mode is switched would mean switching it on mid-frame
         // silently drops every material created before the switch.
+        if (!desc.transparent && desc.depth_test) {
+            m.stereo_pipeline = impl_->GetOrCreatePipeline(
+                Shading::LitStereo, desc.depth_test, false, error);
+            if (!Valid(m.stereo_pipeline)) return {};
+        }
         if (desc.transparent) {
             m.oit_pipeline = impl_->GetOrCreatePipeline(Shading::OitAccumulate,
                                                         desc.depth_test, true, error);
@@ -887,6 +906,18 @@ std::size_t Renderer::CascadeOffset() const {
 
 void Renderer::SetOrderIndependentTransparency(bool on) { impl_->oit_enabled = on; }
 bool Renderer::OrderIndependentTransparency() const { return impl_->oit_enabled; }
+
+void Renderer::DrawSceneStereo(rhi::Encoder& enc, const Scene& scene,
+                               const Camera& right, int width, int height,
+                               rhi::TextureId shadow_map) {
+    // The right eye's matrices, handed to DrawGeometry through the impl rather
+    // than as another parameter: every other pass would have to carry two
+    // arguments it never uses.
+    impl_->right_view_proj = right.ViewProj(float(width) / float(std::max(height, 1)));
+    impl_->right_eye = Vec4{right.eye.x, right.eye.y, right.eye.z, 1.0f};
+    impl_->DrawGeometry(enc, scene, width, height, shadow_map,
+                        Impl::GeometryPass::Stereo);
+}
 
 void Renderer::DrawTransparentOit(rhi::Encoder& enc, const Scene& scene, int width,
                                   int height, rhi::TextureId shadow_map) {
@@ -1592,6 +1623,7 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
                                   rhi::TextureId shadow_map, GeometryPass pass) {
     const bool gbuffer = pass == GeometryPass::GBuffer;
     const bool oit = pass == GeometryPass::Oit;
+    const bool stereo = pass == GeometryPass::Stereo;
     stats = RenderStats{};
     stats.submitted = int(scene.instances.size());
     draw_order.clear();
@@ -1742,7 +1774,8 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
         if (oit && !mat.transparent) continue;
         if (!oit && !gbuffer && oit_enabled && mat.transparent) continue;
         const rhi::PipelineId want =
-            oit ? (skinned ? mat.oit_skinned_pipeline : mat.oit_pipeline)
+            stereo ? mat.stereo_pipeline
+            : oit ? (skinned ? mat.oit_skinned_pipeline : mat.oit_pipeline)
             : gbuffer ? (skinned ? mat.gbuffer_skinned_pipeline : mat.gbuffer_pipeline)
                       : (skinned ? mat.skinned_pipeline : mat.pipeline);
         if (!Valid(want)) {
@@ -1795,6 +1828,8 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
         u.probeBoxMax = Vec4{env.box_max.x, env.box_max.y, env.box_max.z, 0.0f};
         u.probePosition = Vec4{env.capture_position.x, env.capture_position.y,
                                env.capture_position.z, 0.0f};
+        u.viewProjRight = right_view_proj;
+        u.eyePosRight = right_eye;
 
         // Sub-allocate out of this frame's slot instead of a per-draw setBytes.
         std::memcpy(uniform_map + offset, &u, sizeof(u));

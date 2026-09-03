@@ -153,6 +153,17 @@ struct PipelineDesc {
     // Per-attachment blending for OitAccumulate: attachment 0 adds and
     // attachment 1 multiplies. Metal takes a blend state per attachment, so
     // this is a property of the pipeline rather than of the encoder.
+    // VERTEX AMPLIFICATION: how many views one draw produces. 1 is an ordinary
+    // pipeline; 2 is stereo.
+    //
+    // The vertex stage runs ONCE and emits `amplification` copies of its
+    // output, each tagged with a render-target array index. That is the whole
+    // saving: the vertex work, the culling, the state changes and the draw call
+    // are all paid once for both eyes, where two passes pay for everything
+    // twice and the second eye's geometry is identical to the first's.
+    //
+    // Needs a layered render target -- a 2D array with one slice per view.
+    int amplification = 1;
     // Multisample count. Must match the attachments the pipeline will be used
     // with — a pipeline built for one sample cannot draw into a four-sample
     // target, and Metal rejects that outright rather than silently aliasing.
@@ -178,6 +189,14 @@ struct GpuTiming {
 
 struct PassDesc {
     TextureId color;
+    // VIEWS. Above 1 makes this a layered pass writing `views` slices of an
+    // array attachment, and the pipeline's `amplification` must match.
+    //
+    // Metal wants the mapping from amplification index to array slice supplied
+    // per encoder rather than per pipeline, so the encoder sets the identity
+    // mapping: view i goes to slice i. Anything else would be a foveated or
+    // multi-viewport arrangement this does not do.
+    int views = 1;
     // Names this pass in the GPU timing report and in a frame capture. Null
     // means untimed, which costs nothing at all -- a sample-buffer attachment
     // is only added to passes that asked for one.
@@ -413,6 +432,14 @@ class Device {
     // above one, and an 8-bit texture has none.
     [[nodiscard]] TextureId CreateTexture2DFloat(int width, int height,
                                                  const float* rgba32f);
+    // A LAYERED render target: `layers` slices of a 2D array, all rendered in
+    // one pass. Stereo is two of them.
+    [[nodiscard]] TextureId CreateRenderTargetArray(int width, int height, int layers,
+                                                    Format, bool cpu_readable = false);
+    [[nodiscard]] TextureId CreateDepthTargetArray(int width, int height, int layers);
+    // One slice of an array, as a handle that can be sampled or read back on
+    // its own. The array itself cannot be: a readback wants a 2D texture.
+    [[nodiscard]] TextureId CreateArraySlice(TextureId array, int slice);
     // A 3D texture from float pixels: width*height*depth*4 floats, x fastest.
     // Stored as RGBA16Float, which halves the bandwidth of a lookup that
     // happens once per fragment and holds far more precision than an irradiance

@@ -101,6 +101,12 @@ struct Device::Impl {
     id<MTLCommandBuffer> cb = nil;
     id<MTLRenderCommandEncoder> enc = nil;
     bool pass_has_depth = false;
+    // The current pass's view count. Applied when a pipeline is BOUND rather
+    // than when the pass begins: setVertexAmplificationCount is validated
+    // against the bound pipeline's maxVertexAmplificationCount, and at the top
+    // of a pass there is no pipeline bound for it to be validated against, so
+    // the call is accepted and then forgotten.
+    int pass_views = 1;
 
     // --- GPU timing -----------------------------------------------------------
     //
@@ -817,6 +823,56 @@ TextureId Device::CreateTexture2D(int width, int height, const void* rgba8,
     return TextureId{impl_->AllocTextureSlot(t)};
 }
 
+TextureId Device::CreateRenderTargetArray(int width, int height, int layers,
+                                          Format format, bool cpu_readable) {
+    if (width <= 0 || height <= 0 || layers <= 0) return {};
+    MTLTextureDescriptor* td = [[MTLTextureDescriptor alloc] init];
+    td.textureType = MTLTextureType2DArray;
+    td.pixelFormat = ToMTL(format);
+    td.width = NSUInteger(width);
+    td.height = NSUInteger(height);
+    td.arrayLength = NSUInteger(layers);
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+               MTLTextureUsagePixelFormatView;
+    td.storageMode = cpu_readable ? MTLStorageModeShared : MTLStorageModePrivate;
+    id<MTLTexture> t = [impl_->dev newTextureWithDescriptor:td];
+    if (!t) return {};
+    return TextureId{impl_->AllocTextureSlot(t)};
+}
+
+TextureId Device::CreateDepthTargetArray(int width, int height, int layers) {
+    if (width <= 0 || height <= 0 || layers <= 0) return {};
+    MTLTextureDescriptor* td = [[MTLTextureDescriptor alloc] init];
+    td.textureType = MTLTextureType2DArray;
+    td.pixelFormat = MTLPixelFormatDepth32Float;
+    td.width = NSUInteger(width);
+    td.height = NSUInteger(height);
+    td.arrayLength = NSUInteger(layers);
+    td.usage = MTLTextureUsageRenderTarget;
+    // NOT memoryless. A layered depth buffer is written by the amplified pass
+    // and may be sampled afterwards; memoryless would discard it at end of
+    // pass and the second eye's SSAO would read nothing.
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> t = [impl_->dev newTextureWithDescriptor:td];
+    if (!t) return {};
+    return TextureId{impl_->AllocTextureSlot(t)};
+}
+
+TextureId Device::CreateArraySlice(TextureId array, int slice) {
+    if (!Valid(array) || array.v >= impl_->textures.size() || slice < 0) return {};
+    id<MTLTexture> src = impl_->textures[array.v];
+    if (!src || slice >= int(src.arrayLength)) return {};
+    // A VIEW, not a copy: it shares the array's storage, so reading it reads
+    // whatever the pass wrote. Creating one per readback would leak a handle
+    // per frame -- make them once alongside the array.
+    id<MTLTexture> view = [src newTextureViewWithPixelFormat:src.pixelFormat
+                                                 textureType:MTLTextureType2D
+                                                      levels:NSMakeRange(0, 1)
+                                                      slices:NSMakeRange(NSUInteger(slice), 1)];
+    if (!view) return {};
+    return TextureId{impl_->AllocTextureSlot(view)};
+}
+
 TextureId Device::CreateTexture3DFloat(int width, int height, int depth,
                                        const float* rgba32f) {
     if (width <= 0 || height <= 0 || depth <= 0 || !rgba32f) return {};
@@ -1018,6 +1074,19 @@ PipelineId Device::CreatePipeline(const PipelineDesc& desc, std::string& error) 
     // Has to match the attachments exactly. Metal rejects a mismatch here,
     // which is the one class of format error it does NOT let through silently.
     pd.rasterSampleCount = NSUInteger(desc.samples > 0 ? desc.samples : 1);
+    // ALWAYS, not only for amplified pipelines. Metal requires it of any
+    // pipeline whose vertex stage writes render_target_array_index -- and once
+    // that member is in the shared vertex output struct, every pipeline built
+    // from that shader writes it, amplified or not. The error is explicit
+    // ("Vertex shader writes render_target_array_index but
+    // inputPrimitiveTopology is not specified") and it takes down every
+    // material in the engine at once.
+    //
+    // Triangle is right for everything here; there is no line or point
+    // rendering in this renderer.
+    pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+    if (desc.amplification > 1)
+        pd.maxVertexAmplificationCount = NSUInteger(desc.amplification);
     if (desc.blend == Blend::OitAccumulate && !desc.depth_only) {
         // TWO attachments with DIFFERENT blend functions, which is the whole
         // trick. Accumulation sums weighted premultiplied colour; revealage
@@ -1256,6 +1325,10 @@ Encoder Device::BeginPass(const PassDesc& desc) { @autoreleasepool {
     // per pass per frame for the whole run — there is no Cocoa run loop to
     // drain them, because the app drives its own loop.
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    // A LAYERED pass renders every slice at once. renderTargetArrayLength is
+    // what tells Metal that; without it the pass writes slice 0 only and the
+    // second eye is simply never drawn -- no error, just a black eye.
+    if (desc.views > 1) rp.renderTargetArrayLength = NSUInteger(desc.views);
     if (Valid(desc.color)) {
         rp.colorAttachments[0].texture = impl_->textures[desc.color.v];
         rp.colorAttachments[0].loadAction =
@@ -1304,6 +1377,7 @@ Encoder Device::BeginPass(const PassDesc& desc) { @autoreleasepool {
     // The encoder is held by a strong ivar, so it outlives this pool.
     impl_->pass_has_depth = Valid(desc.depth);
     impl_->enc = [impl_->cb renderCommandEncoderWithDescriptor:rp];
+    impl_->pass_views = desc.views > 8 ? 8 : (desc.views < 1 ? 1 : desc.views);
     return Encoder(this);
 }}
 
@@ -1394,6 +1468,25 @@ void Encoder::SetPipeline(PipelineId p) {
     const PipelineObj& obj = device_->impl_->pipelines[p.v];
     [device_->impl_->enc setRenderPipelineState:obj.pso];
     if (obj.dss) [device_->impl_->enc setDepthStencilState:obj.dss];
+    if (device_->impl_->pass_views > 1) {
+        // The identity mapping: amplification index i renders to array slice i,
+        // with no viewport offset. Anything else would be a foveated or
+        // multi-viewport arrangement this does not do.
+        //
+        // AFTER the pipeline, every time. Set once at the top of the pass it is
+        // accepted and has no effect -- both eyes land in slice 0 and the
+        // second one is black, with no error anywhere. That is not a
+        // documented rule so much as what the driver does, and it is exactly
+        // the failure the stereo test exists to catch.
+        MTLVertexAmplificationViewMapping maps[8] = {};
+        for (int i = 0; i < device_->impl_->pass_views; ++i) {
+            maps[i].renderTargetArrayIndexOffset = uint32_t(i);
+            maps[i].viewportArrayIndexOffset = 0;
+        }
+        [device_->impl_->enc
+            setVertexAmplificationCount:NSUInteger(device_->impl_->pass_views)
+                           viewMappings:maps];
+    }
 }
 
 void Encoder::SetViewport(int x, int y, int width, int height) {

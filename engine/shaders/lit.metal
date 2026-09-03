@@ -21,6 +21,16 @@ struct VSOut {
     // renormalises. w is constant across a triangle in every mesh this engine
     // produces, so interpolating it is free and it survives.
     float4 tangentW;
+    // WHERE THE VIEWER IS, per vertex. Constant across a triangle for a
+    // monoscopic draw, and different per EYE for a stereo one.
+    //
+    // A varying rather than a uniform because the fragment stage cannot know
+    // which eye it is shading: the two eyes are one draw with one uniform
+    // block. Reading u.eyePos instead computes the right eye's specular from
+    // the left eye's position -- worst 6/255 on a roughness-0.5 sphere, which
+    // is small, systematic, and exactly the sort of thing that makes a stereo
+    // pair subtly uncomfortable rather than obviously wrong.
+    float3 eyeW;
 };
 
 // Perturbs a world normal by a tangent-space normal map sample.
@@ -60,6 +70,44 @@ static inline float3 ApplyNormalMap(float3 N, float4 tangentW, float2 uv,
     return normalize(T * xy.x + B * xy.y + N * z);
 }
 
+// STEREO. One invocation, two outputs, one per eye.
+//
+// The vertex shader does NOT write render_target_array_index, and that is the
+// whole subtlety. Metal routes an amplified output using the encoder's view
+// MAPPING, and it ADDS whatever the shader writes to that mapping's offset.
+// With the identity mapping already in place, a shader that helpfully writes
+// its own amplification index sends eye 1 to slice 1 + 1 = 2 -- out of range on
+// a two-layer target, where it lands back in slice 0 alongside eye 0. The
+// result is a left eye that looks perfect, a black right eye, and no error
+// anywhere. It cost a long hunt.
+//
+// The saving is not the vertex arithmetic, which is trivial. It is that the
+// draw call, the state changes, the index fetch, the culling and the whole
+// command buffer are paid ONCE. Two passes pay for all of it twice, and the
+// geometry submitted is identical both times.
+vertex VSOut vs_lit_stereo(uint vid [[vertex_id]],
+                           uint amp [[amplification_id]],
+                           device const VertexIn* verts [[buffer(0)]],
+                           constant FrameUniforms& u [[buffer(1)]])
+{
+    VSOut o;
+    const float4 worldPos = u.model * float4(verts[vid].position.xyz, 1.0f);
+    // The ONLY per-eye difference: which projection the world position goes
+    // through. Everything else -- the world position itself, the normal, the
+    // tangent, the shadow-space position -- is a property of the surface and
+    // is identical for both eyes.
+    o.position = (amp == 0 ? u.viewProj : u.viewProjRight) * worldPos;
+    o.worldPos = worldPos.xyz;
+    o.normalW = (u.model * float4(verts[vid].normal.xyz, 0.0f)).xyz;
+    o.color = verts[vid].color * u.tint;
+    o.uv = verts[vid].uv.xy;
+    o.lightClip = u.lightViewProj * worldPos;
+    o.tangentW = float4((u.model * float4(verts[vid].tangent.xyz, 0.0f)).xyz,
+                        verts[vid].tangent.w);
+    o.eyeW = amp == 0 ? u.eyePos.xyz : u.eyePosRight.xyz;
+    return o;
+}
+
 vertex VSOut vs_lit(uint                     vid   [[vertex_id]],
                     device const VertexIn*   verts [[buffer(0)]],
                     constant FrameUniforms&  u     [[buffer(1)]])
@@ -79,6 +127,7 @@ vertex VSOut vs_lit(uint                     vid   [[vertex_id]],
     o.lightClip = u.lightViewProj * worldPos;
     o.tangentW = float4((u.model * float4(verts[vid].tangent.xyz, 0.0f)).xyz,
                         verts[vid].tangent.w);
+    o.eyeW = u.eyePos.xyz;
     return o;
 }
 
@@ -115,6 +164,7 @@ vertex VSOut vs_lit_instanced(uint                      vid       [[vertex_id]],
     o.lightClip = u.lightViewProj * worldPos;
     o.tangentW = float4((inst.model * float4(verts[vid].tangent.xyz, 0.0f)).xyz,
                         verts[vid].tangent.w);
+    o.eyeW = u.eyePos.xyz;
     return o;
 }
 
@@ -155,6 +205,7 @@ vertex VSOut vs_skinned(uint                     vid     [[vertex_id]],
     const float3 skinnedT = (blend * float4(verts[vid].tangent.xyz, 0.0f)).xyz;
     o.tangentW = float4((u.model * float4(skinnedT, 0.0f)).xyz,
                         verts[vid].tangent.w);
+    o.eyeW = u.eyePos.xyz;
     return o;
 }
 
@@ -249,8 +300,8 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
                                     metallic, in.lightClip, u, lights, cascades,
                                     shadowMap, shadowAtlas, shadowSmp,
                                     irradianceMap, specularMap, brdfLut, envSmp,
-                                    ao, clusters, clusterCounts, clusterIndices,
-                                    in.position.xy,
+                                    ao, in.eyeW, clusters, clusterCounts,
+                                    clusterIndices, in.position.xy,
                                     // Distance ALONG the view axis, which is
                                     // what the exponential slicing is in terms
                                     // of -- not distance from the eye, which

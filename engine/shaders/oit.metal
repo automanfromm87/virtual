@@ -90,8 +90,9 @@ fragment OitOut fs_oit(VSOut in [[stage_in]],
     const float3 lit = ShadeSurface(in.worldPos, N, albedo, roughness, metallic,
                                     in.lightClip, u, lights, cascades, shadowMap,
                                     shadowAtlas, shadowSmp, irradianceMap,
-                                    specularMap, brdfLut, envSmp, ao, clusters,
-                                    clusterCounts, clusterIndices, in.position.xy,
+                                    specularMap, brdfLut, envSmp, ao,
+                                    u.eyePos.xyz, clusters, clusterCounts,
+                                    clusterIndices, in.position.xy,
                                     dot(in.worldPos - u.eyePos.xyz, u.viewDir.xyz),
                                     giR, giG, giB, giSmp);
     const float3 emit = u.emissive.rgb * emissiveMap.sample(smp, in.uv).rgb;

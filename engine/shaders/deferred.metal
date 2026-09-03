@@ -131,7 +131,7 @@ fragment float4 fs_deferred(FullscreenOut in [[stage_in]],
                      // No baked occlusion in the deferred path: the G-buffer
                      // has no channel left for it, and packing it into an
                      // alpha that already holds roughness would cost both.
-                     1.0f, clusters, clusterCounts, clusterIndices,
+                     1.0f, u.eyePos.xyz, clusters, clusterCounts, clusterIndices,
                      in.position.xy,
                      dot(worldPos - u.eyePos.xyz, u.viewDir.xyz),
                      giR, giG, giB, giSmp);
