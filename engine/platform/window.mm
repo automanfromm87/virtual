@@ -18,6 +18,8 @@ struct Window::Impl {
     bool quit = false;
     Input input;
     bool held[128] = {};
+    bool mouse_held[int(MouseButton::Count)] = {};
+    bool cursor_locked = false;
 };
 
 Window::Window() : impl_(std::make_unique<Impl>()) {}
@@ -53,6 +55,11 @@ std::unique_ptr<Window> Window::Create(const char* title, int width, int height,
     NSView* view = [[NSView alloc] initWithFrame:frame];
     window.contentView = view;
 
+    // Without this AppKit never delivers mouseMoved at all, and unheld mouse
+    // motion is silently always zero -- which reads as "the mouse does not
+    // work" and is impossible to find by looking at the event handler, because
+    // the handler is correct and simply never runs.
+    window.acceptsMouseMovedEvents = YES;
     [window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     // Required when driving the loop ourselves instead of calling -run.
@@ -101,6 +108,46 @@ bool Window::PumpEvents() {
             case NSEventTypeLeftMouseDragged:
                 impl_->input.drag_dx += float(e.deltaX);
                 impl_->input.drag_dy += float(e.deltaY);
+                impl_->input.mouse_dx += float(e.deltaX);
+                impl_->input.mouse_dy += float(e.deltaY);
+                break;
+            case NSEventTypeMouseMoved:
+            case NSEventTypeRightMouseDragged:
+            case NSEventTypeOtherMouseDragged:
+                // deltaX/deltaY, NOT the difference of two positions. Under a
+                // locked cursor the position is pinned to the centre and never
+                // changes, so differencing it reports no motion at all -- which
+                // is precisely the case a first-person camera is built on.
+                impl_->input.mouse_dx += float(e.deltaX);
+                impl_->input.mouse_dy += float(e.deltaY);
+                break;
+            case NSEventTypeLeftMouseDown:
+                impl_->input.pressed[int(MouseButton::Left)] = true;
+                impl_->mouse_held[int(MouseButton::Left)] = true;
+                break;
+            case NSEventTypeLeftMouseUp:
+                impl_->input.released[int(MouseButton::Left)] = true;
+                impl_->mouse_held[int(MouseButton::Left)] = false;
+                break;
+            case NSEventTypeRightMouseDown:
+                impl_->input.pressed[int(MouseButton::Right)] = true;
+                impl_->mouse_held[int(MouseButton::Right)] = true;
+                break;
+            case NSEventTypeRightMouseUp:
+                impl_->input.released[int(MouseButton::Right)] = true;
+                impl_->mouse_held[int(MouseButton::Right)] = false;
+                break;
+            case NSEventTypeOtherMouseDown:
+                if (e.buttonNumber == 2) {
+                    impl_->input.pressed[int(MouseButton::Middle)] = true;
+                    impl_->mouse_held[int(MouseButton::Middle)] = true;
+                }
+                break;
+            case NSEventTypeOtherMouseUp:
+                if (e.buttonNumber == 2) {
+                    impl_->input.released[int(MouseButton::Middle)] = true;
+                    impl_->mouse_held[int(MouseButton::Middle)] = false;
+                }
                 break;
             case NSEventTypeScrollWheel:
                 // Trackpads report precise deltas an order of magnitude larger
@@ -113,6 +160,32 @@ bool Window::PumpEvents() {
         }
         [NSApp sendEvent:e];
     }
+    // The cursor's POSITION is read once per pump rather than accumulated from
+    // events: a frame with no motion still needs an answer, and mouseMoved
+    // events do not arrive at all while a button is held.
+    {
+        const NSPoint p = [impl_->window mouseLocationOutsideOfEventStream];
+        const NSRect bounds = impl_->view.bounds;
+        const float scale = float(impl_->window.backingScaleFactor);
+        impl_->input.mouse_inside = NSPointInRect(p, bounds);
+        // AppKit's origin is BOTTOM left and in points. The framebuffer's is
+        // top left and in pixels, and every caller wants the second -- so the
+        // flip and the scale happen here, once.
+        impl_->input.mouse_x = float(p.x) * scale;
+        impl_->input.mouse_y = float(bounds.size.height - p.y) * scale;
+    }
+    if (impl_->cursor_locked) {
+        // Back to the centre every frame, so motion never runs out of screen.
+        const NSRect frame = impl_->window.frame;
+        const NSRect screen = impl_->window.screen.frame;
+        const CGPoint centre =
+            CGPointMake(frame.origin.x + frame.size.width * 0.5,
+                        screen.size.height - (frame.origin.y + frame.size.height * 0.5));
+        CGWarpMouseCursorPosition(centre);
+        // Without this the warp itself is reported as motion on the next
+        // event, and the camera snaps back as fast as it is turned.
+        CGAssociateMouseAndMouseCursorPosition(true);
+    }
     if (!impl_->window.isVisible) impl_->quit = true;
     if (impl_->quit) [impl_->window orderOut:nil];
     return !impl_->quit;
@@ -123,6 +196,24 @@ Input Window::TakeInput() {
     impl_->input = Input{};
     return out;
 }
+
+bool Window::IsMouseDown(MouseButton b) const {
+    const int i = int(b);
+    if (i < 0 || i >= int(MouseButton::Count)) return false;
+    return impl_->mouse_held[i];
+}
+
+void Window::SetCursorLocked(bool locked) {
+    if (locked == impl_->cursor_locked) return;
+    impl_->cursor_locked = locked;
+    if (locked) {
+        [NSCursor hide];
+    } else {
+        [NSCursor unhide];
+    }
+}
+
+bool Window::CursorLocked() const { return impl_->cursor_locked; }
 
 bool Window::IsKeyDown(char c) const {
     const unsigned char u = (unsigned char)c;

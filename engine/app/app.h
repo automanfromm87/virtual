@@ -43,7 +43,16 @@ struct Frame {
     int width = 0, height = 0;  // pixels, not points
     rhi::TextureId drawable;
     // Mouse motion since the last frame. Keys go through Actions().
+    //
+    // `drag_*` is motion with the left button held and `mouse_*` is all motion.
+    // Both exist because an orbit camera wants the first -- dragging is the
+    // gesture -- and a first-person camera wants the second, since a game that
+    // makes you hold a button to turn your head is not one.
     float drag_dx = 0.0f, drag_dy = 0.0f, scroll = 0.0f;
+    float mouse_dx = 0.0f, mouse_dy = 0.0f;
+    // The cursor in PIXELS, origin top left, matching the framebuffer.
+    float mouse_x = 0.0f, mouse_y = 0.0f;
+    bool mouse_inside = false;
 };
 
 class App {
@@ -60,6 +69,13 @@ class App {
     [[nodiscard]] FrameTargets& Targets();
     [[nodiscard]] ActionMap& Actions();
     [[nodiscard]] Clock& Time();
+
+    // Hides the cursor and pins it to the window's centre, so mouse motion
+    // keeps arriving after it would have run off the edge of the screen. What
+    // a first-person camera needs; also what stops a click landing in another
+    // application.
+    void SetCursorLocked(bool);
+    [[nodiscard]] bool CursorLocked() const;
 
     // True until the window closes. Checked BEFORE BeginFrame, so a frame that
     // could not be drawn does not look like a quit.

@@ -23,12 +23,17 @@ void ActionMap::BindAxis(std::string axis, char negative, char positive) {
     b.axis_positive = positive;
 }
 
-void ActionMap::Update(Keys held) {
+void ActionMap::BindMouse(std::string action, MouseButton b) {
+    Entry(action).mouse_mask |= 1u << int(b);
+}
+
+void ActionMap::Update(Keys held, std::uint32_t mouse) {
     for (auto& [name, b] : bindings_) {
         b.was_down = b.down;
         b.down = false;
         for (char k : b.keys)
             if (held.Get(k)) b.down = true;
+        if (b.mouse_mask & mouse) b.down = true;
         // An axis key counts as holding the action too, so a binding can be
         // read either way without declaring it twice.
         if (b.axis_negative && held.Get(b.axis_negative)) b.down = true;

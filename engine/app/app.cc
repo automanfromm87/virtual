@@ -60,6 +60,9 @@ Renderer& App::Draw() { return *impl_->renderer; }
 FrameTargets& App::Targets() { return *impl_->targets; }
 ActionMap& App::Actions() { return impl_->actions; }
 Clock& App::Time() { return impl_->clock; }
+void App::SetCursorLocked(bool locked) { impl_->window->SetCursorLocked(locked); }
+bool App::CursorLocked() const { return impl_->window->CursorLocked(); }
+
 bool App::Running() const { return impl_->running; }
 const Frame& App::Current() const { return impl_->frame; }
 
@@ -73,13 +76,27 @@ bool App::BeginFrame() {
     const platform::Input in = s.window->TakeInput();
     s.frame.drag_dx = in.drag_dx;
     s.frame.drag_dy = in.drag_dy;
+    s.frame.mouse_dx = in.mouse_dx;
+    s.frame.mouse_dy = in.mouse_dy;
+    s.frame.mouse_x = in.mouse_x;
+    s.frame.mouse_y = in.mouse_y;
+    s.frame.mouse_inside = in.mouse_inside;
     s.frame.scroll = in.scroll;
 
     // Held state, not the typed characters: key repeat turns a held key into a
     // stream of characters, and an edge derived from that fires over and over.
     Keys held;
     for (int c = 32; c < 127; ++c) held.Set(char(c), s.window->IsKeyDown(char(c)));
-    s.actions.Update(held);
+    // The two enums are separate so that :loop stays free of AppKit; this is
+    // what stops them drifting apart.
+    static_assert(int(MouseButton::Left) == int(platform::MouseButton::Left));
+    static_assert(int(MouseButton::Right) == int(platform::MouseButton::Right));
+    static_assert(int(MouseButton::Middle) == int(platform::MouseButton::Middle));
+    static_assert(int(MouseButton::Count) == int(platform::MouseButton::Count));
+    std::uint32_t mouse = 0;
+    for (int b = 0; b < int(platform::MouseButton::Count); ++b)
+        if (s.window->IsMouseDown(platform::MouseButton(b))) mouse |= 1u << b;
+    s.actions.Update(held, mouse);
 
     s.clock.Tick(Now());
     s.frame.dt = s.clock.Dt();

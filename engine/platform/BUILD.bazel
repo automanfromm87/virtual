@@ -10,8 +10,14 @@ package(default_visibility = ["//visibility:public"])
 # opaque void*, so the platform layer and the graphics API stay independent.
 objc_library(
     name = "platform",
-    srcs = ["window.mm"],
-    hdrs = ["window.h"],
+    srcs = [
+        "font.mm",
+        "window.mm",
+    ],
+    hdrs = [
+        "font.h",
+        "window.h",
+    ],
     linkopts = [
         "-framework",
         "AppKit",
@@ -19,6 +25,12 @@ objc_library(
         "QuartzCore",
         "-framework",
         "Foundation",
+        # CoreText rasterises the font atlas; CoreGraphics is the bitmap
+        # context it draws into.
+        "-framework",
+        "CoreText",
+        "-framework",
+        "CoreGraphics",
     ],
     target_compatible_with = ["@platforms//os:macos"],
 )

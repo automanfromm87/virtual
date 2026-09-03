@@ -20,6 +20,15 @@
 
 namespace eng::app {
 
+// Deliberately NOT platform::MouseButton, even though the values match.
+//
+// This library is pure C++ and is tested without a window, a GPU or AppKit --
+// that is the whole reason the timing and input logic lives apart from the
+// screen-sized targets next door. Including the platform header to reuse three
+// enumerators would give that up. App translates between them and asserts the
+// values agree, so the duplication cannot drift silently.
+enum class MouseButton : int { Left = 0, Right = 1, Middle = 2, Count = 3 };
+
 // Which ASCII keys are held right now. A plain bitset rather than a callback
 // into the window, so the whole mapping can be driven from a test.
 struct Keys {
@@ -44,6 +53,10 @@ class ActionMap {
   public:
     // Several keys may drive one action; one key may drive several actions.
     void Bind(std::string action, char key);
+    // The same action names, bound to a mouse button. One namespace on purpose:
+    // "fire" should not care whether it is the left button or the space bar,
+    // and a caller that has to ask which is a caller that cannot be rebound.
+    void BindMouse(std::string action, MouseButton);
     // A pair of keys reading as -1 and +1, which is what a movement axis is.
     void BindAxis(std::string axis, char negative, char positive);
 
@@ -53,7 +66,9 @@ class ActionMap {
     // keyboard state. Edges are derived from `held` rather than from `typed`:
     // key repeat makes a held key produce a stream of characters, so `typed`
     // would fire a press over and over.
-    void Update(Keys held);
+    // `mouse` is a bitmask of held buttons, one bit per MouseButton, so this
+    // signature does not grow a parameter every time a device is added.
+    void Update(Keys held, std::uint32_t mouse = 0);
 
     [[nodiscard]] bool Pressed(std::string_view action) const;   // went down
     [[nodiscard]] bool Released(std::string_view action) const;  // came up
@@ -67,6 +82,7 @@ class ActionMap {
   private:
     struct Binding {
         std::vector<char> keys;         // any of these
+        std::uint32_t mouse_mask = 0;   // ...or any of these buttons
         char axis_negative = 0;
         char axis_positive = 0;
         bool down = false, was_down = false;

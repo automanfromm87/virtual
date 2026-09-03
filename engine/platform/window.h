@@ -13,11 +13,37 @@ namespace eng::platform {
 // Everything that happened since the last TakeInput(). Deltas, not absolute
 // state: a camera controller wants "how far did the mouse move", and making it
 // difference two absolute positions itself is how frame-boundary bugs start.
+// Which mouse button. Named rather than numbered: `button == 2` at a call site
+// is a coin flip between middle and right, and the two conventions disagree.
+enum class MouseButton : int { Left = 0, Right = 1, Middle = 2, Count = 3 };
+
 struct Input {
-    float drag_dx = 0.0f;  // mouse motion with the left button held, in points
+    // Motion with the left button held. Kept separate from `mouse_dx` because
+    // an orbit camera wants exactly this and nothing else -- moving the cursor
+    // across the window must not spin the view.
+    float drag_dx = 0.0f;
     float drag_dy = 0.0f;
+    // ALL motion, held or not. What a first-person look needs, since a game
+    // that makes you hold a button to turn your head is not a first-person
+    // game.
+    float mouse_dx = 0.0f;
+    float mouse_dy = 0.0f;
     float scroll = 0.0f;
     std::string keys;  // characters typed this frame, lowercased — for toggles
+
+    // The cursor, in PIXELS with the origin at the TOP LEFT -- the same
+    // convention as the framebuffer, so a caller can index a rendered image
+    // with it directly. AppKit's own origin is bottom left and in points; both
+    // conversions happen once, here, rather than at every call site.
+    float mouse_x = 0.0f;
+    float mouse_y = 0.0f;
+    bool mouse_inside = false;
+
+    // Transitions this frame, so a click fires once. Held state is separate --
+    // see IsMouseDown -- because "did they click" and "are they dragging" are
+    // different questions and deriving one from the other needs memory.
+    bool pressed[int(MouseButton::Count)] = {};
+    bool released[int(MouseButton::Count)] = {};
 };
 
 class Window {
@@ -54,6 +80,14 @@ class Window {
     // per press, but walking forward has to keep happening while the key is
     // down. Both exist because they answer different questions.
     [[nodiscard]] bool IsKeyDown(char) const;
+    [[nodiscard]] bool IsMouseDown(MouseButton) const;
+
+    // Hides the cursor and keeps it pinned to the window's centre, so that
+    // motion keeps arriving after it would have reached the edge of the screen.
+    // What a first-person camera needs and the only way to get unbounded
+    // turning; also what stops a click landing on another application.
+    void SetCursorLocked(bool);
+    [[nodiscard]] bool CursorLocked() const;
 
   private:
     Window();

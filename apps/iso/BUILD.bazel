@@ -1,0 +1,16 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_binary(
+    name = "iso",
+    srcs = ["iso.cpp"],
+    deps = [
+        "//engine/app",
+        "//engine/geometry",
+        "//engine/physics",
+        "//engine/platform",
+        "//engine/render",
+        "//engine/text:ui",
+    ],
+)

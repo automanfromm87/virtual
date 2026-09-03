@@ -1,0 +1,30 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Immediate-mode 2D drawing. cc_library, not objc: the font is rasterised
+# behind engine/platform and everything here is pure C++.
+cc_library(
+    name = "ui",
+    srcs = ["ui.cc"],
+    hdrs = ["ui.h"],
+    copts = ["-Wno-c23-extensions"],
+    deps = [
+        "//engine/core",
+        "//engine/platform",
+        "//engine/rhi",
+        "//engine/shaders",
+    ],
+)
+
+cc_test(
+    name = "font_test",
+    srcs = ["font_test.cc"],
+    deps = ["//engine/platform"],
+)
+
+cc_test(
+    name = "ui_test",
+    srcs = ["ui_test.cc"],
+    deps = [":ui"],
+)
