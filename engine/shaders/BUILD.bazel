@@ -22,6 +22,7 @@ cc_library(
         "shadow.metal",
         "ssao.metal",
         "lit.metal",
+        "particles.metal",
         "triangle.metal",
     ],
     deps = ["//engine/core"],

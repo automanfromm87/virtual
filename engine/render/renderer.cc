@@ -482,7 +482,7 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
     desc.color = fmt;
     desc.samples = msaa;
     desc.depth = depth_test;
-    desc.blend = blend;
+    desc.blend = blend ? rhi::Blend::Alpha : rhi::Blend::None;
     // A blended surface must not write depth, or the transparent objects behind
     // it get rejected before they are ever shaded.
     desc.depth_write = !blend;

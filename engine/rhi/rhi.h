@@ -72,6 +72,8 @@ inline bool Valid(SamplerId h) { return h.v != 0; }
 inline bool Valid(AccelId h) { return h.v != 0; }
 inline bool Valid(ComputePipelineId h) { return h.v != 0; }
 
+enum class Blend : std::uint8_t { None, Alpha, Additive };
+
 struct PipelineDesc {
     // Shader source in the backend's own language. The RHI compiles it but
     // does not interpret it — choosing what the shader SAYS is the renderer's
@@ -92,9 +94,17 @@ struct PipelineDesc {
     // Depth-only: no fragment shader and no colour attachment. That is the
     // whole shadow pass — position out, depth written, nothing shaded.
     bool depth_only = false;
-    // Straight alpha blending, and normally paired with depth_write = false:
-    // a transparent surface must not stop what is behind it from drawing.
-    bool blend = false;
+    // How the fragment combines with what is already there. Normally paired
+    // with depth_write = false: a translucent surface must not stop what is
+    // behind it from drawing.
+    //
+    //   Alpha     src*a + dst*(1-a). Glass, smoke, anything that OCCLUDES.
+    //             Order-dependent, so it needs sorting back to front.
+    //   Additive  src*a + dst. Fire, sparks, magic -- anything that only ever
+    //             adds light. Order-INDEPENDENT, because addition commutes,
+    //             which is why a particle system that can use it should:
+    //             ten thousand sparks need no sort at all.
+    Blend blend = Blend::None;
     // Multisample count. Must match the attachments the pipeline will be used
     // with — a pipeline built for one sample cannot draw into a four-sample
     // target, and Metal rejects that outright rather than silently aliasing.

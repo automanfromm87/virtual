@@ -150,6 +150,39 @@ struct GpuDrawArgs {
     unsigned int base_instance;
 };
 
+// One particle. 64 bytes, and the packing is not tidiness -- a million
+// particles is 64 MB, and every field that earns its place costs another 4 MB.
+//
+// `life` counts DOWN, and life <= 0 is the only definition of dead. Keeping a
+// separate alive flag means two things that can disagree, and the one that
+// disagrees is always the one the renderer read.
+struct GpuParticle {
+    ENG_VEC4 position;  // xyz world, w = seconds of life remaining
+    ENG_VEC4 velocity;  // xyz m/s,   w = size in metres
+    ENG_VEC4 color;     // rgba at birth
+    // x = the lifetime it was born with, so the shader can compute normalised
+    // age without a second buffer. y = a per-particle random seed, kept so that
+    // anything wanting variation reads it instead of re-hashing the index and
+    // getting the same number in two places. zw spare.
+    ENG_VEC4 birth;
+};
+
+// Everything the simulation kernel needs. One block, uploaded per step.
+struct GpuParticleParams {
+    ENG_VEC4 origin;     // xyz emitter position, w = cone half-angle in radians
+    ENG_VEC4 direction;  // xyz mean emit direction (unit), w = speed
+    ENG_VEC4 gravity;    // xyz m/s^2, w = linear drag per second
+    ENG_VEC4 color;      // rgba at birth
+    // x dt, y speed variance, z lifetime, w lifetime variance
+    ENG_VEC4 motion;
+    // x size, y size variance, z how many to spawn this step, w frame index
+    // (the random seed's other half -- without it every frame emits the same
+    // particles into the same slots).
+    ENG_VEC4 emit;
+    // x capacity, yzw spare.
+    ENG_VEC4 limits;
+};
+
 struct SkinIn {
     ENG_UVEC4 joints;
     ENG_VEC4 weights;

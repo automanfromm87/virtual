@@ -647,15 +647,25 @@ PipelineId Device::CreatePipeline(const PipelineDesc& desc, std::string& error) 
     // Has to match the attachments exactly. Metal rejects a mismatch here,
     // which is the one class of format error it does NOT let through silently.
     pd.rasterSampleCount = NSUInteger(desc.samples > 0 ? desc.samples : 1);
-    if (desc.blend && !desc.depth_only) {
+    if (desc.blend != Blend::None && !desc.depth_only) {
         MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
         ca.blendingEnabled = YES;
         ca.rgbBlendOperation = MTLBlendOperationAdd;
         ca.alphaBlendOperation = MTLBlendOperationAdd;
         ca.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
         ca.sourceAlphaBlendFactor = MTLBlendFactorSourceAlpha;
-        ca.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-        ca.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        if (desc.blend == Blend::Additive) {
+            // ONE, so the destination is never scaled down. That is what makes
+            // it order-independent: addition commutes, so ten thousand sparks
+            // need no sort. It also means it can only brighten -- an additive
+            // surface cannot darken what is behind it, which is exactly right
+            // for fire and exactly wrong for smoke.
+            ca.destinationRGBBlendFactor = MTLBlendFactorOne;
+            ca.destinationAlphaBlendFactor = MTLBlendFactorOne;
+        } else {
+            ca.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            ca.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        }
     }
 
     PipelineObj obj;
