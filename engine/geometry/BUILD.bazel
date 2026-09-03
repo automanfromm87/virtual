@@ -12,6 +12,7 @@ cc_library(
         "floorplan.cc",
         "hull.cc",
         "mesh.cc",
+        "meshlet.cc",
     ],
     hdrs = [
         "simplify.h",
@@ -19,6 +20,7 @@ cc_library(
         "floorplan.h",
         "hull.h",
         "mesh.h",
+        "meshlet.h",
     ],
     deps = [
         "//engine/core",
@@ -53,5 +55,14 @@ cc_test(
 cc_test(
     name = "terrain_test",
     srcs = ["terrain_test.cc"],
+    deps = [":geometry"],
+)
+
+# Meshlets, on the CPU. The bounds and the normal cone are exact arithmetic and
+# a hole in a model is what a wrong one produces, so they are checked here
+# rather than by looking at a render.
+cc_test(
+    name = "meshlet_test",
+    srcs = ["meshlet_test.cc"],
     deps = [":geometry"],
 )

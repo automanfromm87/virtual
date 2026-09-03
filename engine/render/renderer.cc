@@ -77,6 +77,9 @@ constexpr char kClusterSrc[] = {
 constexpr char kOitSrc[] = {
 #embed "engine/shaders/oit.metal"
     , 0};
+constexpr char kMeshletSrc[] = {
+#embed "engine/shaders/meshlet.metal"
+    , 0};
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
 static_assert(sizeof(FrameUniforms) == 624, "FrameUniforms layout drifted");
@@ -170,6 +173,12 @@ struct GpuMesh {
         std::size_t vertex_count = 0;
     };
     Lod lods[kMaxLods];
+    // MESHLETS, when the mesh was uploaded through UploadMeshlets. Empty
+    // otherwise, and the meshlet draw skips the instance.
+    rhi::BufferId meshlet_buffer;
+    rhi::BufferId meshlet_vertices;
+    rhi::BufferId meshlet_triangles;
+    int meshlet_count = 0;
     int lod_count = 1;
     // Needed by compute skinning, which dispatches one thread per VERTEX while
     // every draw path counts indices.
@@ -372,6 +381,14 @@ struct Renderer::Impl {
     GpuClusters cluster_params{};
 
     // --- baked irradiance volume ----------------------------------------------
+    // The mesh-shader pipeline, built on first use. Not with the materials:
+    // it depends on nothing about the material, and building one per material
+    // would compile the same program dozens of times.
+    rhi::PipelineId meshlet_pipeline;
+    // Kept so the caller can find out WHY nothing drew. A mesh pipeline that
+    // fails to build makes DrawSceneMeshlets a no-op, and a silent no-op is
+    // indistinguishable from a scene with nothing in it.
+    std::string meshlet_error;
     rhi::TextureId gi_r, gi_g, gi_b;
     rhi::SamplerId gi_sampler;
     Vec4 gi_origin{0, 0, 0, 0};   // w = 1 when bound
@@ -463,9 +480,10 @@ struct Renderer::Impl {
 
     // Which of the three geometry passes is running. A bool was enough for
     // two; a third makes every call site read `false, true` and mean nothing.
-    enum class GeometryPass { Forward, GBuffer, Oit, Stereo };
+    enum class GeometryPass { Forward, GBuffer, Oit, Stereo, Meshlet };
     void DrawGeometry(rhi::Encoder&, const Scene&, int width, int height,
-                      rhi::TextureId shadow_map, GeometryPass pass);
+                      rhi::TextureId shadow_map, GeometryPass pass,
+                      rhi::BufferId meshlet_stats = {});
     void UploadLights(const Scene&, std::size_t light_offset, int light_count);
     void UploadCascades(const Scene&, std::size_t cascade_offset, float aspect);
     [[nodiscard]] rhi::Format FormatFor(Shading) const;
@@ -937,6 +955,110 @@ void Renderer::DrawOitResolve(rhi::Encoder& enc, rhi::TextureId accum,
     enc.SetFragmentTexture(revealage, 1);
     enc.SetFragmentSampler(impl_->clamp_sampler, 0);
     enc.Draw(3);
+}
+
+// Mirrors meshlet.metal's GpuMeshlet. Sixteen-byte aligned throughout, which
+// is why the three scalar counts sit beside vertex_offset rather than each
+// having their own float4.
+struct GpuMeshlet {
+    std::uint32_t vertex_offset;
+    std::uint32_t triangle_offset;
+    std::uint32_t vertex_count;
+    std::uint32_t triangle_count;
+    Vec4 sphere;
+    Vec4 cone;
+    Vec4 cone_apex;
+};
+static_assert(sizeof(GpuMeshlet) == 64, "GpuMeshlet layout drifted");
+
+const std::string& Renderer::MeshletError() const { return impl_->meshlet_error; }
+
+bool Renderer::SupportsMeshShaders() const {
+    return impl_->dev->SupportsMeshShaders();
+}
+
+MeshHandle Renderer::UploadMeshlets(const Mesh& original, std::string& error) {
+    if (!impl_->dev->SupportsMeshShaders()) {
+        error = "this GPU has no mesh shader stage";
+        return {};
+    }
+    // The ORDINARY upload first, so the mesh works through every existing path
+    // -- the shadow pass, the depth prepass, ray tracing -- and the meshlets are
+    // an addition rather than a replacement. A mesh that could only be drawn
+    // one way would need the whole renderer to know which.
+    const MeshHandle h = UploadMesh(original);
+    if (!Valid(h)) {
+        error = "the mesh could not be uploaded";
+        return {};
+    }
+    Mesh scratch;
+    const Mesh& mesh = WithTangents(original, scratch);
+    const MeshletBuild build = BuildMeshlets(mesh);
+    if (build.Empty()) {
+        error = "the mesh produced no meshlets";
+        return {};
+    }
+
+    std::vector<GpuMeshlet> gpu;
+    gpu.reserve(build.meshlets.size());
+    for (const Meshlet& m : build.meshlets) {
+        GpuMeshlet g{};
+        g.vertex_offset = m.vertex_offset;
+        g.triangle_offset = m.triangle_offset;
+        g.vertex_count = m.vertex_count;
+        g.triangle_count = m.triangle_count;
+        g.sphere = Vec4{m.center.x, m.center.y, m.center.z, m.radius};
+        g.cone = Vec4{m.cone_axis.x, m.cone_axis.y, m.cone_axis.z, m.cone_cutoff};
+        g.cone_apex = Vec4{m.cone_apex_offset, 0.0f, 0.0f, 0.0f};
+        gpu.push_back(g);
+    }
+
+    GpuMesh& gm = impl_->meshes[h.v];
+    gm.meshlet_buffer =
+        impl_->dev->CreateBuffer(gpu.data(), gpu.size() * sizeof(GpuMeshlet));
+    gm.meshlet_vertices = impl_->dev->CreateBuffer(
+        build.vertices.data(), build.vertices.size() * sizeof(std::uint32_t));
+    gm.meshlet_triangles =
+        impl_->dev->CreateBuffer(build.triangles.data(), build.triangles.size());
+    if (!Valid(gm.meshlet_buffer) || !Valid(gm.meshlet_vertices) ||
+        !Valid(gm.meshlet_triangles)) {
+        error = "could not upload the meshlet buffers";
+        return {};
+    }
+    gm.meshlet_count = int(build.meshlets.size());
+    return h;
+}
+
+void Renderer::DrawSceneMeshlets(rhi::Encoder& enc, const Scene& scene, int width,
+                                 int height, rhi::BufferId stats,
+                                 rhi::TextureId shadow_map) {
+    if (width <= 0 || height <= 0) return;
+    std::string error;
+    if (!Valid(impl_->meshlet_pipeline)) {
+        rhi::MeshPipelineDesc pd;
+        pd.source = ShadingSource(std::string(kLitSrc).append(kMeshletSrc).c_str());
+        pd.object_fn = "os_meshlet";
+        pd.mesh_fn = "ms_meshlet";
+        // The SAME fragment stage as the vertex path. Two copies of the shading
+        // is how two paths start disagreeing about what a surface looks like.
+        pd.fragment_fn = "fs_lit";
+        pd.color = kSceneFormat;
+        pd.depth = true;
+        pd.samples = impl_->samples;
+        pd.payload_bytes = 16;
+        pd.object_threads = 1;
+        // 128, because one thread writes one vertex and one triangle and a
+        // meshlet has up to 124 triangles.
+        pd.mesh_threads = 128;
+        impl_->meshlet_pipeline = impl_->dev->CreateMeshPipeline(pd, error);
+        if (!Valid(impl_->meshlet_pipeline)) {
+            impl_->meshlet_error = error;
+            return;
+        }
+    }
+
+    impl_->DrawGeometry(enc, scene, width, height, shadow_map,
+                        Impl::GeometryPass::Meshlet, stats);
 }
 
 bool Renderer::SetIrradianceVolume(const IrradianceVolume& v, std::string& error) {
@@ -1620,10 +1742,12 @@ void Renderer::Impl::UploadCascades(const Scene& scene,
 
 void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
                                   int width, int height,
-                                  rhi::TextureId shadow_map, GeometryPass pass) {
+                                  rhi::TextureId shadow_map, GeometryPass pass,
+                                  rhi::BufferId meshlet_stats) {
     const bool gbuffer = pass == GeometryPass::GBuffer;
     const bool oit = pass == GeometryPass::Oit;
     const bool stereo = pass == GeometryPass::Stereo;
+    const bool meshlet = pass == GeometryPass::Meshlet;
     stats = RenderStats{};
     stats.submitted = int(scene.instances.size());
     draw_order.clear();
@@ -1833,6 +1957,67 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
 
         // Sub-allocate out of this frame's slot instead of a per-draw setBytes.
         std::memcpy(uniform_map + offset, &u, sizeof(u));
+
+        // MESHLETS: only instances whose mesh has them, and the pipeline is
+        // one program for every material rather than one per material.
+        //
+        // AFTER the uniform block has been written, which is why this is here
+        // and not up beside the pipeline selection. Put there, the object and
+        // mesh stages read whichever ring slot the last frame left -- and
+        // because the last frame's camera was the same, the frustum test
+        // appeared to work while the mesh stage transformed every vertex by a
+        // stale model matrix and drew nothing.
+        if (meshlet) {
+            if (gm.meshlet_count <= 0) {
+                ++stats.invalid;
+                continue;
+            }
+            if (meshlet_pipeline.v != bound_pipeline.v) {
+                enc.SetPipeline(meshlet_pipeline);
+                bound_pipeline = meshlet_pipeline;
+                ++stats.pipeline_switches;
+            }
+            enc.SetCull(mat.cull, rhi::Winding::CounterClockwise);
+            // THREE argument tables, not one. The object stage, the mesh stage
+            // and the fragment stage each have their own, and SetVertexBuffer
+            // reaches none of them -- binding that way compiles, runs, and
+            // delivers nothing at all.
+            enc.SetObjectBuffer(uniforms, offset, kUniformSlot);
+            enc.SetObjectBuffer(gm.meshlet_buffer, 0, 4);
+            if (Valid(meshlet_stats)) enc.SetObjectBuffer(meshlet_stats, 0, 8);
+            enc.SetMeshBuffer(gm.vb, 0, kVertexSlot);
+            enc.SetMeshBuffer(uniforms, offset, kUniformSlot);
+            enc.SetMeshBuffer(gm.meshlet_buffer, 0, 4);
+            enc.SetMeshBuffer(gm.meshlet_vertices, 0, 5);
+            enc.SetMeshBuffer(gm.meshlet_triangles, 0, 6);
+            enc.SetFragmentBuffer(uniforms, offset, kUniformSlot);
+            enc.SetFragmentBuffer(lights, light_offset, kLightSlot);
+            enc.SetFragmentBuffer(cascades, cascade_offset, kCascadeSlot);
+            enc.SetFragmentTexture(mat.albedo, 0);
+            enc.SetFragmentTexture(mat.roughness_map, 1);
+            enc.SetFragmentTexture(shadow_tex, 2);
+            enc.SetFragmentTexture(
+                Valid(shadow_atlas) ? shadow_atlas : dummy_shadow, 3);
+            enc.SetFragmentTexture(mat.normal_map, 4);
+            enc.SetFragmentTexture(mat.metallic_map, 8);
+            enc.SetFragmentTexture(mat.emissive_map, 9);
+            enc.SetFragmentTexture(mat.occlusion_map, 10);
+            enc.SetFragmentSampler(sampler, 0);
+            enc.SetFragmentSampler(shadow_sampler, 2);
+            enc.SetFragmentTexture(env.irradiance, 5);
+            enc.SetFragmentTexture(env.specular, 6);
+            enc.SetFragmentTexture(env.brdf_lut, 7);
+            enc.SetFragmentSampler(env.cube_sampler, 1);
+            enc.SetFragmentTexture(gi_r, 11);
+            enc.SetFragmentTexture(gi_g, 12);
+            enc.SetFragmentTexture(gi_b, 13);
+            enc.SetFragmentSampler(gi_sampler, 3);
+            enc.DrawMeshThreadgroups(gm.meshlet_count, 1, 128);
+            ++stats.draws;
+            draw_order.push_back(item.index);
+            continue;
+        }
+
 
         enc.SetVertexBuffer(gm.vb, 0, kVertexSlot);
         enc.SetVertexBuffer(uniforms, offset, kUniformSlot);

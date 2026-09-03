@@ -14,6 +14,7 @@
 
 #include "engine/anim/anim.h"
 #include "engine/geometry/mesh.h"
+#include "engine/geometry/meshlet.h"
 #include "engine/resource/handles.h"
 #include <span>
 
@@ -624,6 +625,29 @@ class Renderer {
         int max_slice = -1;
     };
     [[nodiscard]] ClusterStats ReadClusterStats();
+
+    // MESH SHADERS. A mesh uploaded as meshlets and drawn through the object and
+    // mesh stages, with per-meshlet frustum and backface culling on the GPU.
+    //
+    // Returns false and fills `error` when the hardware has no mesh stage; the
+    // caller keeps using UploadMesh and the vertex path, which is what every
+    // other entry point here does anyway.
+    [[nodiscard]] bool SupportsMeshShaders() const;
+    [[nodiscard]] MeshHandle UploadMeshlets(const Mesh&, std::string& error);
+    // Draws every instance whose mesh has meshlets. `stats` is a storage buffer
+    // of at least one uint32, zeroed by the caller; the object stage counts the
+    // meshlets that survived culling into it.
+    //
+    // A counter and not a readback of the draw: a mesh-shader pipeline never
+    // tells the CPU how much it drew, which is the point -- and it also means
+    // there is no way to distinguish culling that works from culling that does
+    // nothing without asking for the number explicitly.
+    void DrawSceneMeshlets(rhi::Encoder&, const Scene&, int width, int height,
+                           rhi::BufferId stats, rhi::TextureId shadow_map = {});
+    // Why the meshlet path drew nothing, if it drew nothing. Empty when the
+    // pipeline built. A no-op that says nothing is indistinguishable from an
+    // empty scene.
+    [[nodiscard]] const std::string& MeshletError() const;
 
     // STEREO RENDERING, into a two-layer target, in ONE pass.
     //

@@ -1162,6 +1162,68 @@ void Device::DestroyTexture(TextureId t) {
     impl_->free_textures.push_back(t.v);
 }
 
+bool Device::SupportsMeshShaders() const {
+    return [impl_->dev supportsFamily:MTLGPUFamilyApple7] ||
+           [impl_->dev supportsFamily:MTLGPUFamilyMetal3];
+}
+
+PipelineId Device::CreateMeshPipeline(const MeshPipelineDesc& desc,
+                                      std::string& error) { @autoreleasepool {
+    if (!SupportsMeshShaders()) {
+        error = "this GPU has no mesh shader stage";
+        return {};
+    }
+    NSError* err = nil;
+    id<MTLLibrary> lib = [impl_->dev
+        newLibraryWithSource:[NSString stringWithUTF8String:desc.source.c_str()]
+                     options:nil
+                       error:&err];
+    if (!lib) {
+        error = std::string("shader compile failed: ") +
+                err.localizedDescription.UTF8String;
+        return {};
+    }
+    MTLMeshRenderPipelineDescriptor* pd =
+        [[MTLMeshRenderPipelineDescriptor alloc] init];
+    pd.objectFunction =
+        [lib newFunctionWithName:[NSString stringWithUTF8String:desc.object_fn.c_str()]];
+    pd.meshFunction =
+        [lib newFunctionWithName:[NSString stringWithUTF8String:desc.mesh_fn.c_str()]];
+    pd.fragmentFunction =
+        [lib newFunctionWithName:[NSString stringWithUTF8String:desc.fragment_fn.c_str()]];
+    if (!pd.meshFunction || !pd.fragmentFunction) {
+        error = "mesh or fragment function not found in the shader source";
+        return {};
+    }
+    pd.colorAttachments[0].pixelFormat = ToMTL(desc.color);
+    for (std::size_t i = 0; i < desc.extra_colors.size(); ++i)
+        pd.colorAttachments[i + 1].pixelFormat = ToMTL(desc.extra_colors[i]);
+    if (desc.depth) pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    pd.rasterSampleCount = NSUInteger(desc.samples > 0 ? desc.samples : 1);
+    pd.payloadMemoryLength = NSUInteger(desc.payload_bytes);
+    pd.maxTotalThreadsPerObjectThreadgroup = NSUInteger(desc.object_threads);
+    pd.maxTotalThreadsPerMeshThreadgroup = NSUInteger(desc.mesh_threads);
+
+    PipelineObj obj;
+    obj.pso = [impl_->dev newRenderPipelineStateWithMeshDescriptor:pd
+                                                           options:MTLPipelineOptionNone
+                                                        reflection:nil
+                                                             error:&err];
+    if (!obj.pso) {
+        error = std::string("mesh pipeline creation failed: ") +
+                err.localizedDescription.UTF8String;
+        return {};
+    }
+    if (desc.depth) {
+        MTLDepthStencilDescriptor* dd = [[MTLDepthStencilDescriptor alloc] init];
+        dd.depthCompareFunction = ToMTL(desc.depth_compare);
+        dd.depthWriteEnabled = desc.depth_write;
+        obj.dss = [impl_->dev newDepthStencilStateWithDescriptor:dd];
+    }
+    impl_->pipelines.push_back(obj);
+    return PipelineId{std::uint32_t(impl_->pipelines.size() - 1)};
+}}
+
 std::unique_ptr<Swapchain> Device::CreateSwapchain(Format format,
                                                    std::string& error, bool hdr) {
     if (hdr && format != Format::RGBA16Float) {
@@ -1575,6 +1637,27 @@ void Encoder::DrawInstanced(std::size_t vertex_count, std::size_t instance_count
                            vertexStart:0
                            vertexCount:vertex_count
                          instanceCount:instance_count];
+}
+
+void Encoder::SetObjectBuffer(BufferId b, std::size_t offset, int slot) {
+    [device_->impl_->enc setObjectBuffer:device_->impl_->buffers[b.v]
+                                 offset:offset
+                                atIndex:NSUInteger(slot)];
+}
+
+void Encoder::SetMeshBuffer(BufferId b, std::size_t offset, int slot) {
+    [device_->impl_->enc setMeshBuffer:device_->impl_->buffers[b.v]
+                               offset:offset
+                              atIndex:NSUInteger(slot)];
+}
+
+void Encoder::DrawMeshThreadgroups(int count, int object_threads,
+                                   int mesh_threads) {
+    if (count <= 0) return;
+    [device_->impl_->enc
+        drawMeshThreadgroups:MTLSizeMake(NSUInteger(count), 1, 1)
+        threadsPerObjectThreadgroup:MTLSizeMake(NSUInteger(object_threads), 1, 1)
+          threadsPerMeshThreadgroup:MTLSizeMake(NSUInteger(mesh_threads), 1, 1)];
 }
 
 void Encoder::DrawIndexedU32(BufferId indices, std::size_t index_count) {

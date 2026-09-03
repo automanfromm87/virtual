@@ -172,6 +172,34 @@ struct PipelineDesc {
     bool depth_write = true;
 };
 
+// A MESH-SHADER pipeline: an object stage, a mesh stage and a fragment stage.
+//
+// The object stage runs one threadgroup per meshlet, decides whether the
+// meshlet is visible, and launches zero or one mesh threadgroups accordingly.
+// That is the whole point: a culled meshlet costs one object threadgroup and
+// nothing else -- no vertex fetch, no transform, no rasterisation, and no
+// indirect-draw buffer to write and read back.
+struct MeshPipelineDesc {
+    std::string source;
+    std::string object_fn;
+    std::string mesh_fn;
+    std::string fragment_fn;
+    Format color = Format::BGRA8Unorm;
+    std::vector<Format> extra_colors;
+    bool depth = false;
+    bool depth_write = true;
+    Compare depth_compare = Compare::Greater;
+    int samples = 1;
+    // Bytes the object stage may pass to the mesh stage. It is threadgroup
+    // memory, so it is small and it has to be declared.
+    int payload_bytes = 16;
+    // Threads per group in each stage. The mesh stage's has to be at least the
+    // larger of the meshlet's vertex and primitive counts, because one thread
+    // writes one of each.
+    int object_threads = 1;
+    int mesh_threads = 128;
+};
+
 // How long one pass took ON THE GPU.
 //
 // Not the CPU time spent recording it, which is what a CPU profiler measures
@@ -283,6 +311,16 @@ class Encoder {
     // scanned or sculpted asset clears without trying -- and the failure is not
     // an error, it is triangles wrapping back to the start of the buffer. The
     // extra two bytes per index is the cheapest correctness there is.
+    // The OBJECT and MESH stages have their own argument tables. A mesh-shader
+    // pipeline has three producer stages and SetVertexBuffer reaches none of
+    // them -- binding through it compiles, runs, and delivers nothing, which
+    // reads as a scene with no geometry in it.
+    void SetObjectBuffer(BufferId, std::size_t offset, int slot);
+    void SetMeshBuffer(BufferId, std::size_t offset, int slot);
+    // One object threadgroup per meshlet. Each one decides for itself whether
+    // to launch a mesh threadgroup, so `count` is the number of CANDIDATES and
+    // not the number that will be drawn.
+    void DrawMeshThreadgroups(int count, int object_threads, int mesh_threads);
     void DrawIndexedU32(BufferId indices, std::size_t index_count);
     // One draw, `instance_count` copies. The shader reads instance_id and
     // looks up whatever differs per copy; nothing else changes.
@@ -565,6 +603,11 @@ class Device {
     [[nodiscard]] AccelId CreateTlas(std::span<const AccelInstance> instances,
                                      std::string& error);
     [[nodiscard]] PipelineId CreatePipeline(const PipelineDesc&, std::string& error);
+    // A mesh-shader pipeline. Returns a null handle with a message when the
+    // hardware has no mesh stage; the caller falls back to the vertex path.
+    [[nodiscard]] PipelineId CreateMeshPipeline(const MeshPipelineDesc&,
+                                                std::string& error);
+    [[nodiscard]] bool SupportsMeshShaders() const;
     // `source` is backend shader source, `fn` the kernel's name.
     [[nodiscard]] ComputePipelineId CreateComputePipeline(const std::string& source,
                                                           const std::string& fn,

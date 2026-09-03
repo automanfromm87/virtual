@@ -1,0 +1,16 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Mesh shaders on the GPU. meshlet_test proves the split; this proves the mesh
+# stage draws the same picture and that the culling culls.
+cc_test(
+    name = "meshlet_render_test",
+    srcs = ["main.cpp"],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+    ],
+)
