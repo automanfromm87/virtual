@@ -52,10 +52,16 @@ struct PipelineId {
 struct SamplerId {
     std::uint32_t v = 0;
 };
+// A ray tracing acceleration structure -- either the per-mesh BVH over
+// triangles, or the top-level one over instances of those.
+struct AccelId {
+    std::uint32_t v = 0;
+};
 inline bool Valid(BufferId h) { return h.v != 0; }
 inline bool Valid(TextureId h) { return h.v != 0; }
 inline bool Valid(PipelineId h) { return h.v != 0; }
 inline bool Valid(SamplerId h) { return h.v != 0; }
+inline bool Valid(AccelId h) { return h.v != 0; }
 
 struct PipelineDesc {
     // Shader source in the backend's own language. The RHI compiles it but
@@ -138,6 +144,12 @@ class Encoder {
     // Binds a render target from an earlier pass as a sampled input.
     void SetFragmentTexture(TextureId, int slot);
     void SetFragmentSampler(SamplerId, int slot);
+    // Binds a top-level acceleration structure for the fragment stage, and
+    // makes it and everything it references resident. Residency is the part
+    // that is easy to miss: an acceleration structure reached indirectly, and
+    // the geometry buffers under it, are invisible to the driver's automatic
+    // tracking.
+    void SetFragmentAccel(AccelId, int slot);
     // Small per-draw constants. The backend copies immediately, so the pointer
     // does not have to outlive the call.
     void SetVertexBytes(const void* data, std::size_t bytes, int slot);
@@ -213,6 +225,45 @@ class Device {
     [[nodiscard]] TextureId CreateTexture2D(int width, int height,
                                             const void* rgba8);
     [[nodiscard]] SamplerId CreateSampler(Filter, Wrap);
+
+    // --- ray tracing ---------------------------------------------------------
+    //
+    // Two levels, and the split is the whole reason hardware ray tracing is
+    // affordable. A BOTTOM-level structure is a BVH over one mesh's triangles,
+    // built once and reused; a TOP-level structure is a much smaller BVH over
+    // instances of those, each with its own transform, rebuilt when things
+    // move. A scene of a thousand crates builds one crate BVH and a thousand
+    // cheap instance records, not a thousand BVHs.
+    //
+    // False on hardware without ray tracing. Everything below returns a null
+    // handle in that case rather than failing at build time, so a renderer can
+    // fall back to shadow maps at runtime.
+    [[nodiscard]] bool SupportsRaytracing() const;
+
+    // A BVH over `index_count` indices into `vb`. The vertex buffer's positions
+    // must be the FIRST three floats of each `vertex_stride` bytes, which is
+    // what the engine's VertexIn already is.
+    //
+    // No vertex COUNT: the triangles are named entirely by the index buffer, so
+    // Metal never needs one, and a parameter that is only validated and then
+    // ignored is worse than no parameter at all.
+    [[nodiscard]] AccelId CreateBlas(BufferId vb, int vertex_stride, BufferId ib,
+                                     int index_count, std::string& error);
+
+    struct AccelInstance {
+        AccelId blas;
+        // Object -> world, COLUMN-MAJOR, 16 floats. A plain array and not the
+        // engine's Mat4: this header depends on nothing inside the engine, and
+        // a matrix type is exactly the sort of thing that quietly makes an RHI
+        // reach upward.
+        //
+        // Only the upper 3x4 is used. An instance cannot carry a projection,
+        // and while a non-uniform scale is allowed, a shear is where
+        // intersection precision starts to suffer.
+        float transform[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    };
+    [[nodiscard]] AccelId CreateTlas(std::span<const AccelInstance> instances,
+                                     std::string& error);
     [[nodiscard]] PipelineId CreatePipeline(const PipelineDesc&, std::string& error);
     // Releases the texture. The handle is dangling afterwards — the caller is
     // responsible for not reusing it. No generation counters yet.

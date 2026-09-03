@@ -15,6 +15,7 @@ cc_library(
         "bloom.metal",
         "composite.metal",
         "deferred.metal",
+        "raytrace.metal",
         "shading.metal",
         "shadow.metal",
         "ssao.metal",

@@ -48,6 +48,9 @@ constexpr char kShadingSrc[] = {
 constexpr char kDeferredSrc[] = {
 #embed "engine/shaders/deferred.metal"
     , 0};
+constexpr char kRaytraceSrc[] = {
+#embed "engine/shaders/raytrace.metal"
+    , 0};
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
 static_assert(sizeof(FrameUniforms) == 416, "FrameUniforms layout drifted");
@@ -159,6 +162,15 @@ struct Renderer::Impl {
     rhi::BufferId triangle_vb;
     rhi::PipelineId composite;
     rhi::PipelineId deferred_light;
+    // Built lazily: compiling a ray tracing shader on a device that has none
+    // fails, and most scenes never ask for one.
+    rhi::PipelineId ray_shadow;
+    bool ray_shadow_tried = false;
+    rhi::AccelId scene_tlas;
+    // Bottom-level structure per registered mesh, or a null handle for one
+    // that has not needed one yet. Indexed by MeshHandle.
+    std::vector<rhi::AccelId> mesh_blas;
+    int blas_builds = 0;
     rhi::PipelineId shadow;
     rhi::PipelineId shadow_skinned;
     rhi::TextureId shadow_atlas;
@@ -358,6 +370,10 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
         desc.vertex_fn = skinned ? "vs_skinned" : "vs_lit";
         desc.fragment_fn = "fs_gbuffer";
         desc.extra_colors = {kSceneFormat};  // attachment 1: normal + metallic
+    } else if (shading == Shading::RayShadow) {
+        desc.source = ShaderSource(kRaytraceSrc);
+        desc.vertex_fn = "vs_rt_shadow";
+        desc.fragment_fn = "fs_rt_shadow";
     } else if (shading == Shading::DeferredLight) {
         desc.source = ShadingSource(std::string(kLitSrc).append(kDeferredSrc).c_str());
         desc.vertex_fn = "vs_deferred";
@@ -1298,6 +1314,100 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
         Valid(impl_->shadow_atlas) ? impl_->shadow_atlas : impl_->dummy_shadow, 3);
     enc.SetFragmentTexture(depth, 4);
     enc.SetFragmentSampler(impl_->sampler, 0);
+    enc.Draw(3);
+}
+
+int Renderer::BlasBuilds() const { return impl_->blas_builds; }
+
+bool Renderer::RaytracingAvailable() const {
+    return impl_->dev->SupportsRaytracing();
+}
+
+bool Renderer::BuildSceneAccel(const Scene& scene, std::string& error) {
+    if (!impl_->dev->SupportsRaytracing()) {
+        error = "this device has no hardware ray tracing";
+        return false;
+    }
+
+    impl_->mesh_blas.resize(impl_->meshes.size());
+    std::vector<rhi::Device::AccelInstance> instances;
+    instances.reserve(scene.instances.size());
+
+    for (const Instance& inst : scene.instances) {
+        if (!Valid(inst.mesh) || inst.mesh.v >= impl_->meshes.size()) continue;
+        const GpuMesh& gm = impl_->meshes[inst.mesh.v];
+        // A SKINNED mesh is deliberately left out. Its triangles live only in
+        // the vertex shader's output -- the buffer on the GPU is the bind pose
+        // -- so a structure built from it would cast the shadow of a character
+        // standing still while the character walks. Doing it properly needs the
+        // skinned positions written back to a buffer first, which is a real
+        // feature and not a line of code.
+        if (gm.joint_count > 0) continue;
+
+        rhi::AccelId& blas = impl_->mesh_blas[inst.mesh.v];
+        if (!Valid(blas)) {
+            // Built ONCE per mesh and reused by every instance of it. That is
+            // the entire reason for a two-level structure: a thousand crates
+            // build one BVH and a thousand transforms, not a thousand BVHs.
+            blas = impl_->dev->CreateBlas(gm.vb, int(sizeof(VertexIn)), gm.ib,
+                                          int(gm.index_count), error);
+            if (!Valid(blas)) return false;
+            ++impl_->blas_builds;
+        }
+        rhi::Device::AccelInstance ai;
+        ai.blas = blas;
+        std::memcpy(ai.transform, &inst.model.col[0].x, sizeof(float) * 16);
+        instances.push_back(ai);
+    }
+
+    if (instances.empty()) {
+        error = "no ray-traceable geometry in the scene";
+        return false;
+    }
+    const rhi::AccelId tlas = impl_->dev->CreateTlas(instances, error);
+    if (!Valid(tlas)) return false;
+    impl_->scene_tlas = tlas;
+    return true;
+}
+
+void Renderer::DrawRayShadows(rhi::Encoder& enc, const Scene& scene, int width,
+                              int height, rhi::TextureId depth,
+                              rhi::TextureId normals) {
+    if (width <= 0 || height <= 0) return;
+    if (!Valid(impl_->scene_tlas) || !Valid(depth) || !Valid(normals)) return;
+
+    if (!impl_->ray_shadow_tried) {
+        impl_->ray_shadow_tried = true;
+        std::string err;
+        impl_->ray_shadow =
+            impl_->GetOrCreatePipeline(Shading::RayShadow, false, false, err);
+    }
+    if (!Valid(impl_->ray_shadow)) return;
+
+    const float aspect = float(width) / float(height);
+    const Mat4 viewProj = scene.camera.ViewProj(aspect);
+    FrameUniforms u{};
+    u.viewProj = viewProj;
+    u.invViewProj = Inverse(viewProj);
+    u.lightDir = scene.lightDir;
+    // The ray's maximum length. A directional light has no position, so without
+    // a bound the ray runs to infinity and every pixel pays for traversing the
+    // empty half of the BVH.
+    u.ssao = Vec4{0.0f, 0.0f, 0.0f, scene.shadowDistance > 0.0f
+                                        ? scene.shadowDistance * 2.0f
+                                        : 200.0f};
+
+    const std::size_t offset = impl_->AllocUniform();
+    if (offset == Impl::kNoSpace) return;
+    std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
+
+    enc.SetPipeline(impl_->ray_shadow);
+    enc.SetCull(rhi::Cull::None, rhi::Winding::CounterClockwise);
+    enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
+    enc.SetFragmentTexture(depth, 0);
+    enc.SetFragmentTexture(normals, 1);
+    enc.SetFragmentSampler(impl_->sampler, 0);
+    enc.SetFragmentAccel(impl_->scene_tlas, 4);
     enc.Draw(3);
 }
 

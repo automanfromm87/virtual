@@ -1186,6 +1186,206 @@ int main() {
         compare("three cascades");
     }
 
+    // --- ray-traced shadows --------------------------------------------------
+    //
+    // A shadow map answers "is this lit" from a grid that has nothing to do
+    // with the camera's, so it has a resolution, a bias, and a box outside
+    // which nothing casts. A ray asks the geometry.
+    //
+    // The scene here is deliberately trivial, because a trivial scene has an
+    // ANALYTIC answer: a unit sphere three metres above a floor, lit from
+    // straight overhead, casts a disc of radius exactly 1 centred exactly under
+    // it. So the test does not compare two renderers and hope -- it checks
+    // where the shadow is against where geometry says it must be.
+    {
+        std::printf("\nray-traced shadows\n");
+        Check(renderer->RaytracingAvailable(),
+              "the device reports hardware ray tracing");
+        if (renderer->RaytracingAvailable()) {
+            std::string rerr;
+            auto rt = eng::Renderer::Create(*dev, kFmt, rerr, 1);
+            if (!rt) { std::fprintf(stderr, "FAIL: %s\n", rerr.c_str()); return 1; }
+
+            const eng::MeshHandle floor_mesh =
+                rt->UploadMesh(eng::MakeBox(eng::Vec3{12.0f, 0.1f, 12.0f},
+                                            eng::Vec4{0.8f, 0.8f, 0.8f, 1.0f}));
+            const eng::MeshHandle ball_mesh = rt->UploadMesh(eng::MakeUVSphere(
+                1.0f, 48, 64, eng::Vec4{0.9f, 0.4f, 0.3f, 1.0f},
+                eng::Vec4{0.9f, 0.4f, 0.3f, 1.0f}));
+            eng::MaterialDesc md;
+            md.shading = eng::Shading::Lit;
+            const eng::MaterialHandle mat = rt->CreateMaterial(md, rerr);
+            Check(Valid(floor_mesh) && Valid(ball_mesh) && Valid(mat),
+                  "the ray tracing scene's meshes uploaded");
+
+            eng::Scene rs;
+            // Straight down, so the shadow lands directly beneath the sphere
+            // and its position is arithmetic rather than a projection.
+            rs.lightDir = eng::Vec4{0.0f, 1.0f, 0.0f, 0.0f};
+            rs.lightColor = eng::Vec4{1.0f, 1.0f, 1.0f, 1.0f};
+            rs.shadowExtent = 14.0f;
+            rs.shadowDistance = 40.0f;
+            rs.camera.eye = eng::Vec3{6.0f, 7.0f, 9.0f};
+            rs.camera.target = eng::Vec3{0.0f, 0.5f, 0.0f};
+            {
+                eng::Instance f;
+                f.mesh = floor_mesh;
+                f.material = mat;
+                f.model = eng::Mat4::Translation(eng::Vec3{0.0f, -0.1f, 0.0f});
+                rs.instances.push_back(f);
+                eng::Instance b;
+                b.mesh = ball_mesh;
+                b.material = mat;
+                b.model = eng::Mat4::Translation(eng::Vec3{0.0f, 3.0f, 0.0f});
+                rs.instances.push_back(b);
+            }
+
+            Check(rt->BuildSceneAccel(rs, rerr),
+                  "the scene's acceleration structures built");
+            if (!rerr.empty()) std::fprintf(stderr, "    %s\n", rerr.c_str());
+
+            // DEDUPLICATION, which is the reason a two-level structure exists
+            // at all. Add eight more spheres and the count of bottom-level
+            // structures must not move: they share one mesh, so they share one
+            // BVH and differ only by a transform. Building one each would look
+            // identical on screen and cost build time and memory that nothing
+            // in a rendered image could ever reveal.
+            {
+                eng::Scene many = rs;
+                for (int i = 0; i < 8; ++i) {
+                    eng::Instance b;
+                    b.mesh = ball_mesh;
+                    b.material = mat;
+                    b.model = eng::Mat4::Translation(
+                        eng::Vec3{float(i) * 1.7f - 6.0f, 5.0f, -4.0f});
+                    many.instances.push_back(b);
+                }
+                const int before = rt->BlasBuilds();
+                std::string e2;
+                Check(rt->BuildSceneAccel(many, e2),
+                      "a scene with nine spheres builds");
+                std::printf("    %zu instances of 2 distinct meshes: %d "
+                            "bottom-level structures built in total\n",
+                            many.instances.size(), rt->BlasBuilds());
+                Check(rt->BlasBuilds() == before,
+                      "eight more instances of the same mesh build no new BVH");
+                Check(rt->BlasBuilds() == 2, "one per distinct mesh, ever");
+            }
+            // Back to the two-object scene the geometry below is about.
+            Check(rt->BuildSceneAccel(rs, rerr), "and rebuilds for the test scene");
+
+            const eng::rhi::TextureId rgb0 =
+                dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
+            const eng::rhi::TextureId rgb1 =
+                dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
+            const eng::rhi::TextureId rdepth = dev->CreateDepthTarget(kW, kH, true);
+            const eng::rhi::TextureId rmask =
+                dev->CreateRenderTarget(kW, kH, kFmt, true);
+            Check(Valid(rgb0) && Valid(rmask), "the ray tracing targets were created");
+
+            eng::RenderGraph g;
+            {
+                eng::RenderGraph::Pass p;
+                p.name = "gbuffer";
+                p.color = rgb0;
+                p.extra_colors = {rgb1};
+                p.depth = rdepth;
+                p.clear_depth = 0.0f;
+                p.keep_depth = true;
+                p.execute = [&](eng::rhi::Encoder& e) {
+                    rt->DrawGBuffer(e, rs, kW, kH);
+                };
+                g.AddPass(std::move(p));
+            }
+            {
+                eng::RenderGraph::Pass p;
+                p.name = "ray shadows";
+                p.color = rmask;
+                p.reads = {rdepth, rgb1};
+                // White: a pixel the pass never touches is UNSHADOWED, which is
+                // the value that makes a later multiply a no-op. Clearing to
+                // black would put the background in shadow.
+                p.clear_color[0] = 1.0f; p.clear_color[1] = 1.0f;
+                p.clear_color[2] = 1.0f; p.clear_color[3] = 1.0f;
+                p.execute = [&](eng::rhi::Encoder& e) {
+                    rt->DrawRayShadows(e, rs, kW, kH, rdepth, rgb1);
+                };
+                g.AddPass(std::move(p));
+            }
+            std::string ge;
+            Check(g.Compile(ge), "the ray tracing graph compiles");
+            if (!ge.empty()) std::fprintf(stderr, "    %s\n", ge.c_str());
+            dev->BeginFrame();
+            g.Execute(*dev);
+            std::string we;
+            Check(dev->CommitAndWait(we), "the ray tracing frame submits");
+            if (!we.empty()) std::fprintf(stderr, "    %s\n", we.c_str());
+
+            std::vector<std::uint8_t> mask(std::size_t(kW) * kH * 4, 0);
+            Check(dev->ReadPixels(rmask, kW, kH, mask), "the shadow mask reads back");
+
+            // Where a world point lands on screen, for this camera.
+            const auto project = [&](eng::Vec3 w, int* px, int* py) {
+                const eng::Vec4 clip = rs.camera.ViewProj(float(kW) / float(kH)) *
+                                       eng::Vec4{w.x, w.y, w.z, 1.0f};
+                *px = int((clip.x / clip.w * 0.5f + 0.5f) * float(kW));
+                *py = int((1.0f - (clip.y / clip.w * 0.5f + 0.5f)) * float(kH));
+            };
+            const auto shadowed_at = [&](eng::Vec3 w) {
+                int px = 0, py = 0;
+                project(w, &px, &py);
+                if (px < 1 || py < 1 || px >= kW - 1 || py >= kH - 1) return -1;
+                // A small average, so one stray pixel on a triangle edge does
+                // not decide the answer.
+                int sum = 0;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx)
+                        sum += mask[(std::size_t(py + dy) * kW + (px + dx)) * 4];
+                return sum / 9;
+            };
+
+            // The disc has radius 1 at the origin. Inside it is dark, outside
+            // is light, and the interesting part is that the boundary is where
+            // the geometry says and not where a texel grid happens to fall.
+            const int centre = shadowed_at(eng::Vec3{0, 0, 0});
+            const int inside = shadowed_at(eng::Vec3{0.55f, 0, 0.55f});  // r=0.78
+            const int just_out = shadowed_at(eng::Vec3{1.25f, 0, 0});
+            const int far_out = shadowed_at(eng::Vec3{4.0f, 0, 0});
+            const int behind = shadowed_at(eng::Vec3{0, 0, 4.0f});
+            std::printf("    visibility under the sphere %d, at r=0.78 %d, at "
+                        "r=1.25 %d, at r=4 %d, behind %d\n",
+                        centre, inside, just_out, far_out, behind);
+            Check(centre < 20, "directly under the sphere is in shadow");
+            Check(inside < 20, "and so is the rest of the disc");
+            Check(just_out > 235, "a quarter of a metre outside it is not");
+            Check(far_out > 235 && behind > 235, "and neither is the open floor");
+
+            // The RADIUS, measured rather than assumed. Walking outward along
+            // the floor, the transition must happen at 1.0 -- that number is
+            // the sphere's radius and nothing in the renderer knows it.
+            float edge = -1.0f;
+            for (int i = 0; i <= 400; ++i) {
+                const float r = float(i) * 0.005f;
+                if (shadowed_at(eng::Vec3{r, 0, 0}) > 128) { edge = r; break; }
+            }
+            std::printf("    the shadow's edge is at r = %.3f (the sphere's "
+                        "radius is 1.000)\n", edge);
+            Check(edge > 0.97f && edge < 1.06f,
+                  "the shadow disc is exactly as wide as the sphere");
+
+            // And it is a real image, not a uniform one: an all-black or
+            // all-white mask would satisfy some of the above by accident.
+            long long lit = 0, dark = 0;
+            for (std::size_t i = 0; i + 3 < mask.size(); i += 4) {
+                if (mask[i] > 200) ++lit;
+                else if (mask[i] < 50) ++dark;
+            }
+            std::printf("    %lld pixels lit, %lld in shadow\n", lit, dark);
+            Check(dark > 2000, "the shadow covers a real area");
+            Check(lit > dark * 3, "and most of the frame is not in it");
+        }
+    }
+
     std::printf(g_failures == 0 ? "\ngallery_test: all checks passed\n"
                                 : "\ngallery_test: %d FAILED\n", g_failures);
     return g_failures == 0 ? 0 : 1;

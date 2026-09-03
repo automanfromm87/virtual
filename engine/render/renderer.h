@@ -45,6 +45,9 @@ enum class Shading : std::uint8_t {
     // pixel once, however many lights there are.
     GBuffer,
     DeferredLight,
+    // Ray-traced shadows: fullscreen, traces one ray per pixel at the sun and
+    // writes visibility. Needs hardware ray tracing and a built scene BVH.
+    RayShadow,
 };
 
 // What a surface looks like and how it is rasterised.
@@ -223,6 +226,34 @@ class Renderer {
     void DrawDeferredLight(rhi::Encoder&, const Scene&, int width, int height,
                            rhi::TextureId albedo_rough, rhi::TextureId normal_metal,
                            rhi::TextureId depth, rhi::TextureId shadow_map = {});
+
+    // --- ray tracing ---------------------------------------------------------
+    //
+    // Builds a bottom-level structure per registered mesh and a top-level one
+    // over the scene's instances. Call it after the scene's transforms change;
+    // the per-mesh structures are reused, which is the whole reason the split
+    // exists.
+    //
+    // Returns false and leaves the previous structure in place if the device
+    // has no ray tracing, so a caller can ask and fall back.
+    [[nodiscard]] bool BuildSceneAccel(const Scene&, std::string& error);
+    [[nodiscard]] bool RaytracingAvailable() const;
+
+    // How many bottom-level structures BuildSceneAccel has actually BUILT,
+    // cumulatively. Builds, not live structures: a two-level structure exists
+    // so that a thousand instances of one mesh cost one BVH and a thousand
+    // transforms, and a version that rebuilt per instance would still end up
+    // with one per mesh in the table. Counting the table cannot see the
+    // difference; counting the builds can, and nothing else would ever notice,
+    // because the picture is identical either way.
+    [[nodiscard]] int BlasBuilds() const;
+
+    // One shadow ray per pixel, at the directional light. Writes visibility in
+    // 0..1 -- the same thing a shadow-map lookup produces, so it goes in the
+    // same place. `normals` is the G-buffer's normal target; the ray needs it
+    // to offset its origin off the surface it starts on.
+    void DrawRayShadows(rhi::Encoder&, const Scene&, int width, int height,
+                        rhi::TextureId depth, rhi::TextureId normals);
     void DrawTriangle(rhi::Encoder&, int width, int height);
 
     // Fullscreen pass that samples `src` (a colour target written earlier this

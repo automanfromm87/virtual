@@ -118,6 +118,15 @@ struct Device::Impl {
     }
     std::vector<PipelineObj> pipelines{PipelineObj{}};
     std::vector<id<MTLSamplerState>> samplers{nil};
+
+    // Acceleration structures, and for each one everything the GPU must have
+    // resident to traverse it. A top-level structure REFERENCES its bottom-level
+    // ones, and those reference the vertex and index buffers, and none of that
+    // is visible to the driver's automatic residency tracking -- binding only
+    // the top-level structure and tracing into it is a GPU fault, not a wrong
+    // picture.
+    std::vector<id<MTLAccelerationStructure>> accels{nil};
+    std::vector<std::vector<id<MTLResource>>> accel_deps{{}};
 };
 
 Device::Device() : impl_(std::make_unique<Impl>()) {}
@@ -134,6 +143,182 @@ Device::~Device() {
         for (int i = 0; i < kFramesInFlight; ++i)
             dispatch_semaphore_signal(impl_->frame_sem);
     }
+}
+
+bool Device::SupportsRaytracing() const {
+    return impl_->dev != nil && impl_->dev.supportsRaytracing;
+}
+
+namespace {
+
+// Builds one acceleration structure and waits for it. Synchronous on purpose:
+// these are built at load time, and threading a build through the frame's
+// command buffer would mean the first frame traces a structure that is not
+// finished yet -- which reads as geometry missing from reflections for one
+// frame and is very hard to attribute.
+id<MTLAccelerationStructure> BuildAccel(id<MTLDevice> dev,
+                                        id<MTLCommandQueue> queue,
+                                        MTLAccelerationStructureDescriptor* desc,
+                                        std::string& error) {
+    const MTLAccelerationStructureSizes sizes =
+        [dev accelerationStructureSizesWithDescriptor:desc];
+    id<MTLAccelerationStructure> accel =
+        [dev newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+    if (!accel) {
+        error = "could not allocate an acceleration structure";
+        return nil;
+    }
+    id<MTLBuffer> scratch =
+        [dev newBufferWithLength:std::max<NSUInteger>(sizes.buildScratchBufferSize, 16)
+                         options:MTLResourceStorageModePrivate];
+    if (!scratch) {
+        error = "could not allocate acceleration structure scratch";
+        return nil;
+    }
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLAccelerationStructureCommandEncoder> enc =
+        [cb accelerationStructureCommandEncoder];
+    [enc buildAccelerationStructure:accel descriptor:desc scratchBuffer:scratch
+               scratchBufferOffset:0];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.error) {
+        error = std::string("acceleration structure build failed: ") +
+                cb.error.localizedDescription.UTF8String;
+        return nil;
+    }
+    return accel;
+}
+
+}  // namespace
+
+AccelId Device::CreateBlas(BufferId vb, int vertex_stride, BufferId ib,
+                           int index_count, std::string& error) {
+    if (!SupportsRaytracing()) {
+        error = "this device has no hardware ray tracing";
+        return {};
+    }
+    if (!Valid(vb) || vb.v >= impl_->buffers.size() || !Valid(ib) ||
+        ib.v >= impl_->buffers.size() || vertex_stride <= 0 || index_count <= 0) {
+        error = "CreateBlas: bad buffer or count";
+        return {};
+    }
+    // Triangles, so the index count must divide by three. A partial triangle
+    // would be read as whatever follows it in the buffer.
+    if (index_count % 3 != 0) {
+        error = "CreateBlas: index count is not a multiple of 3";
+        return {};
+    }
+
+    MTLAccelerationStructureTriangleGeometryDescriptor* geo =
+        [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+    geo.vertexBuffer = impl_->buffers[vb.v];
+    geo.vertexBufferOffset = 0;
+    geo.vertexStride = NSUInteger(vertex_stride);
+    geo.indexBuffer = impl_->buffers[ib.v];
+    geo.indexBufferOffset = 0;
+    geo.indexType = MTLIndexTypeUInt16;
+    geo.triangleCount = NSUInteger(index_count / 3);
+    // OPAQUE. Without it every hit would invoke an intersection function to ask
+    // whether it counts, which is both slower and pointless for geometry that
+    // has no alpha cutout.
+    geo.opaque = YES;
+
+    MTLPrimitiveAccelerationStructureDescriptor* desc =
+        [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+    desc.geometryDescriptors = @[geo];
+
+    id<MTLAccelerationStructure> accel =
+        BuildAccel(impl_->dev, impl_->queue, desc, error);
+    if (!accel) return {};
+
+    impl_->accels.push_back(accel);
+    // The geometry buffers have to stay resident whenever this structure is
+    // traversed: the BVH's leaves point into them.
+    impl_->accel_deps.push_back({impl_->buffers[vb.v], impl_->buffers[ib.v]});
+    return AccelId{std::uint32_t(impl_->accels.size() - 1)};
+}
+
+AccelId Device::CreateTlas(std::span<const AccelInstance> instances,
+                           std::string& error) {
+    if (!SupportsRaytracing()) {
+        error = "this device has no hardware ray tracing";
+        return {};
+    }
+    if (instances.empty()) {
+        error = "CreateTlas: no instances";
+        return {};
+    }
+
+    // The distinct bottom-level structures, and each instance's index into that
+    // list. Deduplicating is the entire point of a two-level structure: a
+    // thousand crates share one BVH and differ only by a transform.
+    NSMutableArray<id<MTLAccelerationStructure>>* blas_list = [NSMutableArray array];
+    std::vector<std::uint32_t> blas_of_instance;
+    std::vector<std::uint32_t> unique;
+    std::vector<id<MTLResource>> deps;
+    for (const AccelInstance& inst : instances) {
+        if (!Valid(inst.blas) || inst.blas.v >= impl_->accels.size()) {
+            error = "CreateTlas: an instance names an unbuilt structure";
+            return {};
+        }
+        std::uint32_t at = 0;
+        bool found = false;
+        for (std::uint32_t i = 0; i < unique.size(); ++i)
+            if (unique[i] == inst.blas.v) { at = i; found = true; break; }
+        if (!found) {
+            at = std::uint32_t(unique.size());
+            unique.push_back(inst.blas.v);
+            [blas_list addObject:impl_->accels[inst.blas.v]];
+            deps.push_back(impl_->accels[inst.blas.v]);
+            for (id<MTLResource> r : impl_->accel_deps[inst.blas.v])
+                deps.push_back(r);
+        }
+        blas_of_instance.push_back(at);
+    }
+
+    id<MTLBuffer> inst_buf = [impl_->dev
+        newBufferWithLength:sizeof(MTLAccelerationStructureInstanceDescriptor) *
+                            instances.size()
+                    options:MTLResourceStorageModeShared];
+    if (!inst_buf) {
+        error = "CreateTlas: could not allocate the instance buffer";
+        return {};
+    }
+    auto* d = static_cast<MTLAccelerationStructureInstanceDescriptor*>(
+        inst_buf.contents);
+    for (std::size_t i = 0; i < instances.size(); ++i) {
+        d[i] = {};
+        d[i].accelerationStructureIndex = blas_of_instance[i];
+        d[i].options = MTLAccelerationStructureInstanceOptionOpaque;
+        d[i].mask = 0xFF;
+        d[i].intersectionFunctionTableOffset = 0;
+        // MTLPackedFloat4x3 holds four COLUMNS of three components: the three
+        // basis vectors and then the translation. That is the same order the
+        // engine's column-major 4x4 already has, minus the bottom row -- so
+        // this is a copy and not a transpose. Transposing it here is the
+        // classic way to get a scene that renders correctly and whose shadows
+        // are rotated.
+        for (int c = 0; c < 4; ++c)
+            for (int r = 0; r < 3; ++r)
+                d[i].transformationMatrix.columns[c][r] =
+                    instances[i].transform[c * 4 + r];
+    }
+
+    MTLInstanceAccelerationStructureDescriptor* desc =
+        [MTLInstanceAccelerationStructureDescriptor descriptor];
+    desc.instancedAccelerationStructures = blas_list;
+    desc.instanceCount = instances.size();
+    desc.instanceDescriptorBuffer = inst_buf;
+
+    id<MTLAccelerationStructure> accel =
+        BuildAccel(impl_->dev, impl_->queue, desc, error);
+    if (!accel) return {};
+
+    impl_->accels.push_back(accel);
+    impl_->accel_deps.push_back(std::move(deps));
+    return AccelId{std::uint32_t(impl_->accels.size() - 1)};
 }
 
 std::unique_ptr<Device> Device::Create(std::string& error) {
@@ -610,6 +795,29 @@ void Encoder::SetFragmentBytes(const void* data, std::size_t bytes, int slot) {
 void Encoder::SetFragmentTexture(TextureId t, int slot) {
     [device_->impl_->enc setFragmentTexture:device_->impl_->textures[t.v]
                                     atIndex:NSUInteger(slot)];
+}
+
+void Encoder::SetFragmentAccel(AccelId a, int slot) {
+    if (!device_ || !Valid(a) || a.v >= device_->impl_->accels.size()) return;
+    id<MTLRenderCommandEncoder> enc = device_->impl_->enc;
+    // Residency FIRST, then the binding. Everything the structure reaches --
+    // the bottom-level structures and the vertex and index buffers under them
+    // -- is referenced by GPU address rather than by a binding, so no automatic
+    // tracking sees it.
+    //
+    // Honest note: removing these calls does NOT fault on this driver, with
+    // Metal API validation and GPU validation both on. The tests cannot
+    // demonstrate the difference, so they do not claim to. The calls stay
+    // because the contract requires them and the failure they prevent is a
+    // fault under memory pressure or on another device -- the kind that
+    // reproduces on someone else's machine and not on this one.
+    for (id<MTLResource> r : device_->impl_->accel_deps[a.v])
+        [enc useResource:r usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+    [enc useResource:device_->impl_->accels[a.v]
+               usage:MTLResourceUsageRead
+              stages:MTLRenderStageFragment];
+    [enc setFragmentAccelerationStructure:device_->impl_->accels[a.v]
+                            atBufferIndex:NSUInteger(slot)];
 }
 
 void Encoder::SetFragmentSampler(SamplerId s, int slot) {

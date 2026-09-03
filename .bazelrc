@@ -39,3 +39,13 @@ test --test_output=errors
 # restart plus one clean refetch, and .bazelrc does not expand $USER. Preferred
 # once apple_support stops claiming all of $HOME/Library as system includes.
 build --features=no_dotd_file
+
+# Deployment target. Not cosmetic: apple_support defaults to macOS 10.11, and
+# everything the engine actually uses -- Metal acceleration structures, tile
+# memory, half-float render targets -- is newer than that. The compiler is
+# right to warn, and burying the warnings would mean missing the one that says
+# a symbol genuinely is not there at runtime.
+#
+# 13.0 because that is where MTLAccelerationStructure's instancing API settled.
+build --macos_minimum_os=13.0
+build --host_macos_minimum_os=13.0
