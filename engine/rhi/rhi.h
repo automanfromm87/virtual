@@ -32,6 +32,14 @@ enum class Format : std::uint8_t {
     // scale and a bias, both in 0..1, and nothing else. RGBA16Float would work
     // and would waste half the bandwidth of a texture sampled once per pixel.
     RG16Float,
+    // sRGB. The SAME bytes as RGBA8Unorm, decoded to linear by the sampler and
+    // encoded back on write. Not a convenience: an 8-bit albedo texture is
+    // authored in sRGB -- that is what every paint program and every camera
+    // produces -- and reading it as linear makes midtones roughly twice as
+    // bright as they should be. It also makes mip generation correct, because
+    // the hardware averages after decoding rather than averaging gamma-encoded
+    // bytes, which darkens every mip level.
+    RGBA8Srgb,
     // Full float, for the places where half is measurably not enough. An
     // equirectangular sky holds a sun at tens of thousands of nits, and half
     // saturates at 65504 -- close enough to matter, and the failure is a sun
@@ -225,10 +233,14 @@ class Encoder {
     // vertex id, where there is no index buffer to point at -- a decal's
     // projection box, a batch of billboards.
     void DrawInstanced(std::size_t vertex_count, std::size_t instance_count);
-    void DrawIndexedU16(BufferId indices, std::size_t index_count);
+    // 32-BIT indices, always. 16 bits caps a mesh at 65535 vertices, which any
+    // scanned or sculpted asset clears without trying -- and the failure is not
+    // an error, it is triangles wrapping back to the start of the buffer. The
+    // extra two bytes per index is the cheapest correctness there is.
+    void DrawIndexedU32(BufferId indices, std::size_t index_count);
     // One draw, `instance_count` copies. The shader reads instance_id and
     // looks up whatever differs per copy; nothing else changes.
-    void DrawIndexedInstancedU16(BufferId indices, std::size_t index_count,
+    void DrawIndexedInstancedU32(BufferId indices, std::size_t index_count,
                                  std::size_t instance_count);
     // The instance count and the index range come from a BUFFER the GPU wrote,
     // so the CPU never learns them. That is the point: a culling pass on the
@@ -236,7 +248,7 @@ class Encoder {
     // cost a full pipeline stall -- which is more than the culling saves.
     //
     // `args` must hold a GpuDrawArgs at `offset`.
-    void DrawIndexedIndirectU16(BufferId indices, BufferId args,
+    void DrawIndexedIndirectU32(BufferId indices, BufferId args,
                                 std::size_t offset);
 
   private:
@@ -354,15 +366,36 @@ class Device {
 
     // Sampled texture uploaded from CPU pixels. `rgba8` must hold
     // width*height*4 bytes, first row at the top.
+    //
+    // `mips` builds the full chain down to 1x1 and fills it on the GPU. On by
+    // default because the alternative is not "slightly softer at distance", it
+    // is severe aliasing: a textured floor sampled at one texel per several
+    // pixels shimmers violently as the camera moves, and temporal
+    // antialiasing cannot fix it -- TAA averages samples of a signal that is
+    // already undersampled, so it converges on the wrong answer smoothly.
+    //
+    // `srgb` decodes in the sampler. Any 8-bit ALBEDO or emissive map wants it
+    // on; a roughness, metallic, occlusion or NORMAL map wants it off, because
+    // those store numbers rather than colours and an sRGB decode bends them.
     [[nodiscard]] TextureId CreateTexture2D(int width, int height,
-                                            const void* rgba8);
+                                            const void* rgba8, bool mips = true,
+                                            bool srgb = false);
     // The same, from FLOAT pixels: `rgba32f` holds width*height*4 floats.
     // What an HDR environment arrives as, and the reason it cannot go through
     // the 8-bit path -- the whole point of an environment map is the values
     // above one, and an 8-bit texture has none.
     [[nodiscard]] TextureId CreateTexture2DFloat(int width, int height,
                                                  const float* rgba32f);
-    [[nodiscard]] SamplerId CreateSampler(Filter, Wrap);
+    // `max_anisotropy` above 1 turns on anisotropic filtering: up to that many
+    // samples along the axis of greatest compression.
+    //
+    // It is the fix for the OTHER half of minification aliasing. A mip chain
+    // picks one level for both axes, so a floor seen at a grazing angle -- very
+    // compressed along one axis and barely along the other -- has to choose
+    // between aliasing across and blurring along. 16 is the hardware maximum
+    // and costs nothing on a surface facing the camera, because the sample
+    // count scales with the actual anisotropy rather than being fixed.
+    [[nodiscard]] SamplerId CreateSampler(Filter, Wrap, int max_anisotropy = 1);
     // A sampler that filters ACROSS MIP LEVELS as well as within one. Separate
     // from the ordinary one because it is wrong nearly everywhere else: a UI
     // atlas or a shadow map has no mip chain, and asking for trilinear on one

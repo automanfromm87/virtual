@@ -93,8 +93,8 @@ inline Flag MakeFlag() {
                 const int lo = std::min(int(along), kJoints - 1);
                 const int hi = std::min(lo + 1, kJoints - 1);
                 eng::anim::SkinVertex sv;
-                sv.joints[0] = std::uint16_t(lo);
-                sv.joints[1] = std::uint16_t(hi);
+                sv.joints[0] = std::uint32_t(lo);
+                sv.joints[1] = std::uint32_t(hi);
                 sv.weights[0] = 1.0f - (along - float(lo));
                 sv.weights[1] = along - float(lo);
                 eng::anim::NormalizeWeights(&sv);
@@ -104,10 +104,10 @@ inline Flag MakeFlag() {
         const int base = side * verts_per_sheet;
         for (int r = 0; r < kSpanRows; ++r) {
             for (int c = 0; c < kSpanCols; ++c) {
-                const auto a = std::uint16_t(base + r * (kSpanCols + 1) + c);
-                const auto b = std::uint16_t(a + 1);
-                const auto d = std::uint16_t(a + kSpanCols + 1);
-                const auto e = std::uint16_t(d + 1);
+                const auto a = std::uint32_t(base + r * (kSpanCols + 1) + c);
+                const auto b = std::uint32_t(a + 1);
+                const auto d = std::uint32_t(a + kSpanCols + 1);
+                const auto e = std::uint32_t(d + 1);
                 // a->e->d is counter-clockwise seen from +z: the cross product
                 // of (e-a) and (d-a) is +z, which is what side 0's vertex
                 // normal claims. Wound the other way the sheet whose normal

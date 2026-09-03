@@ -74,7 +74,7 @@ struct FloorPlan {
 
 // Ear clipping. Exposed for testing: a triangulator that silently drops a
 // triangle produces a floor with an invisible hole in it.
-[[nodiscard]] std::vector<std::uint16_t> TriangulatePolygon(
+[[nodiscard]] std::vector<std::uint32_t> TriangulatePolygon(
     const std::vector<Vec2>& outline);
 
 }  // namespace eng

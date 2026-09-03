@@ -63,6 +63,14 @@ struct FrameUniforms {
     // it does the lighting and every actual light in the scene stops mattering.
     ENG_VEC4 ambientSky;
     ENG_VEC4 ambientGround;
+    // .rgb emissive radiance, multiplied by the emissive map. .w is the normal
+    // map's strength.
+    //
+    // Radiance and not a colour: it is added to the lit result AFTER everything
+    // else and before the tone map, so a value of 40 is a filament and a value
+    // of 1 is a surface no brighter than a lit wall. Anything at or below 1
+    // will not bloom, because the bloom threshold is in the same linear units.
+    ENG_VEC4 emissive;
 };
 
 // A local light. Sixteen bytes times four, so the array packs with no padding
@@ -218,13 +226,29 @@ struct VertexIn {
     ENG_VEC3 normal;    // object space, unit length; .w unused
     ENG_VEC4 color;
     // .xy = texture coordinates, origin top-left to match Metal's texture
-    // convention. .zw reserved (tangent sign / a second uv set later).
+    // convention. .zw reserved (a second uv set later).
     //
     // A bare float2 would be tempting, but MSL would align the struct to 16
     // anyway and the padding lands somewhere less useful. The unused .w lanes
     // of position and normal cannot be used instead: they are float3 on the
     // MSL side, which occupies 16 bytes but exposes only .xyz.
     ENG_VEC4 uv;
+    // TANGENT, object space. .xyz is the direction in which u increases across
+    // the surface; .w is the handedness of the bitangent, +1 or -1.
+    //
+    // Why a whole extra 16 bytes per vertex: a normal map stores a perturbation
+    // in TANGENT space -- relative to the surface's own uv axes -- and there is
+    // no way to recover those axes from position and normal alone. Two meshes
+    // with identical geometry and mirrored uvs need opposite bitangents, which
+    // is exactly what .w records; deriving the bitangent as cross(N, T) without
+    // it inverts every mirrored shell, and a mirrored shell is what half of
+    // every character model is.
+    //
+    // Computing the frame in the fragment shader from screen derivatives is the
+    // other option and it is worse: it costs four derivatives per pixel, it is
+    // wrong wherever the derivative crosses a uv seam, and it cannot be
+    // orthogonalised consistently between neighbouring triangles.
+    ENG_VEC4 tangent;
 };
 
 #endif  // ENGINE_SHADER_TYPES_H

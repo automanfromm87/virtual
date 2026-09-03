@@ -16,7 +16,49 @@ struct VSOut {
     float4 color;
     float2 uv;
     float4 lightClip;  // position in the light's clip space, for the shadow lookup
+    // World-space tangent in xyz, the bitangent's handedness in w. Interpolated
+    // like the normal, and like the normal it comes out short -- the fragment
+    // renormalises. w is constant across a triangle in every mesh this engine
+    // produces, so interpolating it is free and it survives.
+    float4 tangentW;
 };
+
+// Perturbs a world normal by a tangent-space normal map sample.
+//
+// A no-op when nothing is bound: an unbound texture makes is_null_texture true
+// and the interpolated vertex normal comes straight back out, so an untextured
+// material costs one branch and no samples.
+static inline float3 ApplyNormalMap(float3 N, float4 tangentW, float2 uv,
+                                    texture2d<float> normalMap, sampler smp,
+                                    float strength)
+{
+    if (is_null_texture(normalMap)) return N;
+
+    // Re-orthogonalise against the INTERPOLATED normal. The tangent was made
+    // perpendicular to the vertex normal at mesh time, but interpolation across
+    // a triangle does not preserve that, and a TBN whose axes are not
+    // orthogonal is not invertible by transpose -- which is how it is used
+    // below.
+    float3 T = tangentW.xyz - N * dot(N, tangentW.xyz);
+    const float len = length(T);
+    if (len < 1e-6f) return N;  // degenerate frame: better flat than NaN
+    T /= len;
+    const float3 B = cross(N, T) * tangentW.w;
+
+    // Unpack from 0..1 to -1..1. Only xy are used to rebuild z: an 8-bit map's
+    // blue channel is the least precise of the three and is redundant given the
+    // other two are unit-length together, so reconstructing it is both cheaper
+    // and more accurate than trusting it. It also makes two-channel maps (BC5,
+    // which stores exactly xy) work with no special case.
+    float2 xy = normalMap.sample(smp, uv).xy * 2.0f - 1.0f;
+    // STRENGTH scales the tangent-space slope, not the final vector. Scaling
+    // the vector and renormalising would rotate it toward the surface normal
+    // non-linearly and saturate; scaling xy before rebuilding z is the same
+    // thing as making the bumps taller or shallower.
+    xy *= strength;
+    const float z = sqrt(max(1.0f - dot(xy, xy), 0.0f));
+    return normalize(T * xy.x + B * xy.y + N * z);
+}
 
 vertex VSOut vs_lit(uint                     vid   [[vertex_id]],
                     device const VertexIn*   verts [[buffer(0)]],
@@ -35,6 +77,8 @@ vertex VSOut vs_lit(uint                     vid   [[vertex_id]],
     o.color = verts[vid].color * u.tint;
     o.uv = verts[vid].uv.xy;
     o.lightClip = u.lightViewProj * worldPos;
+    o.tangentW = float4((u.model * float4(verts[vid].tangent.xyz, 0.0f)).xyz,
+                        verts[vid].tangent.w);
     return o;
 }
 
@@ -69,6 +113,8 @@ vertex VSOut vs_lit_instanced(uint                      vid       [[vertex_id]],
     o.color = verts[vid].color * inst.tint;
     o.uv = verts[vid].uv.xy;
     o.lightClip = u.lightViewProj * worldPos;
+    o.tangentW = float4((inst.model * float4(verts[vid].tangent.xyz, 0.0f)).xyz,
+                        verts[vid].tangent.w);
     return o;
 }
 
@@ -102,6 +148,13 @@ vertex VSOut vs_skinned(uint                     vid     [[vertex_id]],
     o.color = verts[vid].color * u.tint;
     o.uv = verts[vid].uv.xy;
     o.lightClip = u.lightViewProj * worldPos;
+    // The tangent is skinned by the SAME blended matrix as the normal. Skinning
+    // them with different matrices, or skinning only one, tears the frame apart
+    // wherever a joint bends -- and a torn frame is a seam of wrong lighting
+    // exactly at the elbow, which is where the eye is looking.
+    const float3 skinnedT = (blend * float4(verts[vid].tangent.xyz, 0.0f)).xyz;
+    o.tangentW = float4((u.model * float4(skinnedT, 0.0f)).xyz,
+                        verts[vid].tangent.w);
     return o;
 }
 
@@ -113,13 +166,18 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
                        texture2d<float> roughnessMap [[texture(1)]],
                        depth2d<float>   shadowMap    [[texture(2)]],
                        depth2d<float>   shadowAtlas  [[texture(3)]],
+                       texture2d<float> normalMap    [[texture(4)]],
                        // The environment probe, slots 5-7. Left unbound when
                        // there is none, which ShadeSurface detects.
                        texturecube<float> irradianceMap [[texture(5)]],
                        texturecube<float> specularMap   [[texture(6)]],
                        texture2d<float>   brdfLut       [[texture(7)]],
+                       texture2d<float> metallicMap  [[texture(8)]],
+                       texture2d<float> emissiveMap  [[texture(9)]],
+                       texture2d<float> occlusionMap [[texture(10)]],
                        sampler          smp          [[sampler(0)]],
-                       sampler          envSmp       [[sampler(1)]])
+                       sampler          envSmp       [[sampler(1)]],
+                       sampler          shadowSmp    [[sampler(2)]])
 {
     // SECTION CUT before anything else: no point shading a fragment that is
     // about to be thrown away. This is what lets you look inside a building
@@ -132,7 +190,11 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
         in.color.rgb * u.baseColor.rgb * albedoMap.sample(smp, in.uv).rgb;
     const float roughness =
         saturate(u.surface.x * roughnessMap.sample(smp, in.uv).r);
-    const float metallic = saturate(u.surface.y);
+    const float metallic = saturate(u.surface.y * metallicMap.sample(smp, in.uv).r);
+    const float ao = occlusionMap.sample(smp, in.uv).r;
+
+    const float3 N = ApplyNormalMap(normalize(in.normalW), in.tangentW, in.uv,
+                                    normalMap, smp, u.emissive.w);
 
     // LINEAR HDR out, un-tone-mapped and un-gamma-corrected. The scene target
     // is half-float and the composite does both at the end.
@@ -141,9 +203,14 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
     // surface to one before anything downstream sees it, so a lamp and a sheet
     // of white paper arrive at the bloom pass identical and it glows off the
     // paper. Brightness has to survive to the end of the frame to be usable.
-    const float3 lit = ShadeSurface(in.worldPos, in.normalW, albedo, roughness,
+    const float3 lit = ShadeSurface(in.worldPos, N, albedo, roughness,
                                     metallic, in.lightClip, u, lights, cascades,
-                                    shadowMap, shadowAtlas, smp,
-                                    irradianceMap, specularMap, brdfLut, envSmp);
-    return float4(lit, in.color.a);
+                                    shadowMap, shadowAtlas, shadowSmp,
+                                    irradianceMap, specularMap, brdfLut, envSmp,
+                                    ao);
+    // EMISSION last and unlit. It is radiance the surface produces, so nothing
+    // shadows it, no light affects it and ambient occlusion does not dim it --
+    // a glowing sign in a dark alcove is exactly as bright as one in the open.
+    const float3 emit = u.emissive.rgb * emissiveMap.sample(smp, in.uv).rgb;
+    return float4(lit + emit, in.color.a);
 }

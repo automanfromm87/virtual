@@ -146,7 +146,7 @@ std::unique_ptr<FluidSim> FluidSim::Create(rhi::Device& dev,
     im.buckets = dev.CreateStorageBuffer(
         sizeof(std::uint32_t) * std::size_t(im.CellCount()) *
         std::size_t(cfg.bucket_capacity));
-    const std::uint16_t quad[6] = {0, 1, 2, 2, 1, 3};
+    const std::uint32_t quad[6] = {0, 1, 2, 2, 1, 3};
     im.quad_ib = dev.CreateBuffer(quad, sizeof(quad));
     if (!Valid(im.particles) || !Valid(im.accel) || !Valid(im.counts) ||
         !Valid(im.buckets) || !Valid(im.quad_ib)) {
@@ -272,7 +272,7 @@ void FluidSim::Draw(rhi::Encoder& enc, const Camera& camera, int width,
     enc.SetVertexBuffer(impl_->particles, 0, 0);
     enc.SetVertexBytes(&u, sizeof(u), 1);
     enc.SetVertexBytes(&params, sizeof(params), 2);
-    enc.DrawIndexedInstancedU16(impl_->quad_ib, 6, std::size_t(impl_->count));
+    enc.DrawIndexedInstancedU32(impl_->quad_ib, 6, std::size_t(impl_->count));
 }
 
 std::vector<Vec3> FluidSim::ReadPositions() const {

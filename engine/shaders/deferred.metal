@@ -36,6 +36,8 @@ fragment GBufferOut fs_gbuffer(VSOut in [[stage_in]],
                                constant FrameUniforms& u [[buffer(1)]],
                                texture2d<float> albedoMap    [[texture(0)]],
                                texture2d<float> roughnessMap [[texture(1)]],
+                               texture2d<float> normalMap    [[texture(4)]],
+                               texture2d<float> metallicMap  [[texture(8)]],
                                sampler          smp          [[sampler(0)]])
 {
     if (in.worldPos.y > u.surface.w) discard_fragment();
@@ -44,11 +46,13 @@ fragment GBufferOut fs_gbuffer(VSOut in [[stage_in]],
     o.albedoRough.rgb =
         in.color.rgb * u.baseColor.rgb * albedoMap.sample(smp, in.uv).rgb;
     o.albedoRough.a = saturate(u.surface.x * roughnessMap.sample(smp, in.uv).r);
-    // Stored NOT normalized, and renormalized when read. Interpolation shortens
-    // it and so does half-float rounding; doing it once at the read is both
-    // cheaper and the only place it is actually needed.
-    o.normalMetal.rgb = in.normalW;
-    o.normalMetal.a = saturate(u.surface.y);
+    // The normal map is applied HERE, not in the lighting pass. The G-buffer's
+    // whole contract is that it holds what the surface IS, and after a normal
+    // map the surface faces somewhere else -- the lighting pass has no tangent
+    // frame to apply one with, because a fullscreen triangle has no mesh.
+    o.normalMetal.rgb = ApplyNormalMap(normalize(in.normalW), in.tangentW, in.uv,
+                                       normalMap, smp, u.emissive.w);
+    o.normalMetal.a = saturate(u.surface.y * metallicMap.sample(smp, in.uv).r);
     return o;
 }
 
@@ -82,7 +86,8 @@ fragment float4 fs_deferred(FullscreenOut in [[stage_in]],
                             texturecube<float> specularMap   [[texture(6)]],
                             texture2d<float>   brdfLut       [[texture(7)]],
                             sampler          smp         [[sampler(0)]],
-                            sampler          envSmp      [[sampler(1)]])
+                            sampler          envSmp      [[sampler(1)]],
+                            sampler          shadowSmp   [[sampler(2)]])
 {
     const float depth = sceneDepth.sample(smp, in.uv);
     // Reversed-Z: 0 is the far plane, and it is what an untouched pixel holds.
@@ -114,7 +119,7 @@ fragment float4 fs_deferred(FullscreenOut in [[stage_in]],
     const float3 lit =
         ShadeSurface(worldPos, nm.xyz, ar.rgb, ar.a, nm.a,
                      u.lightViewProj * float4(worldPos, 1.0f), u, lights,
-                     cascades, shadowMap, shadowAtlas, smp,
+                     cascades, shadowMap, shadowAtlas, shadowSmp,
                      irradianceMap, specularMap, brdfLut, envSmp);
     return float4(lit, 1.0f);
 }

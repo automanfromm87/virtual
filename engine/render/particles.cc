@@ -75,7 +75,7 @@ std::unique_ptr<ParticleSystem> ParticleSystem::Create(rhi::Device& dev,
 
     // Two triangles, shared by every particle. The four corners come from the
     // vertex id, so there is no vertex buffer at all.
-    const std::uint16_t quad[6] = {0, 1, 2, 2, 1, 3};
+    const std::uint32_t quad[6] = {0, 1, 2, 2, 1, 3};
     ps->impl_->quad_ib = dev.CreateBuffer(quad, sizeof(quad));
     if (!Valid(ps->impl_->pool) || !Valid(ps->impl_->spawned) ||
         !Valid(ps->impl_->quad_ib)) {
@@ -175,7 +175,7 @@ void ParticleSystem::Draw(rhi::Encoder& enc, const Camera& camera, int width,
     enc.SetFragmentBytes(&u, sizeof(u), 1);
     if (Valid(scene_depth)) enc.SetFragmentTexture(scene_depth, 0);
     enc.SetFragmentSampler(impl_->sampler, 0);
-    enc.DrawIndexedInstancedU16(impl_->quad_ib, 6, std::size_t(impl_->capacity));
+    enc.DrawIndexedInstancedU32(impl_->quad_ib, 6, std::size_t(impl_->capacity));
 }
 
 int ParticleSystem::LiveCountSlow() const {

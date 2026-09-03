@@ -511,11 +511,20 @@ Document ParseGltf(std::string_view json_text, const std::vector<std::uint8_t>& 
 
             const AccessorView pos = reader.View(attrs["POSITION"].Int());
             if (!pos.valid) return doc;
-            AccessorView nrm, uv;
+            AccessorView nrm, uv, tan;
             const bool has_normal = attrs.Has("NORMAL");
             const bool has_uv = attrs.Has("TEXCOORD_0");
+            // TANGENT is vec4: xyz plus the bitangent's handedness in w, which
+            // is the same layout the engine's VertexIn uses. Taken from the
+            // file when it is there rather than regenerated, because an
+            // exporter's tangents are the ones the normal map was BAKED
+            // against -- regenerating them from a different triangulation or a
+            // different smoothing choice produces a frame the map was not made
+            // for, and the error shows up as lighting that swims across a seam.
+            const bool has_tangent = attrs.Has("TANGENT");
             if (has_normal) { nrm = reader.View(attrs["NORMAL"].Int()); if (!nrm.valid) return doc; }
             if (has_uv) { uv = reader.View(attrs["TEXCOORD_0"].Int()); if (!uv.valid) return doc; }
+            if (has_tangent) { tan = reader.View(attrs["TANGENT"].Int()); if (!tan.valid) return doc; }
             AccessorView joints, weights;
             // Both or neither. One without the other is a file that says which
             // joints influence a vertex but not by how much, or the reverse.
@@ -524,12 +533,6 @@ Document ParseGltf(std::string_view json_text, const std::vector<std::uint8_t>& 
                 joints = reader.View(attrs["JOINTS_0"].Int());
                 weights = reader.View(attrs["WEIGHTS_0"].Int());
                 if (!joints.valid || !weights.valid) return doc;
-            }
-
-            if (pos.count > 65535) {
-                error = "gltf: primitive has " + std::to_string(pos.count) +
-                        " vertices; the engine's index buffers are 16-bit";
-                return doc;
             }
 
             Primitive out;
@@ -551,6 +554,11 @@ Document ParseGltf(std::string_view json_text, const std::vector<std::uint8_t>& 
                     float t[4] = {0, 0, 0, 0};
                     Reader::ReadFloats(uv, i, t);
                     v.uv = Vec4{t[0], t[1], 0, 0};
+                }
+                if (has_tangent) {
+                    float t[4] = {1, 0, 0, 1};
+                    Reader::ReadFloats(tan, i, t);
+                    v.tangent = Vec4{t[0], t[1], t[2], t[3] < 0.0f ? -1.0f : 1.0f};
                 }
                 v.color = Vec4{1, 1, 1, 1};
                 out.mesh.vertices.push_back(v);
@@ -577,17 +585,14 @@ Document ParseGltf(std::string_view json_text, const std::vector<std::uint8_t>& 
                 const AccessorView idx = reader.View(p["indices"].Int());
                 if (!idx.valid) return doc;
                 out.mesh.indices.reserve(std::size_t(idx.count));
-                for (int i = 0; i < idx.count; ++i) {
-                    const std::uint32_t v = Reader::ReadIndex(idx, i);
-                    if (v > 65535) { error = "gltf: index out of 16-bit range"; return doc; }
-                    out.mesh.indices.push_back(std::uint16_t(v));
-                }
+                for (int i = 0; i < idx.count; ++i)
+                    out.mesh.indices.push_back(Reader::ReadIndex(idx, i));
             } else {
                 // Non-indexed: synthesise a trivial index buffer so the rest of
                 // the engine only ever deals with indexed draws.
                 out.mesh.indices.resize(std::size_t(pos.count));
                 for (int i = 0; i < pos.count; ++i)
-                    out.mesh.indices[std::size_t(i)] = std::uint16_t(i);
+                    out.mesh.indices[std::size_t(i)] = std::uint32_t(i);
             }
 
             // --- morph targets ---------------------------------------------

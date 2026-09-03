@@ -27,7 +27,7 @@ struct Hull {
     std::vector<Vec3> vertices;
     // Triangles, wound counter-clockwise seen from OUTSIDE, so a face normal is
     // Cross(v1 - v0, v2 - v0) with no sign to remember.
-    std::vector<std::uint16_t> indices;
+    std::vector<std::uint32_t> indices;
 
     [[nodiscard]] bool Empty() const { return vertices.size() < 4; }
     [[nodiscard]] std::size_t FaceCount() const { return indices.size() / 3; }

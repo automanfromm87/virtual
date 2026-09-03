@@ -262,7 +262,7 @@ Hull ConvexHull(std::span<const Vec3> points, float tolerance) {
     if (hull.vertices.size() > 65535) return Hull{};  // 16-bit indices
     for (const Face& f : faces)
         for (int idx : {f.a, f.b, f.c})
-            hull.indices.push_back(std::uint16_t(remap[std::size_t(idx)]));
+            hull.indices.push_back(std::uint32_t(remap[std::size_t(idx)]));
 
     // A hull with no volume is degenerate however it was arrived at, and saying
     // so here is much cheaper than a division by zero in the inertia tensor.

@@ -177,7 +177,7 @@ int main() {
             const std::uint32_t base = std::uint32_t(nav_vertices.size());
             for (const VertexIn& v : m.vertices)
                 nav_vertices.push_back(eng::Vec3{v.position.x, v.position.y, v.position.z});
-            for (std::uint16_t i : m.indices) nav_indices.push_back(base + i);
+            for (std::uint32_t i : m.indices) nav_indices.push_back(base + i);
         }
     eng::nav::BuildConfig nav_config;
     nav_config.cell_size = 0.6f;

@@ -48,7 +48,7 @@ static inline float3 F_Schlick(float VdotH, float3 f0)
 // Returns 1 where the surface is lit, 0 where the shadow map says something
 // else was closer to the light.
 static inline float ShadowFactor(float4 lightClip, depth2d<float> shadowMap,
-                                 sampler smp, float enabled)
+                                 sampler shadowSmp, float enabled)
 {
     if (enabled < 0.5f) return 1.0f;
 
@@ -87,7 +87,7 @@ static inline float ShadowFactor(float4 lightClip, depth2d<float> shadowMap,
         // A fixed ring rather than a random disc: no noise to denoise later.
         const float ang = float(i) * 0.7853981f;  // 45 degrees apart
         const float2 o = float2(cos(ang), sin(ang)) * texel * 3.0f;
-        const float d = shadowMap.sample(smp, uv + o);
+        const float d = shadowMap.sample(shadowSmp, uv + o);
         if (d > ndc.z + bias) {  // reversed-Z: greater means nearer the light
             blockerSum += d;
             blockerCount += 1.0f;
@@ -106,7 +106,7 @@ static inline float ShadowFactor(float4 lightClip, depth2d<float> shadowMap,
     for (int dy = -1; dy <= 1; ++dy)
         for (int dx = -1; dx <= 1; ++dx) {
             const float2 o = float2(float(dx), float(dy)) * radius;
-            lit += (ndc.z >= shadowMap.sample(smp, uv + o) - bias) ? 1.0f : 0.0f;
+            lit += (ndc.z >= shadowMap.sample(shadowSmp, uv + o) - bias) ? 1.0f : 0.0f;
         }
     return lit * (1.0f / 9.0f);
 }
@@ -151,7 +151,7 @@ static inline float4 AtlasTile(float index, float per_side)
 // Clamped a texel inside the tile: a bilinear tap at the very edge reaches into
 // the neighbouring light's map and draws a stripe of someone else's shadow
 // along the border.
-static inline float SampleTile(depth2d<float> atlas, sampler smp, float2 uv,
+static inline float SampleTile(depth2d<float> atlas, sampler shadowSmp, float2 uv,
                                float4 tile, float depth, float bias)
 {
     if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) return 1.0f;
@@ -166,7 +166,7 @@ static inline float SampleTile(depth2d<float> atlas, sampler smp, float2 uv,
                                     lo, hi);
             // Reversed-Z: nearer the light is a GREATER depth, so lit means "at
             // least as near as whatever was recorded".
-            lit += (depth >= atlas.sample(smp, at) - bias) ? 1.0f : 0.0f;
+            lit += (depth >= atlas.sample(shadowSmp, at) - bias) ? 1.0f : 0.0f;
         }
     return lit * (1.0f / 9.0f);
 }
@@ -177,7 +177,7 @@ static inline float SampleTile(depth2d<float> atlas, sampler smp, float2 uv,
 // rather than a formality — a spot's rays diverge and depth is not linear in
 // clip space.
 static inline float SpotShadow(float4 clip, float4 place, depth2d<float> atlas,
-                               sampler smp)
+                               sampler shadowSmp)
 {
     if (clip.w <= 0.0f) return 1.0f;   // behind the lamp
     const float3 ndc = clip.xyz / clip.w;
@@ -188,7 +188,7 @@ static inline float SpotShadow(float4 clip, float4 place, depth2d<float> atlas,
     // distance in a way an orthographic one's does not, so a constant is either
     // useless near the lamp or lets the far end of the cone shadow itself.
     const float bias = 2.5e-4f + 4.0e-3f * ndc.z;
-    return SampleTile(atlas, smp, uv, AtlasTile(place.x, place.y), ndc.z, bias);
+    return SampleTile(atlas, shadowSmp, uv, AtlasTile(place.x, place.y), ndc.z, bias);
 }
 
 // A point light's lookup: SIX tiles, and the direction chooses which.
@@ -199,7 +199,7 @@ static inline float SpotShadow(float4 clip, float4 place, depth2d<float> atlas,
 // hardware. Storing six matrices per light would work and would cost 384 bytes
 // each; this costs a compare and a divide.
 static inline float PointShadow(float3 to_frag, float4 place,
-                                depth2d<float> atlas, sampler smp)
+                                depth2d<float> atlas, sampler shadowSmp)
 {
     const float3 a = abs(to_frag);
     const float major = max(max(a.x, a.y), a.z);
@@ -231,7 +231,7 @@ static inline float PointShadow(float3 to_frag, float4 place,
     // face's forward axis, which for the chosen face is exactly `major`.
     const float depth = place.z / major;
     const float bias = 3.0e-4f + 6.0e-3f * depth;
-    return SampleTile(atlas, smp, uv, AtlasTile(place.x + float(face), place.y),
+    return SampleTile(atlas, shadowSmp, uv, AtlasTile(place.x + float(face), place.y),
                       depth, bias);
 }
 
@@ -264,7 +264,20 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
                                   constant GpuCascades& cascades,
                                   depth2d<float> shadowMap,
                                   depth2d<float> shadowAtlas,
-                                  sampler smp,
+                                  // The SHADOW sampler, and nothing else uses
+                                  // it. It has to clamp and it has to be
+                                  // isotropic: a shadow lookup outside the
+                                  // light's box must hold the border rather
+                                  // than wrap to the far side of the map, and
+                                  // an anisotropic filter on a depth
+                                  // comparison samples across the depth
+                                  // discontinuity at every silhouette.
+                                  //
+                                  // Sharing one slot with the material maps is
+                                  // what made this need its own name: those
+                                  // want Repeat and 16x, which are exactly the
+                                  // two wrong answers here.
+                                  sampler shadowSmp,
                                   // The environment probe. OPTIONAL, and checked
                                   // with is_null_texture rather than with a flag
                                   // in the uniforms: a flag can disagree with
@@ -274,7 +287,15 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
                                   texturecube<float> irradianceMap,
                                   texturecube<float> specularMap,
                                   texture2d<float> brdfLut,
-                                  sampler envSmp)
+                                  sampler envSmp,
+                                  // BAKED ambient occlusion, 1 = unoccluded.
+                                  // Applied to the ambient and image-based
+                                  // terms ONLY. A crevice the sky cannot reach
+                                  // is still lit by a lamp aimed into it, and
+                                  // multiplying direct light by a static map
+                                  // is how baked AO stops reading as shadow and
+                                  // starts reading as dirt.
+                                  float ao = 1.0f)
 {
     // Renormalize per fragment: interpolating unit vectors across a triangle
     // does not preserve length, and the error is worst mid-face.
@@ -287,7 +308,7 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
     if (u.surface.z > 0.5f) {
         const int count = int(cascades.info.x);
         if (count <= 1) {
-            shadow = ShadowFactor(lightClip, shadowMap, smp, u.surface.z);
+            shadow = ShadowFactor(lightClip, shadowMap, shadowSmp, u.surface.z);
         } else {
             // Pick by distance from the eye. The FIRST cascade the fragment
             // fits inside — they are nested, so the nearest one that contains
@@ -305,7 +326,7 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
             uv.y = 1.0f - uv.y;
             // Orthographic, so depth is linear and a constant bias is right —
             // unlike the perspective maps a spot or a point light uses.
-            shadow = SampleTile(shadowMap, smp, uv, tile, ndc.z, 1.2e-3f);
+            shadow = SampleTile(shadowMap, shadowSmp, uv, tile, ndc.z, 1.2e-3f);
         }
     }
     float3 direct = Brdf(N, V, Lsun, albedo, roughness, metallic) *
@@ -336,11 +357,11 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
 
         if (lt.shadow.w > 1.5f) {
             attenuation *= PointShadow(worldPos - lt.position.xyz, lt.shadow,
-                                       shadowAtlas, smp);
+                                       shadowAtlas, shadowSmp);
             if (attenuation <= 0.0f) continue;
         } else if (lt.shadow.w > 0.5f) {
             attenuation *= SpotShadow(lt.viewProj * float4(worldPos, 1.0f),
-                                      lt.shadow, shadowAtlas, smp);
+                                      lt.shadow, shadowAtlas, shadowSmp);
             if (attenuation <= 0.0f) continue;
         }
         direct += Brdf(N, V, L, albedo, roughness, metallic) * lt.color.rgb *
@@ -419,5 +440,5 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
     // surface to one before anything downstream sees it, so a lamp and a sheet
     // of white paper arrive at the bloom pass identical and it glows off the
     // paper. Brightness has to survive to the end of the frame to be usable.
-    return direct + ambient;
+    return direct + ambient * ao;
 }

@@ -1,0 +1,17 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Surface detail: tangents, normal maps, mip chains, 32-bit indices, emission.
+# Each is checked by the quantity it is supposed to move, not by a screenshot.
+cc_test(
+    name = "surface_test",
+    srcs = ["main.cpp"],
+    deps = [
+        "//engine/asset:png",
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+    ],
+)

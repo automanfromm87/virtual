@@ -97,7 +97,14 @@ std::unique_ptr<Canvas> Canvas::Create(rhi::Device& dev,
         rgba[i * 4 + 2] = pixels[i];
         rgba[i * 4 + 3] = pixels[i];
     }
-    im.atlas = dev.CreateTexture2D(font.width, font.height, rgba.data());
+        // NO MIP CHAIN, and no sRGB. A glyph atlas is drawn at one texel per pixel
+    // and never minified, so a chain buys nothing -- and it costs something
+    // real: the lower levels average across the gaps between glyph cells, so
+    // neighbouring letters bleed into each other the moment anything picks a
+    // level above zero. The coverage values are alpha, not colour, so an sRGB
+    // decode would be wrong too.
+    im.atlas = dev.CreateTexture2D(font.width, font.height, rgba.data(),
+                                   /*mips=*/false, /*srgb=*/false);
     if (!Valid(im.atlas)) {
         error = "could not upload the font atlas";
         return nullptr;

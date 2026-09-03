@@ -74,10 +74,42 @@ struct MaterialDesc {
     float roughness = 0.5f;
     float metallic = 0.0f;
 
+    // EMISSIVE radiance, added after everything else and lit by nothing. Not a
+    // colour in 0..1: a lamp filament is thousands of times a wall, the scene
+    // target is half-float precisely so it can hold that, and the bloom
+    // threshold is in linear radiance. A value of 1 is "as bright as a white
+    // surface in full light" and will not glow.
+    //
+    // This is the only way to make a light SOURCE visible. Scene::lights put
+    // radiance into the world; nothing before this made the lamp itself bright,
+    // so every light in every scene here was an invisible point that other
+    // things reflected.
+    Vec3 emissive{0.0f, 0.0f, 0.0f};
+
     // Maps MULTIPLY the scalars above. A null handle binds a 1x1 white texture,
     // so an untextured material needs no branch in the shader.
     rhi::TextureId albedo;
     rhi::TextureId roughness_map;  // read from the RED channel
+    rhi::TextureId metallic_map;   // read from the RED channel
+    rhi::TextureId emissive_map;   // multiplies `emissive`, RGB
+    // Baked ambient occlusion, RED channel. Multiplies the AMBIENT and image-
+    // based terms only, never the direct light: a crevice that the sky cannot
+    // reach is still lit by a lamp pointed into it, and darkening direct light
+    // with a static map is how baked AO turns into visible dirt.
+    rhi::TextureId occlusion_map;
+
+    // TANGENT-SPACE normal map. The single most valuable texture a material can
+    // have: it is what puts brick mortar, fabric weave, brushed metal and skin
+    // pores on a surface that has none of them in its triangles.
+    //
+    // Only xy are read; z is rebuilt as sqrt(1 - x^2 - y^2). That makes a
+    // two-channel map work unchanged, and on an 8-bit three-channel one it is
+    // more accurate than the stored blue.
+    rhi::TextureId normal_map;
+    // Scales the tangent-space slope before z is rebuilt, so 0 is flat, 1 is
+    // the map as authored and 2 is twice as deep. Scaling the unpacked vector
+    // instead would rotate it toward the surface normal and saturate.
+    float normal_strength = 1.0f;
 
     // Alpha blended, drawn after every opaque object, back to front, and NOT
     // writing depth. Glass needs all four of those or it stops looking like
@@ -469,6 +501,16 @@ class Renderer {
     // written by an earlier pass with the SAME camera.
     void DrawSsao(rhi::Encoder&, const Camera&, int width, int height,
                   rhi::TextureId depth, float radius = 1.1f);
+
+    // Anisotropic filtering for MATERIAL textures, 1 to 16. Rebuilds the
+    // sampler, so it is a settings change and not a per-frame one.
+    //
+    // A knob rather than a constant because it is a quality/bandwidth trade
+    // like any other -- and because a hard-coded value cannot be tested: the
+    // only way to show anisotropy is doing something is to render the same
+    // frame without it.
+    void SetAnisotropy(int max_anisotropy);
+    [[nodiscard]] int Anisotropy() const;
 
     [[nodiscard]] const RenderStats& LastStats() const;
     // Indices into the last DrawScene's Scene::instances, in the order they

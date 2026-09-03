@@ -112,11 +112,11 @@ int main() {
     {
         const char* which = "triangulate square";
         const std::vector<Vec2> square = {{0, 0}, {2, 0}, {2, 2}, {0, 2}};
-        const std::vector<std::uint16_t> t = TriangulatePolygon(square);
+        const std::vector<std::uint32_t> t = TriangulatePolygon(square);
         // n-gon -> n-2 triangles, always. A triangulator that gives up early
         // leaves an invisible hole in the floor.
         CHECK(t.size() == 2 * 3);
-        for (std::uint16_t i : t) CHECK(i < square.size());
+        for (std::uint32_t i : t) CHECK(i < square.size());
     }
 
     {
@@ -124,7 +124,7 @@ int main() {
         // Concave: an ear clipper that ignores reflex corners produces
         // triangles outside the polygon.
         const std::vector<Vec2> l = {{0, 0}, {4, 0}, {4, 2}, {2, 2}, {2, 4}, {0, 4}};
-        const std::vector<std::uint16_t> t = TriangulatePolygon(l);
+        const std::vector<std::uint32_t> t = TriangulatePolygon(l);
         CHECK(t.size() == 4 * 3);
 
         // The triangles must cover exactly the polygon's area — 12 for this L.

@@ -72,17 +72,18 @@ constexpr char kCullSrc[] = {
     , 0};
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
-static_assert(sizeof(FrameUniforms) == 416, "FrameUniforms layout drifted");
+static_assert(sizeof(FrameUniforms) == 432, "FrameUniforms layout drifted");
 static_assert(sizeof(GpuLight) == 144, "GpuLight layout drifted");
 static_assert(sizeof(GpuCascades) == 288, "GpuCascades layout drifted");
 static_assert(sizeof(GpuInstance) == 96, "GpuInstance layout drifted");
 // Metal reads this as MTLDrawIndexedPrimitivesIndirectArguments. A mismatch is
 // not a compile error anywhere -- it is a draw of the wrong thing.
 static_assert(sizeof(GpuDrawArgs) == 20, "GpuDrawArgs must match Metal's layout");
-static_assert(sizeof(VertexIn) == 64, "VertexIn layout drifted");
+static_assert(sizeof(VertexIn) == 80, "VertexIn layout drifted");
 static_assert(offsetof(VertexIn, normal) == 16, "GPU float3 occupies 16 bytes");
 static_assert(offsetof(VertexIn, color) == 32, "GPU float3 occupies 16 bytes");
 static_assert(offsetof(VertexIn, uv) == 48, "uv must follow color");
+static_assert(offsetof(VertexIn, tangent) == 64, "tangent must follow uv");
 
 // The triangle predates the Camera type and bakes its vertices straight into
 // world space, so it carries its own projection constants.
@@ -193,6 +194,12 @@ struct GpuMaterial {
     float metallic = 0.0f;
     rhi::TextureId albedo;
     rhi::TextureId roughness_map;
+    rhi::TextureId metallic_map;
+    rhi::TextureId emissive_map;
+    rhi::TextureId occlusion_map;
+    rhi::TextureId normal_map;
+    Vec3 emissive{0.0f, 0.0f, 0.0f};
+    float normal_strength = 1.0f;
 };
 
 // A survivor of culling, with the keys it gets sorted on.
@@ -325,6 +332,12 @@ struct Renderer::Impl {
     // find: it is invisible in a dark scene and unmistakable in a bright one.
     rhi::SamplerId sampler;
     rhi::SamplerId clamp_sampler;
+    // The SHADOW sampler: linear, clamped, isotropic. Its own object because
+    // the other two are wrong for a depth comparison in different ways -- the
+    // material sampler wraps and is 16x anisotropic, the fullscreen one is
+    // shared with passes that may want something else later.
+    rhi::SamplerId shadow_sampler;
+    int anisotropy = 16;
 
     // One uniform ring covering every frame slot. Writing slot N is safe only
     // because Device::BeginFrame blocks until the frame that last used slot N
@@ -585,13 +598,38 @@ std::uint32_t Renderer::PipelineOf(MaterialHandle m) const {
     return impl_->materials[m.v].pipeline.v;
 }
 
-MeshHandle Renderer::UploadMesh(const Mesh& mesh) {
-    if (mesh.vertices.empty() || mesh.indices.empty()) return {};
+// A mesh with no tangent frame, fixed up. Returns a reference to `scratch` when
+// it had to build one, and to the original otherwise -- so a mesh that already
+// carries tangents is uploaded with no copy at all.
+//
+// The check is on the FIRST vertex only. GenerateTangents always writes a unit
+// vector, so a zero tangent means nothing ever ran; a mesh with one zeroed
+// vertex and the rest filled cannot be produced by any path here.
+static const Mesh& WithTangents(const Mesh& mesh, Mesh& scratch) {
+    if (!mesh.vertices.empty() &&
+        (mesh.vertices[0].tangent.x != 0.0f || mesh.vertices[0].tangent.y != 0.0f ||
+         mesh.vertices[0].tangent.z != 0.0f))
+        return mesh;
+    // Here rather than in each generator on purpose. There are a dozen places
+    // that build a Mesh -- boxes, terrain chunks, floor plans, hulls, the glTF
+    // importer, the LOD simplifier -- and a normal map on a mesh whose tangent
+    // is the zero vector does not look wrong, it produces NaN and a black
+    // surface. One choke point that every mesh passes through cannot be
+    // forgotten by the next generator someone writes.
+    scratch = mesh;
+    GenerateTangents(scratch);
+    return scratch;
+}
+
+MeshHandle Renderer::UploadMesh(const Mesh& original) {
+    if (original.vertices.empty() || original.indices.empty()) return {};
+    Mesh scratch;
+    const Mesh& mesh = WithTangents(original, scratch);
     GpuMesh gm;
     gm.vb = impl_->dev->CreateBuffer(mesh.vertices.data(),
                                      mesh.vertices.size() * sizeof(VertexIn));
     gm.ib = impl_->dev->CreateBuffer(mesh.indices.data(),
-                                     mesh.indices.size() * sizeof(std::uint16_t));
+                                     mesh.indices.size() * sizeof(std::uint32_t));
     if (!Valid(gm.vb) || !Valid(gm.ib)) return {};
     gm.index_count = mesh.indices.size();
     gm.vertex_count = mesh.vertices.size();
@@ -612,13 +650,14 @@ MeshHandle Renderer::UploadMeshLods(std::span<const Mesh> levels) {
     GpuMesh& gm = impl_->meshes[h.v];
     const int count = std::min(int(levels.size()), kMaxLods);
     for (int i = 1; i < count; ++i) {
-        const Mesh& m = levels[std::size_t(i)];
+        Mesh lod_scratch;
+        const Mesh& m = WithTangents(levels[std::size_t(i)], lod_scratch);
         if (m.vertices.empty() || m.indices.empty()) break;
         GpuMesh::Lod lod;
         lod.vb = impl_->dev->CreateBuffer(m.vertices.data(),
                                           m.vertices.size() * sizeof(VertexIn));
         lod.ib = impl_->dev->CreateBuffer(m.indices.data(),
-                                          m.indices.size() * sizeof(std::uint16_t));
+                                          m.indices.size() * sizeof(std::uint32_t));
         // A level that fails to allocate TRUNCATES the chain rather than
         // leaving a hole. A null buffer in the middle would be selected by the
         // cull pass and drawn as nothing, so the object would vanish at one
@@ -731,14 +770,42 @@ MaterialHandle Renderer::CreateMaterial(const MaterialDesc& desc,
     m.base_color = desc.base_color;
     m.roughness = desc.roughness;
     m.metallic = desc.metallic;
+    m.emissive = desc.emissive;
+    m.normal_strength = desc.normal_strength;
     m.albedo = Valid(desc.albedo) ? desc.albedo : impl_->white;
     m.roughness_map =
         Valid(desc.roughness_map) ? desc.roughness_map : impl_->white;
+    m.metallic_map =
+        Valid(desc.metallic_map) ? desc.metallic_map : impl_->white;
+    m.emissive_map =
+        Valid(desc.emissive_map) ? desc.emissive_map : impl_->white;
+    m.occlusion_map =
+        Valid(desc.occlusion_map) ? desc.occlusion_map : impl_->white;
+    // NOT substituted with white. Every other map defaults to a 1x1 white
+    // texture so the shader can multiply unconditionally, but a normal map has
+    // no such identity value -- white unpacks to (1, 1) which is off the unit
+    // circle entirely. The shader tests is_null_texture instead, so this stays
+    // a null handle and binds nothing.
+    m.normal_map = desc.normal_map;
     impl_->materials.push_back(m);
     return MaterialHandle{std::uint32_t(impl_->materials.size() - 1)};
 }
 
 int Renderer::Samples() const { return impl_->samples; }
+
+void Renderer::SetAnisotropy(int max_anisotropy) {
+    const int n = max_anisotropy < 1 ? 1 : (max_anisotropy > 16 ? 16 : max_anisotropy);
+    if (n == impl_->anisotropy) return;
+    const rhi::SamplerId s =
+        impl_->dev->CreateSampler(rhi::Filter::Linear, rhi::Wrap::Repeat, n);
+    // Keep the old one on failure. A null sampler bound to slot 0 is not a
+    // degraded picture, it is undefined sampling in every material.
+    if (!Valid(s)) return;
+    impl_->sampler = s;
+    impl_->anisotropy = n;
+}
+
+int Renderer::Anisotropy() const { return impl_->anisotropy; }
 
 std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
                                            std::string& error, int samples) {
@@ -757,10 +824,16 @@ std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
     r->impl_->black = dev.CreateTexture2D(1, 1, kBlackPixel);
     const float kUnitExposure = 1.0f;
     r->impl_->unit_exposure = dev.CreateBuffer(&kUnitExposure, sizeof(float));
-    r->impl_->sampler = dev.CreateSampler(rhi::Filter::Linear, rhi::Wrap::Repeat);
+    // 16x anisotropic on the MATERIAL sampler. Every textured surface in a
+    // scene is eventually seen at a grazing angle -- a floor always is -- and
+    // that is exactly the case a mip chain alone handles badly.
+    r->impl_->sampler =
+        dev.CreateSampler(rhi::Filter::Linear, rhi::Wrap::Repeat, 16);
     r->impl_->clamp_sampler = dev.CreateSampler(rhi::Filter::Linear, rhi::Wrap::Clamp);
+    r->impl_->shadow_sampler = dev.CreateSampler(rhi::Filter::Linear, rhi::Wrap::Clamp);
     if (!Valid(r->impl_->white) || !Valid(r->impl_->black) ||
-        !Valid(r->impl_->sampler) || !Valid(r->impl_->clamp_sampler)) {
+        !Valid(r->impl_->sampler) || !Valid(r->impl_->clamp_sampler) ||
+        !Valid(r->impl_->shadow_sampler)) {
         error = "failed to create the default texture or sampler";
         return nullptr;
     }
@@ -977,7 +1050,7 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
             enc.SetVertexBuffer(gm.skin_vb, 0, kSkinSlot);
             enc.SetVertexBuffer(impl_->palettes, palette_offset, kPaletteSlot);
         }
-        enc.DrawIndexedU16(gm.ib, gm.index_count);
+        enc.DrawIndexedU32(gm.ib, gm.index_count);
         ++impl_->shadow_draws;
     }
     }
@@ -1074,7 +1147,7 @@ void Renderer::DrawLightShadows(rhi::Encoder& enc, const Scene& scene) {
                     enc.SetVertexBuffer(gm.skin_vb, 0, kSkinSlot);
                     enc.SetVertexBuffer(impl_->palettes, palette_offset, kPaletteSlot);
                 }
-                enc.DrawIndexedU16(gm.ib, gm.index_count);
+                enc.DrawIndexedU32(gm.ib, gm.index_count);
             }
         }
         impl_->shadow_tile_of_light[li] = tile;
@@ -1134,7 +1207,7 @@ void Renderer::DrawSceneDepth(rhi::Encoder& enc, const Scene& scene, int width,
             enc.SetVertexBuffer(gm.skin_vb, 0, kSkinSlot);
             enc.SetVertexBuffer(impl_->palettes, palette_offset, kPaletteSlot);
         }
-        enc.DrawIndexedU16(gm.ib, gm.index_count);
+        enc.DrawIndexedU32(gm.ib, gm.index_count);
     }
 }
 
@@ -1381,6 +1454,8 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
                             scene.ambientSky.z, 0.0f};
         u.ambientGround = Vec4{scene.ambientGround.x, scene.ambientGround.y,
                                scene.ambientGround.z, 0.0f};
+        u.emissive = Vec4{mat.emissive.x, mat.emissive.y, mat.emissive.z,
+                          mat.normal_strength};
 
         // Sub-allocate out of this frame's slot instead of a per-draw setBytes.
         std::memcpy(uniform_map + offset, &u, sizeof(u));
@@ -1392,6 +1467,11 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
         enc.SetFragmentBuffer(cascades, cascade_offset, kCascadeSlot);
         enc.SetFragmentTexture(mat.albedo, 0);
         enc.SetFragmentTexture(mat.roughness_map, 1);
+        enc.SetFragmentTexture(mat.normal_map, 4);
+        enc.SetFragmentTexture(mat.metallic_map, 8);
+        enc.SetFragmentTexture(mat.emissive_map, 9);
+        enc.SetFragmentTexture(mat.occlusion_map, 10);
+        enc.SetFragmentSampler(shadow_sampler, 2);
         enc.SetFragmentTexture(shadow_tex, 2);
         // The local lights' atlas. Something has to be bound even when no light
         // has a tile, so the placeholder stands in — the shader guards on the
@@ -1410,7 +1490,7 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
             enc.SetVertexBuffer(gm.skin_vb, 0, kSkinSlot);
             enc.SetVertexBuffer(palettes, palette_offset, kPaletteSlot);
         }
-        enc.DrawIndexedU16(gm.ib, gm.index_count);
+        enc.DrawIndexedU32(gm.ib, gm.index_count);
         draw_order.push_back(item.index);
         ++stats.draws;
         if (item.transparent) ++stats.transparent_draws;
@@ -1602,6 +1682,9 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
                         scene.ambientSky.z, 0.0f};
     u.ambientGround = Vec4{scene.ambientGround.x, scene.ambientGround.y,
                            scene.ambientGround.z, 0.0f};
+    // No material here: a fullscreen lighting pass reads the G-buffer,
+    // and emission was already added by the pass that wrote it.
+    u.emissive = Vec4{0.0f, 0.0f, 0.0f, 1.0f};
 
     const std::size_t offset = impl_->AllocUniform();
     if (offset == Impl::kNoSpace) return;
@@ -1618,18 +1701,12 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
     enc.SetFragmentTexture(
         Valid(impl_->shadow_atlas) ? impl_->shadow_atlas : impl_->dummy_shadow, 3);
     enc.SetFragmentTexture(depth, 4);
-    // The WRAPPING sampler, deliberately, even though this is a fullscreen
-    // pass. Slot 0 serves double duty in both lighting paths: it filters the
-    // material maps AND the shadow map, and the forward path binds the wrapping
-    // one. Clamping only here makes the two disagree wherever a shadow lookup
-    // leaves the light's box -- 58 pixels of the gallery comparison, which is
-    // what caught it.
-    //
-    // The real fix is a shadow sampler of its own: a shadow map wants Clamp and
-    // a tiling albedo wants Repeat, and one slot cannot be both. That is a
-    // signature change in two shaders, so it is written down rather than
-    // smuggled in here.
-    enc.SetFragmentSampler(impl_->sampler, 0);
+    // Slot 0 reads the G-BUFFER here, one texel per pixel, so it clamps and is
+    // isotropic like every other fullscreen pass. It used to be the material
+    // sampler, which wraps -- shared with the shadow lookup, which is now on
+    // slot 2 with a sampler of its own.
+    enc.SetFragmentSampler(impl_->clamp_sampler, 0);
+    enc.SetFragmentSampler(impl_->shadow_sampler, 2);
     // The environment probe. All three may be null handles, which binds
     // nothing -- and nothing is exactly what the shader's is_null_texture
     // check is looking for.
@@ -1901,6 +1978,8 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
                             scene.ambientSky.z, 0.0f};
         u.ambientGround = Vec4{scene.ambientGround.x, scene.ambientGround.y,
                                scene.ambientGround.z, 0.0f};
+        u.emissive = Vec4{mat.emissive.x, mat.emissive.y, mat.emissive.z,
+                          mat.normal_strength};
         std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
 
         enc.SetPipeline(mat.instanced_pipeline);
@@ -1911,6 +1990,11 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
         enc.SetFragmentBuffer(impl_->cascades, cascade_offset, kCascadeSlot);
         enc.SetFragmentTexture(mat.albedo, 0);
         enc.SetFragmentTexture(mat.roughness_map, 1);
+        enc.SetFragmentTexture(mat.normal_map, 4);
+        enc.SetFragmentTexture(mat.metallic_map, 8);
+        enc.SetFragmentTexture(mat.emissive_map, 9);
+        enc.SetFragmentTexture(mat.occlusion_map, 10);
+        enc.SetFragmentSampler(impl_->shadow_sampler, 2);
         enc.SetFragmentTexture(shadow_tex, 2);
         enc.SetFragmentTexture(
             Valid(impl_->shadow_atlas) ? impl_->shadow_atlas : impl_->dummy_shadow, 3);
@@ -1939,7 +2023,7 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
             // Each level owns a fixed-stride region of one buffer.
             enc.SetVertexBuffer(b.visible, sizeof(GpuInstance) * b.capacity * std::size_t(l),
                                 kInstanceSlot);
-            enc.DrawIndexedIndirectU16(lod.ib, b.args, sizeof(GpuDrawArgs) * std::size_t(l));
+            enc.DrawIndexedIndirectU32(lod.ib, b.args, sizeof(GpuDrawArgs) * std::size_t(l));
             ++impl_->stats.draws;
         }
         ++impl_->stats.pipeline_switches;

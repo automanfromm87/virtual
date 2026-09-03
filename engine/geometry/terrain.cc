@@ -272,13 +272,11 @@ Mesh Terrain::BuildChunk(int chunk_x, int chunk_z, int lod) const {
     const int base_x = chunk_x * per_chunk;
     const int base_z = chunk_z * per_chunk;
 
-    // uint16 indices, so a chunk cannot exceed 65535 vertices. A 255x255 chunk
-    // is already 65k, and nobody wants a chunk that large -- but a caller who
-    // asks for one should get an empty mesh rather than silently wrapped
-    // indices, which draw a plausible and completely wrong surface.
-    if (std::size_t(verts) * std::size_t(verts) + std::size_t(verts) * 4 > 65000)
-        return mesh;
-
+    // No vertex cap. This used to refuse anything over 65000 vertices because
+    // indices were 16 bits and the alternative was silently wrapped indices --
+    // a plausible and completely wrong surface. Indices are 32-bit now, so the
+    // only cost of a large chunk is that it is one draw call and one LOD
+    // decision, which is the caller's trade to make.
     mesh.vertices.reserve(std::size_t(verts) * std::size_t(verts) +
                           std::size_t(verts) * 4);
     float lo = 1e30f, hi = -1e30f;
@@ -310,10 +308,10 @@ Mesh Terrain::BuildChunk(int chunk_x, int chunk_z, int lod) const {
                          std::size_t(quads) * 24);
     for (int z = 0; z < quads; ++z)
         for (int x = 0; x < quads; ++x) {
-            const std::uint16_t a = std::uint16_t(z * verts + x);
-            const std::uint16_t b = std::uint16_t(a + 1);
-            const std::uint16_t c = std::uint16_t(a + verts);
-            const std::uint16_t d = std::uint16_t(c + 1);
+            const std::uint32_t a = std::uint32_t(z * verts + x);
+            const std::uint32_t b = std::uint32_t(a + 1);
+            const std::uint32_t c = std::uint32_t(a + verts);
+            const std::uint32_t d = std::uint32_t(c + 1);
             // The diagonal ALTERNATES with the checker parity. A fixed diagonal
             // gives every quad the same bias, and on a regular slope that shows
             // as a herringbone running across the whole terrain.
@@ -332,7 +330,7 @@ Mesh Terrain::BuildChunk(int chunk_x, int chunk_z, int lod) const {
     // then looks like the terrain rather than like a grey wall.
     const float skirt_y = lo - im.config.skirt_depth + im.config.origin.y;
     const auto add_skirt = [&](int start_vertex, int stride, int count, Vec3 outward) {
-        const std::uint16_t first = std::uint16_t(mesh.vertices.size());
+        const std::uint32_t first = std::uint32_t(mesh.vertices.size());
         for (int i = 0; i < count; ++i) {
             VertexIn v = mesh.vertices[std::size_t(start_vertex + i * stride)];
             v.position.y = skirt_y;
@@ -340,10 +338,10 @@ Mesh Terrain::BuildChunk(int chunk_x, int chunk_z, int lod) const {
             mesh.vertices.push_back(v);
         }
         for (int i = 0; i + 1 < count; ++i) {
-            const std::uint16_t top0 = std::uint16_t(start_vertex + i * stride);
-            const std::uint16_t top1 = std::uint16_t(start_vertex + (i + 1) * stride);
-            const std::uint16_t bot0 = std::uint16_t(first + i);
-            const std::uint16_t bot1 = std::uint16_t(first + i + 1);
+            const std::uint32_t top0 = std::uint32_t(start_vertex + i * stride);
+            const std::uint32_t top1 = std::uint32_t(start_vertex + (i + 1) * stride);
+            const std::uint32_t bot0 = std::uint32_t(first + i);
+            const std::uint32_t bot1 = std::uint32_t(first + i + 1);
             mesh.indices.insert(mesh.indices.end(),
                                 {top0, bot0, top1, top1, bot0, bot1});
         }

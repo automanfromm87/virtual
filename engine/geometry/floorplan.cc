@@ -46,7 +46,7 @@ void AppendBox(Mesh& m, Vec3 origin, Vec3 u_axis, Vec3 v_axis, Vec3 n_axis,
                             {du, 2 * half_thickness}};
 
     for (int f = 0; f < 6; ++f) {
-        const auto base = std::uint16_t(m.vertices.size());
+        const auto base = std::uint32_t(m.vertices.size());
         const float uvs[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
         for (int k = 0; k < 4; ++k) {
             VertexIn v{};
@@ -58,11 +58,11 @@ void AppendBox(Mesh& m, Vec3 origin, Vec3 u_axis, Vec3 v_axis, Vec3 n_axis,
             m.vertices.push_back(v);
         }
         m.indices.push_back(base);
-        m.indices.push_back(std::uint16_t(base + 1));
-        m.indices.push_back(std::uint16_t(base + 2));
+        m.indices.push_back(std::uint32_t(base + 1));
+        m.indices.push_back(std::uint32_t(base + 2));
         m.indices.push_back(base);
-        m.indices.push_back(std::uint16_t(base + 2));
-        m.indices.push_back(std::uint16_t(base + 3));
+        m.indices.push_back(std::uint32_t(base + 2));
+        m.indices.push_back(std::uint32_t(base + 3));
     }
 }
 
@@ -104,19 +104,19 @@ void AppendPrism(Mesh& m, Vec3 a, Vec3 b, Vec3 c, float half_thickness,
         vt.color = color;
         vt.uv = Vec4{u, v, 0, 0};
         m.vertices.push_back(vt);
-        return std::uint16_t(m.vertices.size() - 1);
+        return std::uint32_t(m.vertices.size() - 1);
     };
 
     // Two caps. The back one is wound the other way so it faces -n.
-    const std::uint16_t f0 = push(front[0], n, 0, 0);
-    const std::uint16_t f1 = push(front[1], n, 1, 0);
-    const std::uint16_t f2 = push(front[2], n, 0, 1);
+    const std::uint32_t f0 = push(front[0], n, 0, 0);
+    const std::uint32_t f1 = push(front[1], n, 1, 0);
+    const std::uint32_t f2 = push(front[2], n, 0, 1);
     m.indices.push_back(f0); m.indices.push_back(f1); m.indices.push_back(f2);
 
     const Vec3 bn = n * -1.0f;
-    const std::uint16_t b0 = push(back[0], bn, 0, 0);
-    const std::uint16_t b1 = push(back[1], bn, 1, 0);
-    const std::uint16_t b2 = push(back[2], bn, 0, 1);
+    const std::uint32_t b0 = push(back[0], bn, 0, 0);
+    const std::uint32_t b1 = push(back[1], bn, 1, 0);
+    const std::uint32_t b2 = push(back[2], bn, 0, 1);
     m.indices.push_back(b0); m.indices.push_back(b2); m.indices.push_back(b1);
 
     // Three side quads, closing the prism.
@@ -126,10 +126,10 @@ void AppendPrism(Mesh& m, Vec3 a, Vec3 b, Vec3 c, float half_thickness,
         const float el = Length(edge_n);
         if (el < 1e-9f) continue;
         edge_n = edge_n * (1.0f / el);
-        const std::uint16_t q0 = push(front[e], edge_n, 0, 0);
-        const std::uint16_t q1 = push(front[e2], edge_n, 1, 0);
-        const std::uint16_t q2 = push(back[e2], edge_n, 1, 1);
-        const std::uint16_t q3 = push(back[e], edge_n, 0, 1);
+        const std::uint32_t q0 = push(front[e], edge_n, 0, 0);
+        const std::uint32_t q1 = push(front[e2], edge_n, 1, 0);
+        const std::uint32_t q2 = push(back[e2], edge_n, 1, 1);
+        const std::uint32_t q3 = push(back[e], edge_n, 0, 1);
         m.indices.push_back(q0); m.indices.push_back(q1); m.indices.push_back(q2);
         m.indices.push_back(q0); m.indices.push_back(q2); m.indices.push_back(q3);
     }
@@ -153,8 +153,8 @@ bool PointInTriangle(Vec2 p, Vec2 a, Vec2 b, Vec2 c) {
 
 }  // namespace
 
-std::vector<std::uint16_t> TriangulatePolygon(const std::vector<Vec2>& outline) {
-    std::vector<std::uint16_t> out;
+std::vector<std::uint32_t> TriangulatePolygon(const std::vector<Vec2>& outline) {
+    std::vector<std::uint32_t> out;
     const std::size_t n = outline.size();
     if (n < 3) return out;
 
@@ -185,9 +185,9 @@ std::vector<std::uint16_t> TriangulatePolygon(const std::vector<Vec2>& outline) 
             }
             if (!empty) continue;
 
-            out.push_back(std::uint16_t(ia));
-            out.push_back(std::uint16_t(ib));
-            out.push_back(std::uint16_t(ic));
+            out.push_back(std::uint32_t(ia));
+            out.push_back(std::uint32_t(ib));
+            out.push_back(std::uint32_t(ic));
             idx.erase(idx.begin() + long(i));
             clipped = true;
             break;
@@ -197,9 +197,9 @@ std::vector<std::uint16_t> TriangulatePolygon(const std::vector<Vec2>& outline) 
         if (!clipped) break;
     }
     if (idx.size() == 3) {
-        out.push_back(std::uint16_t(idx[0]));
-        out.push_back(std::uint16_t(idx[1]));
-        out.push_back(std::uint16_t(idx[2]));
+        out.push_back(std::uint32_t(idx[0]));
+        out.push_back(std::uint32_t(idx[1]));
+        out.push_back(std::uint32_t(idx[2]));
     }
     return out;
 }
@@ -250,7 +250,7 @@ Mesh MakeWalls(const FloorPlan& plan, Vec4 color) {
 Mesh MakeFloorSlab(const FloorPlan& plan, Vec4 color) {
     Mesh m;
     const std::vector<Vec2>& poly = plan.floor_outline;
-    const std::vector<std::uint16_t> tris = TriangulatePolygon(poly);
+    const std::vector<std::uint32_t> tris = TriangulatePolygon(poly);
     if (tris.empty()) return m;
 
     const float top = 0.0f;
@@ -261,7 +261,7 @@ Mesh MakeFloorSlab(const FloorPlan& plan, Vec4 color) {
     for (int face = 0; face < 2; ++face) {
         const float y = face ? bottom : top;
         const Vec4 n = face ? Vec4{0, -1, 0, 0} : Vec4{0, 1, 0, 0};
-        const auto base = std::uint16_t(m.vertices.size());
+        const auto base = std::uint32_t(m.vertices.size());
         for (const Vec2& p : poly) {
             VertexIn v{};
             v.position = Vec4{p.x, y, p.y, 0.0f};
@@ -280,13 +280,13 @@ Mesh MakeFloorSlab(const FloorPlan& plan, Vec4 color) {
         // reads as nearly black and the bug looks like a lighting problem.
         for (std::size_t i = 0; i + 2 < tris.size(); i += 3) {
             if (face) {  // underside keeps the triangulator's order
-                m.indices.push_back(std::uint16_t(base + tris[i + 0]));
-                m.indices.push_back(std::uint16_t(base + tris[i + 1]));
-                m.indices.push_back(std::uint16_t(base + tris[i + 2]));
+                m.indices.push_back(std::uint32_t(base + tris[i + 0]));
+                m.indices.push_back(std::uint32_t(base + tris[i + 1]));
+                m.indices.push_back(std::uint32_t(base + tris[i + 2]));
             } else {
-                m.indices.push_back(std::uint16_t(base + tris[i + 2]));
-                m.indices.push_back(std::uint16_t(base + tris[i + 1]));
-                m.indices.push_back(std::uint16_t(base + tris[i + 0]));
+                m.indices.push_back(std::uint32_t(base + tris[i + 2]));
+                m.indices.push_back(std::uint32_t(base + tris[i + 1]));
+                m.indices.push_back(std::uint32_t(base + tris[i + 0]));
             }
         }
     }
@@ -298,7 +298,7 @@ Mesh MakeFloorSlab(const FloorPlan& plan, Vec4 color) {
         Vec2 outward = Normalize(Perp(b - a));
         if (ccw) outward = outward * -1.0f;
 
-        const auto base = std::uint16_t(m.vertices.size());
+        const auto base = std::uint32_t(m.vertices.size());
         const Vec3 quad[4] = {{a.x, bottom, a.y}, {b.x, bottom, b.y},
                               {b.x, top, b.y},    {a.x, top, a.y}};
         for (int k = 0; k < 4; ++k) {
@@ -315,18 +315,18 @@ Mesh MakeFloorSlab(const FloorPlan& plan, Vec4 color) {
         // pointing the other way, and back-face culling follows the geometry.
         if (ccw) {
             m.indices.push_back(base);
-            m.indices.push_back(std::uint16_t(base + 2));
-            m.indices.push_back(std::uint16_t(base + 1));
+            m.indices.push_back(std::uint32_t(base + 2));
+            m.indices.push_back(std::uint32_t(base + 1));
             m.indices.push_back(base);
-            m.indices.push_back(std::uint16_t(base + 3));
-            m.indices.push_back(std::uint16_t(base + 2));
+            m.indices.push_back(std::uint32_t(base + 3));
+            m.indices.push_back(std::uint32_t(base + 2));
         } else {
             m.indices.push_back(base);
-            m.indices.push_back(std::uint16_t(base + 1));
-            m.indices.push_back(std::uint16_t(base + 2));
+            m.indices.push_back(std::uint32_t(base + 1));
+            m.indices.push_back(std::uint32_t(base + 2));
             m.indices.push_back(base);
-            m.indices.push_back(std::uint16_t(base + 2));
-            m.indices.push_back(std::uint16_t(base + 3));
+            m.indices.push_back(std::uint32_t(base + 2));
+            m.indices.push_back(std::uint32_t(base + 3));
         }
     }
     FitBounds(m);

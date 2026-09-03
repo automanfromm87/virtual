@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <numbers>
+#include <vector>
 
 namespace eng {
 
@@ -50,26 +51,27 @@ Mesh MakeUVSphere(float radius, int stacks, int slices, Vec4 a, Vec4 b) {
     m.indices.reserve(std::size_t(stacks) * std::size_t(slices) * 6);
     for (int i = 0; i < stacks; ++i) {
         for (int j = 0; j < slices; ++j) {
-            const auto v0 = std::uint16_t(i * stride + j);
-            const auto v1 = std::uint16_t(v0 + stride);
+            const auto v0 = std::uint32_t(i * stride + j);
+            const auto v1 = std::uint32_t(v0 + stride);
 
             // At the poles the whole top (or bottom) row collapses to one
             // point, so one triangle of each quad there is zero-area.
             if (i != 0) {
                 m.indices.push_back(v0);
-                m.indices.push_back(std::uint16_t(v0 + 1));
+                m.indices.push_back(std::uint32_t(v0 + 1));
                 m.indices.push_back(v1);
             }
             if (i != stacks - 1) {
                 m.indices.push_back(v1);
-                m.indices.push_back(std::uint16_t(v0 + 1));
-                m.indices.push_back(std::uint16_t(v1 + 1));
+                m.indices.push_back(std::uint32_t(v0 + 1));
+                m.indices.push_back(std::uint32_t(v1 + 1));
             }
         }
     }
 
     m.bounds.center = Vec3{0.0f, 0.0f, 0.0f};
     m.bounds.radius = radius;
+    GenerateTangents(m);
     return m;
 }
 
@@ -100,7 +102,7 @@ Mesh MakeBox(Vec3 half_extents, Vec4 color) {
         const Vec3 n = scale(faces[f].n);
         const Vec3 u = scale(faces[f].u);
         const Vec3 v = scale(faces[f].v);
-        const auto base = std::uint16_t(m.vertices.size());
+        const auto base = std::uint32_t(m.vertices.size());
         for (int c = 0; c < 4; ++c) {
             const Vec3 p = n + u * su[c] + v * sv[c];
             VertexIn vtx{};
@@ -111,14 +113,15 @@ Mesh MakeBox(Vec3 half_extents, Vec4 color) {
             m.vertices.push_back(vtx);
         }
         m.indices.push_back(base);
-        m.indices.push_back(std::uint16_t(base + 1));
-        m.indices.push_back(std::uint16_t(base + 2));
+        m.indices.push_back(std::uint32_t(base + 1));
+        m.indices.push_back(std::uint32_t(base + 2));
         m.indices.push_back(base);
-        m.indices.push_back(std::uint16_t(base + 2));
-        m.indices.push_back(std::uint16_t(base + 3));
+        m.indices.push_back(std::uint32_t(base + 2));
+        m.indices.push_back(std::uint32_t(base + 3));
     }
     m.bounds.center = Vec3{0, 0, 0};
     m.bounds.radius = Length(half_extents);
+    GenerateTangents(m);
     return m;
 }
 
@@ -148,7 +151,7 @@ Mesh MakeCube(float size, Vec4 a, Vec4 b) {
     for (int f = 0; f < 6; ++f) {
         const Face& face = faces[f];
         const Vec4 color = (f & 1) ? b : a;
-        const auto base = std::uint16_t(m.vertices.size());
+        const auto base = std::uint32_t(m.vertices.size());
 
         // bottom-left, bottom-right, top-right, top-left in face space.
         const float su[4] = {-1, 1, 1, -1};
@@ -164,16 +167,104 @@ Mesh MakeCube(float size, Vec4 a, Vec4 b) {
             m.vertices.push_back(vtx);
         }
         m.indices.push_back(base);
-        m.indices.push_back(std::uint16_t(base + 1));
-        m.indices.push_back(std::uint16_t(base + 2));
+        m.indices.push_back(std::uint32_t(base + 1));
+        m.indices.push_back(std::uint32_t(base + 2));
         m.indices.push_back(base);
-        m.indices.push_back(std::uint16_t(base + 2));
-        m.indices.push_back(std::uint16_t(base + 3));
+        m.indices.push_back(std::uint32_t(base + 2));
+        m.indices.push_back(std::uint32_t(base + 3));
     }
 
     m.bounds.center = Vec3{0.0f, 0.0f, 0.0f};
     m.bounds.radius = h * std::sqrt(3.0f);  // half the space diagonal
+    GenerateTangents(m);
     return m;
+}
+
+void GenerateTangents(Mesh& m) {
+    const std::size_t n = m.vertices.size();
+    if (n == 0) return;
+
+    // Two accumulators, not one. The tangent alone cannot tell you the
+    // handedness: a mirrored uv shell produces the same tangent direction and
+    // the opposite bitangent, and only comparing the two reveals it.
+    std::vector<Vec3> tan(n, Vec3{0.0f, 0.0f, 0.0f});
+    std::vector<Vec3> bit(n, Vec3{0.0f, 0.0f, 0.0f});
+
+    for (std::size_t i = 0; i + 2 < m.indices.size(); i += 3) {
+        const std::uint32_t i0 = m.indices[i], i1 = m.indices[i + 1],
+                            i2 = m.indices[i + 2];
+        if (i0 >= n || i1 >= n || i2 >= n) continue;
+        const VertexIn& v0 = m.vertices[i0];
+        const VertexIn& v1 = m.vertices[i1];
+        const VertexIn& v2 = m.vertices[i2];
+
+        const Vec3 p0{v0.position.x, v0.position.y, v0.position.z};
+        const Vec3 e1{v1.position.x - p0.x, v1.position.y - p0.y,
+                      v1.position.z - p0.z};
+        const Vec3 e2{v2.position.x - p0.x, v2.position.y - p0.y,
+                      v2.position.z - p0.z};
+
+        const float du1 = v1.uv.x - v0.uv.x, dv1 = v1.uv.y - v0.uv.y;
+        const float du2 = v2.uv.x - v0.uv.x, dv2 = v2.uv.y - v0.uv.y;
+        const float det = du1 * dv2 - du2 * dv1;
+        // A DEGENERATE uv triangle -- a seam collapsed to a point, or a face
+        // with no unwrap at all. 1/det is then enormous or infinite and would
+        // poison the accumulation of every vertex it touches, including the
+        // ones whose other triangles are perfectly fine. Skipping leaves those
+        // vertices to their good triangles and leaves the rest to the fallback
+        // below.
+        if (std::fabs(det) < 1e-12f) continue;
+        const float r = 1.0f / det;
+
+        const Vec3 t{(e1.x * dv2 - e2.x * dv1) * r, (e1.y * dv2 - e2.y * dv1) * r,
+                     (e1.z * dv2 - e2.z * dv1) * r};
+        const Vec3 b{(e2.x * du1 - e1.x * du2) * r, (e2.y * du1 - e1.y * du2) * r,
+                     (e2.z * du1 - e1.z * du2) * r};
+
+        for (std::uint32_t k : {i0, i1, i2}) {
+            tan[k] = tan[k] + t;
+            bit[k] = bit[k] + b;
+        }
+    }
+
+    for (std::size_t i = 0; i < n; ++i) {
+        VertexIn& v = m.vertices[i];
+        const Vec3 nrm = Normalize(Vec3{v.normal.x, v.normal.y, v.normal.z});
+        Vec3 t = tan[i];
+
+        // GRAM-SCHMIDT. The accumulated tangent is an average over triangles
+        // that do not all share this vertex's normal, so it is generally not
+        // perpendicular to it. Projecting out the normal component is what
+        // makes the frame orthonormal, which the shader relies on to invert it
+        // by transpose rather than by a real inverse.
+        const float along = Dot(nrm, t);
+        t = Vec3{t.x - nrm.x * along, t.y - nrm.y * along, t.z - nrm.z * along};
+
+        const float len = Length(t);
+        if (len < 1e-8f) {
+            // No usable uv gradient here: every triangle touching this vertex
+            // was degenerate, or the tangent came out parallel to the normal.
+            // ANY perpendicular direction is a valid frame for a surface with
+            // no unwrap -- what matters is that it is finite and unit length,
+            // because a zero tangent makes the whole TBN singular and the
+            // fragment's normal becomes NaN.
+            //
+            // Cross with whichever axis the normal is least aligned to, so the
+            // cross product never approaches zero.
+            const Vec3 axis = std::fabs(nrm.x) < 0.9f ? Vec3{1.0f, 0.0f, 0.0f}
+                                                      : Vec3{0.0f, 1.0f, 0.0f};
+            t = Normalize(Cross(axis, nrm));
+        } else {
+            t = Vec3{t.x / len, t.y / len, t.z / len};
+        }
+
+        // HANDEDNESS. cross(N, T) is one of the two possible bitangents; the
+        // accumulated one says which. A mirrored shell -- half of every
+        // character model -- has the opposite sign, and getting it wrong turns
+        // every dent on that half into a bump.
+        const float sign = Dot(Cross(nrm, t), bit[i]) < 0.0f ? -1.0f : 1.0f;
+        v.tangent = Vec4{t.x, t.y, t.z, sign};
+    }
 }
 
 }  // namespace eng

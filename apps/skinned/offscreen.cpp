@@ -688,15 +688,15 @@ int main() {
                 // origin and very easy to blame on the exporter.
                 for (int c = 0; c < 4; ++c) { sv.joints[c] = 0; sv.weights[c] = 0.0f; }
             } else {
-                sv.joints[0] = std::uint16_t(i % 2);
+                sv.joints[0] = std::uint32_t(i % 2);
                 sv.weights[0] = 1.0f;
             }
             ssk.push_back(sv);
         }
         for (int i = 0; i + 2 < kSmall; ++i) {
-            sm.indices.push_back(std::uint16_t(i));
-            sm.indices.push_back(std::uint16_t(i + 1));
-            sm.indices.push_back(std::uint16_t(i + 2));
+            sm.indices.push_back(std::uint32_t(i));
+            sm.indices.push_back(std::uint32_t(i + 1));
+            sm.indices.push_back(std::uint32_t(i + 2));
         }
         const eng::MeshHandle small = renderer->UploadSkinnedMesh(sm, ssk, 2);
         Check(Valid(small), "a small skinned mesh uploaded");

@@ -136,9 +136,9 @@ Mesh Simplify(const Mesh& in, const SimplifyOptions& options) {
     std::vector<Quadric> quadrics(in.vertices.size());
     const std::size_t triangles = in.indices.size() / 3;
     for (std::size_t t = 0; t < triangles; ++t) {
-        const std::uint16_t i0 = in.indices[t * 3 + 0];
-        const std::uint16_t i1 = in.indices[t * 3 + 1];
-        const std::uint16_t i2 = in.indices[t * 3 + 2];
+        const std::uint32_t i0 = in.indices[t * 3 + 0];
+        const std::uint32_t i1 = in.indices[t * 3 + 1];
+        const std::uint32_t i2 = in.indices[t * 3 + 2];
         if (i0 >= in.vertices.size() || i1 >= in.vertices.size() ||
             i2 >= in.vertices.size())
             continue;
@@ -273,9 +273,9 @@ Mesh Simplify(const Mesh& in, const SimplifyOptions& options) {
         const int o1 = clusters[std::size_t(c1)].output;
         const int o2 = clusters[std::size_t(c2)].output;
         if (o0 < 0 || o1 < 0 || o2 < 0) continue;
-        out.indices.push_back(std::uint16_t(o0));
-        out.indices.push_back(std::uint16_t(o1));
-        out.indices.push_back(std::uint16_t(o2));
+        out.indices.push_back(std::uint32_t(o0));
+        out.indices.push_back(std::uint32_t(o1));
+        out.indices.push_back(std::uint32_t(o2));
     }
 
     // THE BOUNDS ARE THE ORIGINAL'S, not the simplified mesh's.

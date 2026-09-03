@@ -67,10 +67,10 @@ eng::Mesh StepPlane(int n, float size, float step_height) {
         }
     for (int z = 0; z < n; ++z)
         for (int x = 0; x < n; ++x) {
-            const std::uint16_t a = std::uint16_t(z * (n + 1) + x);
-            const std::uint16_t b = std::uint16_t(a + 1);
-            const std::uint16_t c = std::uint16_t(a + n + 1);
-            const std::uint16_t d = std::uint16_t(c + 1);
+            const std::uint32_t a = std::uint32_t(z * (n + 1) + x);
+            const std::uint32_t b = std::uint32_t(a + 1);
+            const std::uint32_t c = std::uint32_t(a + n + 1);
+            const std::uint32_t d = std::uint32_t(c + 1);
             m.indices.insert(m.indices.end(), {a, c, b, b, c, d});
         }
     m.bounds.radius = size;
@@ -102,14 +102,14 @@ int main() {
         // and passes any test that only counts vertices.
         int degenerate = 0;
         for (std::size_t t = 0; t + 2 < out.indices.size(); t += 3) {
-            const std::uint16_t a = out.indices[t], b = out.indices[t + 1],
+            const std::uint32_t a = out.indices[t], b = out.indices[t + 1],
                                 c = out.indices[t + 2];
             if (a == b || b == c || a == c) ++degenerate;
         }
         Check(degenerate == 0, "and no triangle has two corners the same");
 
         bool in_range = true;
-        for (std::uint16_t i : out.indices)
+        for (std::uint32_t i : out.indices)
             if (i >= out.vertices.size()) in_range = false;
         Check(in_range, "and every index is in range");
     }

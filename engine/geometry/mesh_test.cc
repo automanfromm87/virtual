@@ -33,7 +33,7 @@ void CheckClosedMesh(const eng::Mesh& m, const char* which) {
     CHECK(m.indices.size() % 3 == 0);
     CHECK(m.bounds.radius > 0.0f);
 
-    for (std::uint16_t i : m.indices) CHECK(i < m.vertices.size());
+    for (std::uint32_t i : m.indices) CHECK(i < m.vertices.size());
 
     for (const VertexIn& v : m.vertices) {
         const Vec3 n{v.normal.x, v.normal.y, v.normal.z};
@@ -212,6 +212,110 @@ int main() {
         CHECK(MakeCube(-1.0f, Vec4{}, Vec4{}).vertices.empty());
         CHECK(MakeBox(Vec3{0, 1, 1}, Vec4{}).vertices.empty());
         CHECK(MakeBox(Vec3{1, -1, 1}, Vec4{}).vertices.empty());
+    }
+
+    {
+        // TANGENTS. Three properties, and each catches a different mistake:
+        // unit length catches a missing normalise, perpendicularity catches a
+        // missing Gram-Schmidt, and DIRECTION catches the one that matters --
+        // a tangent that is a valid frame but points the wrong way makes a
+        // normal map's x axis run backwards, which is invisible on a symmetric
+        // pattern and obvious on lettering.
+        const char* which = "tangents";
+        const Mesh cube = MakeCube(2.0f, Vec4{1, 1, 1, 1}, Vec4{1, 1, 1, 1});
+        CHECK(!cube.vertices.empty());
+
+        float worst_len = 0.0f, worst_perp = 0.0f;
+        for (const VertexIn& v : cube.vertices) {
+            const Vec3 t{v.tangent.x, v.tangent.y, v.tangent.z};
+            const Vec3 n{v.normal.x, v.normal.y, v.normal.z};
+            worst_len = std::max(worst_len, std::fabs(Length(t) - 1.0f));
+            worst_perp = std::max(worst_perp, std::fabs(Dot(Normalize(n), t)));
+            CHECK(v.tangent.w == 1.0f || v.tangent.w == -1.0f);
+        }
+        std::printf("  cube: worst |T|-1 = %.2e, worst |dot(N,T)| = %.2e\n",
+                    double(worst_len), double(worst_perp));
+        CHECK(worst_len < 1e-5f);
+        CHECK(worst_perp < 1e-5f);
+
+        // DIRECTION, on a face whose axes are known. MakeCube's +Z face spans
+        // u along +X and v along -Y (uv originates top-left), so the tangent
+        // there must be +X and cross(N,T)*w must come out -Y.
+        int checked = 0;
+        for (const VertexIn& v : cube.vertices) {
+            if (v.normal.z < 0.99f) continue;  // +Z face only
+            const Vec3 t{v.tangent.x, v.tangent.y, v.tangent.z};
+            CHECK(t.x > 0.99f);
+            const Vec3 n{v.normal.x, v.normal.y, v.normal.z};
+            const Vec3 b = Cross(n, t) * v.tangent.w;
+            CHECK(b.y < -0.99f);
+            ++checked;
+        }
+        CHECK(checked == 4);
+
+        // HANDEDNESS flips with a mirrored uv shell. Same geometry, u running
+        // backwards: the tangent reverses and so must the bitangent's sign, or
+        // every dent on a mirrored half of a model becomes a bump.
+        Mesh mirrored = cube;
+        for (VertexIn& v : mirrored.vertices) v.uv.x = 1.0f - v.uv.x;
+        GenerateTangents(mirrored);
+        int flipped = 0, reversed = 0;
+        for (std::size_t i = 0; i < cube.vertices.size(); ++i) {
+            if (mirrored.vertices[i].tangent.w != cube.vertices[i].tangent.w)
+                ++flipped;
+            if (mirrored.vertices[i].tangent.x * cube.vertices[i].tangent.x +
+                    mirrored.vertices[i].tangent.y * cube.vertices[i].tangent.y +
+                    mirrored.vertices[i].tangent.z * cube.vertices[i].tangent.z <
+                -0.99f)
+                ++reversed;
+        }
+        std::printf("  mirrored uv: %d of %zu tangents reversed, %d signs flipped\n",
+                    reversed, cube.vertices.size(), flipped);
+        CHECK(reversed == int(cube.vertices.size()));
+        CHECK(flipped == int(cube.vertices.size()));
+
+        // A mesh with NO uv variation at all. Every triangle is degenerate in
+        // uv space, so there is no correct tangent -- but there is a required
+        // one: finite, unit length and perpendicular to the normal. A zero
+        // tangent makes the shader's TBN singular and every fragment NaN,
+        // which renders as a black surface rather than as an error.
+        Mesh flat = MakeCube(1.0f, Vec4{1, 1, 1, 1}, Vec4{1, 1, 1, 1});
+        for (VertexIn& v : flat.vertices) v.uv = Vec4{0.5f, 0.5f, 0.0f, 0.0f};
+        GenerateTangents(flat);
+        bool all_finite = true;
+        for (const VertexIn& v : flat.vertices) {
+            const Vec3 t{v.tangent.x, v.tangent.y, v.tangent.z};
+            const Vec3 n{v.normal.x, v.normal.y, v.normal.z};
+            if (!std::isfinite(t.x) || !std::isfinite(t.y) || !std::isfinite(t.z))
+                all_finite = false;
+            if (std::fabs(Length(t) - 1.0f) > 1e-5f) all_finite = false;
+            if (std::fabs(Dot(Normalize(n), t)) > 1e-5f) all_finite = false;
+        }
+        CHECK(all_finite);
+
+        // A SPHERE, where the accumulated tangent is genuinely not
+        // perpendicular to the normal before orthogonalisation -- the normals
+        // vary smoothly across each triangle, so the per-triangle tangent is
+        // an average that leans. On a cube every face is flat and the raw
+        // accumulation is already perpendicular, so a cube cannot tell whether
+        // the Gram-Schmidt step ran.
+        const Mesh sphere = MakeUVSphere(1.0f, 24, 32, Vec4{1, 1, 1, 1},
+                                         Vec4{1, 1, 1, 1});
+        float sphere_perp = 0.0f, sphere_len = 0.0f;
+        for (const VertexIn& v : sphere.vertices) {
+            const Vec3 t{v.tangent.x, v.tangent.y, v.tangent.z};
+            const Vec3 nv{v.normal.x, v.normal.y, v.normal.z};
+            sphere_perp = std::max(sphere_perp, std::fabs(Dot(Normalize(nv), t)));
+            sphere_len = std::max(sphere_len, std::fabs(Length(t) - 1.0f));
+        }
+        std::printf("  sphere: worst |dot(N,T)| = %.2e, worst |T|-1 = %.2e\n",
+                    double(sphere_perp), double(sphere_len));
+        CHECK(sphere_perp < 1e-5f);
+        CHECK(sphere_len < 1e-5f);
+
+        // Every generator fills them in, not just the one that was remembered.
+        CHECK(MakeUVSphere(1.0f, 8, 12, Vec4{}, Vec4{}).vertices[10].tangent.w != 0.0f);
+        CHECK(MakeBox(Vec3{1, 2, 3}, Vec4{}).vertices[3].tangent.w != 0.0f);
     }
 
     if (g_failures == 0) std::printf("mesh_test: all checks passed\n");

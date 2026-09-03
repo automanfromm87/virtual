@@ -140,7 +140,7 @@ int main() {
         Check(surface_verts == 33 * 33, "and there is one per sample");
 
         bool in_range = true;
-        for (std::uint16_t i : chunk.indices)
+        for (std::uint32_t i : chunk.indices)
             if (i >= chunk.vertices.size()) in_range = false;
         Check(in_range, "and every index is in range");
     }

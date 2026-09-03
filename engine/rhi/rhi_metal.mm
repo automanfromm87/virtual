@@ -20,6 +20,7 @@ namespace {
 MTLPixelFormat ToMTL(Format f) {
     switch (f) {
         case Format::RGBA8Unorm: return MTLPixelFormatRGBA8Unorm;
+        case Format::RGBA8Srgb: return MTLPixelFormatRGBA8Unorm_sRGB;
         case Format::BGRA8Unorm: return MTLPixelFormatBGRA8Unorm;
         case Format::RGBA16Float: return MTLPixelFormatRGBA16Float;
         case Format::Depth32Float: return MTLPixelFormatDepth32Float;
@@ -262,7 +263,7 @@ AccelId Device::CreateBlas(BufferId vb, int vertex_stride, BufferId ib,
     geo.vertexStride = NSUInteger(vertex_stride);
     geo.indexBuffer = impl_->buffers[ib.v];
     geo.indexBufferOffset = 0;
-    geo.indexType = MTLIndexTypeUInt16;
+    geo.indexType = MTLIndexTypeUInt32;
     geo.triangleCount = NSUInteger(index_count / 3);
     // OPAQUE. Without it every hit would invoke an intersection function to ask
     // whether it counts, which is both slower and pointless for geometry that
@@ -752,13 +753,19 @@ int Device::TextureMipLevels(TextureId h) const {
     return int(impl_->textures[h.v].mipmapLevelCount);
 }
 
-TextureId Device::CreateTexture2D(int width, int height, const void* rgba8) {
+TextureId Device::CreateTexture2D(int width, int height, const void* rgba8,
+                                  bool mips, bool srgb) {
     if (width <= 0 || height <= 0 || !rgba8) return {};
+    // A 1x1 texture has exactly one level however you ask, and asking Metal to
+    // generate mipmaps for it is an error rather than a no-op. The engine's
+    // white and black placeholders are 1x1, so this is the common case.
+    const bool want_mips = mips && (width > 1 || height > 1);
     MTLTextureDescriptor* td = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        texture2DDescriptorWithPixelFormat:(srgb ? MTLPixelFormatRGBA8Unorm_sRGB
+                                                 : MTLPixelFormatRGBA8Unorm)
                                      width:NSUInteger(width)
                                     height:NSUInteger(height)
-                                 mipmapped:NO];
+                                 mipmapped:(want_mips ? YES : NO)];
     td.usage = MTLTextureUsageShaderRead;
     // Shared so the upload below is a plain memcpy. A Private texture would
     // need a staging buffer and a blit — worth it for large assets, pointless
@@ -770,16 +777,39 @@ TextureId Device::CreateTexture2D(int width, int height, const void* rgba8) {
          mipmapLevel:0
            withBytes:rgba8
          bytesPerRow:NSUInteger(width) * 4];
+
+    if (want_mips) {
+        // Its OWN command buffer, committed and waited on here. Texture upload
+        // is a load-time operation and there may be no frame in flight to
+        // append to -- and appending to one would make the texture unusable
+        // until that frame completed, which the caller has no way to know.
+        id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit generateMipmapsForTexture:t];
+        [blit endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
     return TextureId{impl_->AllocTextureSlot(t)};
 }
 
-SamplerId Device::CreateSampler(Filter filter, Wrap wrap) {
+SamplerId Device::CreateSampler(Filter filter, Wrap wrap, int max_anisotropy) {
     MTLSamplerDescriptor* sd = [[MTLSamplerDescriptor alloc] init];
     const MTLSamplerMinMagFilter f = (filter == Filter::Linear)
                                          ? MTLSamplerMinMagFilterLinear
                                          : MTLSamplerMinMagFilterNearest;
     sd.minFilter = f;
     sd.magFilter = f;
+    // TRILINEAR whenever the filter is linear. A texture with no mip chain has
+    // one level and this costs nothing; one with a chain would otherwise snap
+    // between levels at a visible line across the floor.
+    if (filter == Filter::Linear) sd.mipFilter = MTLSamplerMipFilterLinear;
+    // Metal requires 1..16. Clamping rather than rejecting: an out-of-range
+    // value here is a caller asking for "as much as possible", and refusing to
+    // build the sampler would take down the whole renderer for a quality hint.
+    sd.maxAnisotropy = NSUInteger(max_anisotropy < 1    ? 1
+                                  : max_anisotropy > 16 ? 16
+                                                        : max_anisotropy);
     const MTLSamplerAddressMode a = (wrap == Wrap::Repeat)
                                         ? MTLSamplerAddressModeRepeat
                                         : MTLSamplerAddressModeClampToEdge;
@@ -1247,30 +1277,30 @@ void Encoder::DrawInstanced(std::size_t vertex_count, std::size_t instance_count
                          instanceCount:instance_count];
 }
 
-void Encoder::DrawIndexedU16(BufferId indices, std::size_t index_count) {
+void Encoder::DrawIndexedU32(BufferId indices, std::size_t index_count) {
     [device_->impl_->enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                                     indexCount:index_count
-                                     indexType:MTLIndexTypeUInt16
+                                     indexType:MTLIndexTypeUInt32
                                    indexBuffer:device_->impl_->buffers[indices.v]
                              indexBufferOffset:0];
 }
 
-void Encoder::DrawIndexedInstancedU16(BufferId indices, std::size_t index_count,
+void Encoder::DrawIndexedInstancedU32(BufferId indices, std::size_t index_count,
                                       std::size_t instance_count) {
     if (instance_count == 0) return;  // Metal rejects zero outright
     [device_->impl_->enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                                     indexCount:index_count
-                                     indexType:MTLIndexTypeUInt16
+                                     indexType:MTLIndexTypeUInt32
                                    indexBuffer:device_->impl_->buffers[indices.v]
                              indexBufferOffset:0
                                  instanceCount:instance_count];
 }
 
-void Encoder::DrawIndexedIndirectU16(BufferId indices, BufferId args,
+void Encoder::DrawIndexedIndirectU32(BufferId indices, BufferId args,
                                      std::size_t offset) {
     if (!Valid(indices) || !Valid(args)) return;
     [device_->impl_->enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                     indexType:MTLIndexTypeUInt16
+                                     indexType:MTLIndexTypeUInt32
                                    indexBuffer:device_->impl_->buffers[indices.v]
                              indexBufferOffset:0
                                 indirectBuffer:device_->impl_->buffers[args.v]

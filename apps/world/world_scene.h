@@ -102,7 +102,11 @@ inline bool BuildAssets(eng::rhi::Device& dev, eng::Renderer& r, World& w,
     // document. Nothing about this texture exists in the source tree as pixels.
     if (!doc.images.empty() && !doc.images[0].Empty()) {
         const eng::Texture2D& img = doc.images[0];
-        w.gltf_albedo = dev.CreateTexture2D(img.width, img.height, img.rgba.data());
+                // srgb: an albedo image out of a glTF file is authored in sRGB, which
+        // is what the spec says and what every exporter writes. Reading it as
+        // linear makes the midtones about twice as bright as intended.
+        w.gltf_albedo = dev.CreateTexture2D(img.width, img.height, img.rgba.data(),
+                                            /*mips=*/true, /*srgb=*/true);
     }
 
     eng::MaterialDesc md;
