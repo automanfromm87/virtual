@@ -256,6 +256,51 @@ static inline float Falloff(float distance, float range)
 // shader has already done the transform; the cascaded path and the deferred
 // pass both recompute it from the world position, because a fullscreen pass has
 // no vertex to have done it in.
+// Irradiance from a baked volume, or zero when none is bound.
+//
+// Three 3D textures rather than one: an SH-L1 probe is four coefficients per
+// colour channel, and an RGBA texel holds exactly one channel's four. The
+// hardware then does the trilinear blend of the COEFFICIENTS, which is what is
+// wanted -- blending eight evaluated irradiances instead would lose the
+// cancellation that keeps the interpolation smooth, and the cell boundaries
+// become visible seams.
+static inline float3 SampleIrradianceVolume(float3 worldPos, float3 N,
+                                            constant FrameUniforms& u,
+                                            texture3d<float> giR,
+                                            texture3d<float> giG,
+                                            texture3d<float> giB,
+                                            sampler giSmp)
+{
+    if (u.giOrigin.w < 0.5f || is_null_texture(giR)) return float3(0.0f);
+
+    const float3 counts = max(u.giCounts.xyz, float3(1.0f));
+    const float3 grid = (worldPos - u.giOrigin.xyz) / max(u.giSpacing.xyz, 1e-6f);
+    // HALF-TEXEL inset, and clamped inside it. A 3D texture's coordinate 0 is
+    // the outer EDGE of the first texel, not its centre, so a probe grid maps
+    // to (i + 0.5) / n. Without the half texel every lookup is shifted by half
+    // a cell -- which looks like the whole volume is slightly in the wrong
+    // place, and is very hard to see and very easy to misdiagnose as the bake
+    // being wrong.
+    const float3 uvw = clamp((grid + 0.5f) / counts, 0.5f / counts,
+                             1.0f - 0.5f / counts);
+
+    const float4 cr = giR.sample(giSmp, uvw);
+    const float4 cg = giG.sample(giSmp, uvw);
+    const float4 cb = giB.sample(giSmp, uvw);
+
+    // The same L1 basis and the same band constants as the CPU bake. Written
+    // out rather than shared because there is no way to share code across the
+    // two languages -- so the constants are duplicated, and gi_test's uniform-
+    // environment check is what keeps the CPU side honest about them.
+    const float y0 = 0.282095f;
+    const float3 y1 = 0.488603f * float3(N.y, N.z, N.x);
+    const float a0 = 3.14159265f;
+    const float a1 = 2.0f * 3.14159265f / 3.0f;
+    const float4 w = float4(a0 * y0, a1 * y1.x, a1 * y1.y, a1 * y1.z);
+    const float inv_pi = 1.0f / 3.14159265f;
+    return max(float3(dot(cr, w), dot(cg, w), dot(cb, w)) * inv_pi, 0.0f);
+}
+
 static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
                                   float roughness, float metallic,
                                   float4 lightClip,
@@ -309,7 +354,14 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
                                   // reconstructs both and the forward pass has
                                   // them already.
                                   float2 pixel = float2(0.0f),
-                                  float view_depth = 0.0f)
+                                  float view_depth = 0.0f,
+                                  // The baked irradiance volume. Null when
+                                  // there is none, and the hemisphere ambient
+                                  // below stands in.
+                                  texture3d<float> giR = {},
+                                  texture3d<float> giG = {},
+                                  texture3d<float> giB = {},
+                                  sampler giSmp = {})
 {
     // Renormalize per fragment: interpolating unit vectors across a triangle
     // does not preserve length, and the error is worst mid-face.
@@ -449,6 +501,11 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
 
     float3 ambient =
         albedo * (1.0f - metallic) * skyAtN * (1.0f - Famb) + skyAtR * Famb;
+    // The specular half kept separately, so a baked irradiance volume can
+    // replace the DIFFUSE half without taking the reflection with it: an SH-L1
+    // probe cannot represent a reflection at all, and dropping the specular
+    // term would make every metal surface black indoors.
+    float3 ambient_specular = skyAtR * Famb;
 
     // ...AND THE REAL THING, when a probe is bound. Same two halves, same
     // Fresnel split; the only change is where the incoming radiance comes from.
@@ -480,6 +537,7 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
         // diffuse one, and a metal has no diffuse lobe at all.
         const float3 kD = (float3(1.0f) - Famb) * (1.0f - metallic);
         ambient = kD * albedo * irradiance + prefiltered * (f0amb * ab.x + ab.y);
+        ambient_specular = prefiltered * (f0amb * ab.x + ab.y);
     }
 
     // LINEAR HDR out, un-tone-mapped and un-gamma-corrected. The scene target
@@ -489,5 +547,18 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
     // surface to one before anything downstream sees it, so a lamp and a sheet
     // of white paper arrive at the bloom pass identical and it glows off the
     // paper. Brightness has to survive to the end of the frame to be usable.
+    // THE BAKED VOLUME REPLACES the hemisphere ambient's diffuse half when it
+    // is present, rather than adding to it. Adding would count the sky twice --
+    // the bake already integrated it -- and the room would come out roughly
+    // twice as bright as the bake says, which reads as "the GI is too strong"
+    // and gets tuned away by turning the GI down.
+    //
+    // The specular half of `ambient` stays: an SH-L1 probe cannot represent a
+    // reflection, and dropping it would make every metal surface black indoors.
+    const float3 gi = SampleIrradianceVolume(worldPos, N, u, giR, giG, giB, giSmp);
+    if (u.giOrigin.w > 0.5f) {
+        const float3 kD_gi = (1.0f - metallic);
+        return direct + (kD_gi * albedo * gi + ambient_specular) * ao;
+    }
     return direct + ambient * ao;
 }

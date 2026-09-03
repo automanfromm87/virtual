@@ -17,6 +17,7 @@
 #include "engine/resource/handles.h"
 #include <span>
 
+#include "engine/render/gi.h"
 #include "engine/render/ibl.h"
 #include "engine/rhi/rhi.h"
 #include "engine/scene/scene.h"
@@ -501,6 +502,20 @@ class Renderer {
     // written by an earlier pass with the SAME camera.
     void DrawSsao(rhi::Encoder&, const Camera&, int width, int height,
                   rhi::TextureId depth, float radius = 1.1f);
+
+    // A BAKED IRRADIANCE VOLUME, replacing the hemisphere-ambient guess with
+    // measured indirect light. Uploads three 3D textures; pass an empty volume
+    // to go back to the guess.
+    //
+    // It replaces the DIFFUSE ambient rather than adding to it -- the bake
+    // already integrated the sky, so adding would count it twice and the room
+    // would come out about twice as bright as the bake says. The specular half
+    // stays, because SH-L1 cannot represent a reflection and dropping it would
+    // make every metal surface black indoors.
+    [[nodiscard]] bool SetIrradianceVolume(const IrradianceVolume&,
+                                           std::string& error);
+    void ClearIrradianceVolume();
+    [[nodiscard]] bool HasIrradianceVolume() const;
 
     // CLUSTERED LIGHTING. Cuts the view frustum into a 16x9x24 grid, works out
     // on the GPU which lights touch which cell, and lets each fragment read

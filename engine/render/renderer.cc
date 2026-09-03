@@ -75,7 +75,7 @@ constexpr char kClusterSrc[] = {
     , 0};
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
-static_assert(sizeof(FrameUniforms) == 448, "FrameUniforms layout drifted");
+static_assert(sizeof(FrameUniforms) == 496, "FrameUniforms layout drifted");
 static_assert(sizeof(GpuClusters) == 64, "GpuClusters layout drifted");
 static_assert(sizeof(GpuLight) == 144, "GpuLight layout drifted");
 static_assert(sizeof(GpuCascades) == 288, "GpuCascades layout drifted");
@@ -360,6 +360,13 @@ struct Renderer::Impl {
     rhi::BufferId cluster_lights;
     rhi::BufferId cluster_candidates;
     GpuClusters cluster_params{};
+
+    // --- baked irradiance volume ----------------------------------------------
+    rhi::TextureId gi_r, gi_g, gi_b;
+    rhi::SamplerId gi_sampler;
+    Vec4 gi_origin{0, 0, 0, 0};   // w = 1 when bound
+    Vec4 gi_spacing{1, 1, 1, 0};
+    Vec4 gi_counts{1, 1, 1, 0};
     // Shared by UploadLights (per-draw ring) and BinLights (its own buffer).
     // One function, because two would drift and the symptom would be the
     // binning pass culling against ranges the shading pass does not use.
@@ -818,6 +825,62 @@ MaterialHandle Renderer::CreateMaterial(const MaterialDesc& desc,
 }
 
 int Renderer::Samples() const { return impl_->samples; }
+
+bool Renderer::SetIrradianceVolume(const IrradianceVolume& v, std::string& error) {
+    if (v.Empty()) {
+        ClearIrradianceVolume();
+        return true;
+    }
+    const GiBakeConfig& c = v.Config();
+    const std::size_t n = std::size_t(c.nx) * c.ny * c.nz;
+    if (v.Probes().size() != n) {
+        error = "the irradiance volume's probe count does not match its grid";
+        return false;
+    }
+
+    // THREE textures, one per colour channel, each holding that channel's four
+    // SH coefficients in an RGBA texel. Splitting by channel rather than by
+    // coefficient is what makes one sample per channel enough -- the
+    // alternative needs four samples and then a transpose in the shader.
+    std::vector<float> r(n * 4), g(n * 4), b(n * 4);
+    for (std::size_t i = 0; i < n; ++i)
+        for (int k = 0; k < 4; ++k) {
+            r[i * 4 + std::size_t(k)] = (&v.Probes()[i].r.x)[k];
+            g[i * 4 + std::size_t(k)] = (&v.Probes()[i].g.x)[k];
+            b[i * 4 + std::size_t(k)] = (&v.Probes()[i].b.x)[k];
+        }
+
+    // The old ones are released FIRST. Rebaking every time the sun moves is a
+    // reasonable thing for a caller to do, and without this the texture table
+    // grows by three entries per bake until the device runs out.
+    ClearIrradianceVolume();
+    impl_->gi_r = impl_->dev->CreateTexture3DFloat(c.nx, c.ny, c.nz, r.data());
+    impl_->gi_g = impl_->dev->CreateTexture3DFloat(c.nx, c.ny, c.nz, g.data());
+    impl_->gi_b = impl_->dev->CreateTexture3DFloat(c.nx, c.ny, c.nz, b.data());
+    if (!Valid(impl_->gi_sampler))
+        impl_->gi_sampler =
+            impl_->dev->CreateSampler(rhi::Filter::Linear, rhi::Wrap::Clamp);
+    if (!Valid(impl_->gi_r) || !Valid(impl_->gi_g) || !Valid(impl_->gi_b) ||
+        !Valid(impl_->gi_sampler)) {
+        ClearIrradianceVolume();
+        error = "could not upload the irradiance volume";
+        return false;
+    }
+    impl_->gi_origin = Vec4{c.origin.x, c.origin.y, c.origin.z, 1.0f};
+    impl_->gi_spacing = Vec4{c.spacing.x, c.spacing.y, c.spacing.z, 0.0f};
+    impl_->gi_counts = Vec4{float(c.nx), float(c.ny), float(c.nz), 0.0f};
+    return true;
+}
+
+void Renderer::ClearIrradianceVolume() {
+    for (rhi::TextureId* t : {&impl_->gi_r, &impl_->gi_g, &impl_->gi_b}) {
+        if (Valid(*t)) impl_->dev->DestroyTexture(*t);
+        *t = {};
+    }
+    impl_->gi_origin.w = 0.0f;
+}
+
+bool Renderer::HasIrradianceVolume() const { return impl_->gi_origin.w > 0.5f; }
 
 void Renderer::SetClusteredLighting(bool on) {
     if (on == impl_->clustered) return;
@@ -1619,6 +1682,9 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
                                scene.ambientGround.z, 0.0f};
         u.emissive = Vec4{mat.emissive.x, mat.emissive.y, mat.emissive.z,
                           mat.normal_strength};
+        u.giOrigin = gi_origin;
+        u.giSpacing = gi_spacing;
+        u.giCounts = gi_counts;
 
         // Sub-allocate out of this frame's slot instead of a per-draw setBytes.
         std::memcpy(uniform_map + offset, &u, sizeof(u));
@@ -1635,6 +1701,10 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
         enc.SetFragmentTexture(mat.emissive_map, 9);
         enc.SetFragmentTexture(mat.occlusion_map, 10);
         enc.SetFragmentSampler(shadow_sampler, 2);
+        enc.SetFragmentTexture(gi_r, 11);
+        enc.SetFragmentTexture(gi_g, 12);
+        enc.SetFragmentTexture(gi_b, 13);
+        enc.SetFragmentSampler(gi_sampler, 3);
         // CLUSTERS, or nothing. Binding stale bins is worse than binding none:
         // the shader's null check falls back to the full buffer, while a stale
         // index list points at lights that may no longer exist.
@@ -1861,6 +1931,9 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
     // No material here: a fullscreen lighting pass reads the G-buffer,
     // and emission was already added by the pass that wrote it.
     u.emissive = Vec4{0.0f, 0.0f, 0.0f, 1.0f};
+    u.giOrigin = impl_->gi_origin;
+    u.giSpacing = impl_->gi_spacing;
+    u.giCounts = impl_->gi_counts;
 
     const std::size_t offset = impl_->AllocUniform();
     if (offset == Impl::kNoSpace) return;
@@ -1883,6 +1956,10 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
     // slot 2 with a sampler of its own.
     enc.SetFragmentSampler(impl_->clamp_sampler, 0);
     enc.SetFragmentSampler(impl_->shadow_sampler, 2);
+    enc.SetFragmentTexture(impl_->gi_r, 11);
+    enc.SetFragmentTexture(impl_->gi_g, 12);
+    enc.SetFragmentTexture(impl_->gi_b, 13);
+    enc.SetFragmentSampler(impl_->gi_sampler, 3);
     // CLUSTERS, or nothing. Binding stale bins is worse than binding
     // none: the shader's null check falls back to the full buffer, while a
     // stale index list points at lights that may no longer exist.
@@ -2169,6 +2246,9 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
                                scene.ambientGround.z, 0.0f};
         u.emissive = Vec4{mat.emissive.x, mat.emissive.y, mat.emissive.z,
                           mat.normal_strength};
+        u.giOrigin = impl_->gi_origin;
+        u.giSpacing = impl_->gi_spacing;
+        u.giCounts = impl_->gi_counts;
         std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
 
         enc.SetPipeline(mat.instanced_pipeline);
@@ -2184,6 +2264,14 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
         enc.SetFragmentTexture(mat.emissive_map, 9);
         enc.SetFragmentTexture(mat.occlusion_map, 10);
         enc.SetFragmentSampler(impl_->shadow_sampler, 2);
+        enc.SetFragmentTexture(impl_->gi_r, 11);
+        enc.SetFragmentTexture(impl_->gi_g, 12);
+        enc.SetFragmentTexture(impl_->gi_b, 13);
+        enc.SetFragmentSampler(impl_->gi_sampler, 3);
+    enc.SetFragmentTexture(impl_->gi_r, 11);
+    enc.SetFragmentTexture(impl_->gi_g, 12);
+    enc.SetFragmentTexture(impl_->gi_b, 13);
+    enc.SetFragmentSampler(impl_->gi_sampler, 3);
         // CLUSTERS, or nothing. Binding stale bins is worse than binding
         // none: the shader's null check falls back to the full buffer, while a
         // stale index list points at lights that may no longer exist.

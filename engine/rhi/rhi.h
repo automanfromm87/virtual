@@ -396,6 +396,17 @@ class Device {
     // above one, and an 8-bit texture has none.
     [[nodiscard]] TextureId CreateTexture2DFloat(int width, int height,
                                                  const float* rgba32f);
+    // A 3D texture from float pixels: width*height*depth*4 floats, x fastest.
+    // Stored as RGBA16Float, which halves the bandwidth of a lookup that
+    // happens once per fragment and holds far more precision than an irradiance
+    // coefficient needs.
+    //
+    // Sampled with an ordinary linear sampler, which on a 3D texture is
+    // TRILINEAR in hardware -- eight texels and seven lerps for free. Doing the
+    // same interpolation by hand from a buffer is eight scattered reads and a
+    // dozen instructions, per fragment.
+    [[nodiscard]] TextureId CreateTexture3DFloat(int width, int height, int depth,
+                                                 const float* rgba32f);
     // A block-compressed texture, every mip level supplied.
     //
     // `level_offsets` gives each level's start in `data`, and its size is the

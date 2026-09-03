@@ -1,0 +1,17 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# The baked volume, rendered. gi_test proves the bake; this proves it reaches
+# the screen, which is a different claim and a different set of mistakes.
+cc_test(
+    name = "gi_render_test",
+    srcs = ["main.cpp"],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/render:gi",
+        "//engine/rhi",
+        "//engine/scene",
+    ],
+)

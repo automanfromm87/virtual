@@ -90,7 +90,11 @@ fragment float4 fs_deferred(FullscreenOut in [[stage_in]],
                             sampler          shadowSmp   [[sampler(2)]],
                             constant GpuClusters* clusters       [[buffer(5)]],
                             device const uint*    clusterCounts  [[buffer(6)]],
-                            device const uint*    clusterIndices [[buffer(7)]])
+                            device const uint*    clusterIndices [[buffer(7)]],
+                            texture3d<float> giR [[texture(11)]],
+                            texture3d<float> giG [[texture(12)]],
+                            texture3d<float> giB [[texture(13)]],
+                            sampler          giSmp [[sampler(3)]])
 {
     const float depth = sceneDepth.sample(smp, in.uv);
     // Reversed-Z: 0 is the far plane, and it is what an untouched pixel holds.
@@ -129,6 +133,7 @@ fragment float4 fs_deferred(FullscreenOut in [[stage_in]],
                      // alpha that already holds roughness would cost both.
                      1.0f, clusters, clusterCounts, clusterIndices,
                      in.position.xy,
-                     dot(worldPos - u.eyePos.xyz, u.viewDir.xyz));
+                     dot(worldPos - u.eyePos.xyz, u.viewDir.xyz),
+                     giR, giG, giB, giSmp);
     return float4(lit, 1.0f);
 }

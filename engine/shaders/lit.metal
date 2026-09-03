@@ -182,7 +182,12 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
                        // function falls back to the whole light buffer.
                        constant GpuClusters* clusters       [[buffer(5)]],
                        device const uint*    clusterCounts  [[buffer(6)]],
-                       device const uint*    clusterIndices [[buffer(7)]])
+                       device const uint*    clusterIndices [[buffer(7)]],
+                       // The baked irradiance volume, slots 11-13.
+                       texture3d<float> giR [[texture(11)]],
+                       texture3d<float> giG [[texture(12)]],
+                       texture3d<float> giB [[texture(13)]],
+                       sampler          giSmp [[sampler(3)]])
 {
     // SECTION CUT before anything else: no point shading a fragment that is
     // about to be thrown away. This is what lets you look inside a building
@@ -220,7 +225,8 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
                                     // of -- not distance from the eye, which
                                     // would make the cell boundaries spherical
                                     // and disagree with the binning pass.
-                                    dot(worldPos - u.eyePos.xyz, u.viewDir.xyz));
+                                    dot(worldPos - u.eyePos.xyz, u.viewDir.xyz),
+                                    giR, giG, giB, giSmp);
     // EMISSION last and unlit. It is radiance the surface produces, so nothing
     // shadows it, no light affects it and ambient occlusion does not dim it --
     // a glowing sign in a dark alcove is exactly as bright as one in the open.

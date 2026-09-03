@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -30,6 +30,7 @@ cc_library(
         "-Wno-c23-extensions",
     ],
     deps = [
+        ":gi",
         "//engine/anim",
         "//engine/core",
         "//engine/geometry",
@@ -39,4 +40,23 @@ cc_library(
         "//engine/shaders",
         "//engine/texture",
     ],
+)
+
+# Baked indirect light on a grid. On the CPU and separate from :render: a bake
+# is not a frame, and every failure mode of a GI bake produces a picture that
+# looks plausible -- so it has to be testable without a device.
+cc_library(
+    name = "gi",
+    srcs = ["gi.cc"],
+    hdrs = ["gi.h"],
+    deps = [
+        "//engine/core",
+        "//engine/physics",
+    ],
+)
+
+cc_test(
+    name = "gi_test",
+    srcs = ["gi_test.cc"],
+    deps = [":gi"],
 )

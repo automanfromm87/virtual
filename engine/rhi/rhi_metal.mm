@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 
 #include "engine/rhi/rhi.h"
 
@@ -795,6 +796,45 @@ TextureId Device::CreateTexture2D(int width, int height, const void* rgba8,
         [cb commit];
         [cb waitUntilCompleted];
     }
+    return TextureId{impl_->AllocTextureSlot(t)};
+}
+
+TextureId Device::CreateTexture3DFloat(int width, int height, int depth,
+                                       const float* rgba32f) {
+    if (width <= 0 || height <= 0 || depth <= 0 || !rgba32f) return {};
+    MTLTextureDescriptor* td = [[MTLTextureDescriptor alloc] init];
+    td.textureType = MTLTextureType3D;
+    td.pixelFormat = MTLPixelFormatRGBA16Float;
+    td.width = NSUInteger(width);
+    td.height = NSUInteger(height);
+    td.depth = NSUInteger(depth);
+    td.mipmapLevelCount = 1;
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> t = [impl_->dev newTextureWithDescriptor:td];
+    if (!t) return {};
+
+    // Converted to half on the CPU. replaceRegion does no format conversion --
+    // handing it float data for a half texture writes the raw bits and the
+    // result is not "slightly wrong colours", it is noise.
+    std::vector<std::uint16_t> half(std::size_t(width) * height * depth * 4);
+    for (std::size_t i = 0; i < half.size(); ++i) {
+        const float f = rgba32f[i];
+        // __fp16 is the compiler's own conversion, including the round-to-
+        // nearest-even and the overflow-to-infinity that a hand-rolled bit
+        // twiddle gets wrong at the edges.
+        const __fp16 h = __fp16(f);
+        std::uint16_t bits;
+        std::memcpy(&bits, &h, sizeof(bits));
+        half[i] = bits;
+    }
+    [t replaceRegion:MTLRegionMake3D(0, 0, 0, NSUInteger(width),
+                                     NSUInteger(height), NSUInteger(depth))
+         mipmapLevel:0
+               slice:0
+           withBytes:half.data()
+         bytesPerRow:NSUInteger(width) * 8
+       bytesPerImage:NSUInteger(width) * NSUInteger(height) * 8];
     return TextureId{impl_->AllocTextureSlot(t)};
 }
 

@@ -77,6 +77,15 @@ struct FrameUniforms {
     // of 1 is a surface no brighter than a lit wall. Anything at or below 1
     // will not bloom, because the bloom threshold is in the same linear units.
     ENG_VEC4 emissive;
+    // The irradiance volume's placement. xyz = world origin of probe (0,0,0),
+    // w = 1 when a volume is bound.
+    ENG_VEC4 giOrigin;
+    // xyz = cell size in metres, w unused.
+    ENG_VEC4 giSpacing;
+    // xyz = probe counts, w unused. Needed to turn a world position into a
+    // texture coordinate: a 3D texture samples in 0..1, and the half-texel
+    // inset is what stops the outermost probes being blended with nothing.
+    ENG_VEC4 giCounts;
 };
 
 // A local light. Sixteen bytes times four, so the array packs with no padding
