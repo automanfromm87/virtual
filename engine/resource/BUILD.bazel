@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -8,4 +8,20 @@ package(default_visibility = ["//visibility:public"])
 cc_library(
     name = "resource",
     hdrs = ["handles.h"],
+)
+
+# Streaming residency: what should be in memory, loaded in the background,
+# evicted under a budget. No graphics in it -- the caller supplies the loader
+# and does the upload, so this is a scheduling problem and testable as one.
+cc_library(
+    name = "stream",
+    srcs = ["stream.cc"],
+    hdrs = ["stream.h"],
+    deps = ["//engine/core"],
+)
+
+cc_test(
+    name = "stream_test",
+    srcs = ["stream_test.cc"],
+    deps = [":stream"],
 )
