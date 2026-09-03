@@ -7,13 +7,33 @@ package(default_visibility = ["//visibility:public"])
 # be checkable against known input rather than by eye.
 cc_library(
     name = "anim",
-    srcs = ["anim.cc"],
-    hdrs = ["anim.h"],
+    srcs = [
+        "anim.cc",
+        "blend.cc",
+        "ik.cc",
+    ],
+    hdrs = [
+        "anim.h",
+        "blend.h",
+        "ik.h",
+    ],
     deps = ["//engine/core"],
 )
 
 cc_test(
     name = "anim_test",
     srcs = ["anim_test.cc"],
+    deps = [":anim"],
+)
+
+cc_test(
+    name = "blend_test",
+    srcs = ["blend_test.cc"],
+    deps = [":anim"],
+)
+
+cc_test(
+    name = "ik_test",
+    srcs = ["ik_test.cc"],
     deps = [":anim"],
 )
