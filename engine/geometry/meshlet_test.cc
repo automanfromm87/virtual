@@ -167,6 +167,41 @@ int main() {
     }
 
     {
+        std::printf("\ntwo objects far apart stay apart\n");
+        // A cluster that runs out of connected surface JUMPS to the nearest
+        // unclaimed triangle, which is what lets a cube's six faces -- sharing
+        // no vertex index at all -- end up in one meshlet. The jump has to be
+        // bounded, or a cluster finishing one object drags in the next one and
+        // its bounding sphere spans the gap between them. A bounding sphere
+        // that large is a meshlet the frustum can never reject.
+        // SMALL spheres, each well under one meshlet's worth. That is the case
+        // the jump exists for and the only case that exercises the limit: a
+        // large object fills its cluster up and closes before the frontier ever
+        // empties, so no jump is attempted and an unbounded limit costs
+        // nothing. Two 56-triangle spheres, and the first cluster swallows one
+        // whole with room to spare.
+        Mesh pair = MakeUVSphere(1.0f, 5, 7, Vec4{1, 1, 1, 1}, Vec4{1, 1, 1, 1});
+        const std::uint32_t base = std::uint32_t(pair.vertices.size());
+        const Mesh second = MakeUVSphere(1.0f, 5, 7, Vec4{1, 1, 1, 1},
+                                         Vec4{1, 1, 1, 1});
+        for (VertexIn v : second.vertices) {
+            v.position.x += 40.0f;  // forty radii away
+            pair.vertices.push_back(v);
+        }
+        for (std::uint32_t i : second.indices) pair.indices.push_back(base + i);
+
+        const MeshletBuild pb = BuildMeshlets(pair);
+        double worst = 0.0;
+        for (const Meshlet& ml : pb.meshlets) worst = std::max(worst, double(ml.radius));
+        std::printf("    %zu meshlets over two spheres 40 units apart; "
+                    "largest bounding radius %.2f\n",
+                    pb.meshlets.size(), worst);
+        // Anything approaching 20 is a meshlet holding a piece of each.
+        Check(worst < 2.0,
+              "no meshlet spans the gap between two separate objects");
+    }
+
+    {
         std::printf("\ndegenerate input\n");
         Check(BuildMeshlets(Mesh{}).Empty(), "an empty mesh gives no meshlets");
         Mesh no_tris;

@@ -200,20 +200,21 @@ int main() {
                     facing, build.meshlets.size(),
                     100.0 * facing / double(build.meshlets.size()));
         Check(facing > 0, "something survives when the sphere is on screen");
-        // 81%, not the ~50% a hemisphere suggests, and that is the BUILDER
-        // rather than the test. BuildMeshlets is greedy over the index order,
-        // and a UV sphere's index order walks a whole latitude band before
-        // moving on -- so a meshlet is a long thin strip spanning most of a
-        // circumference, its normals span a wide angle, and its cone is too
-        // wide to reject. Clustering by locality first would make the cones
-        // tight and take this figure close to half; it is written down in
-        // meshlet.h as what this builder does not do.
+        // ABOUT HALF, which is the ceiling: a sphere shows one hemisphere, and
+        // the meshlets straddling the terminator have normals spanning it and
+        // can never be rejected.
         //
-        // What is asserted is that the cone rejects a real fraction, and that
-        // the frame is unchanged by it -- which the bit-identical comparison
-        // above already established, so those nineteen were invisible.
-        Check(facing < build.meshlets.size() * 9 / 10,
-              "and the back-facing meshlets its cones can reject are rejected");
+        // This read 81% while BuildMeshlets walked the index array -- a uv
+        // sphere's index order runs along a whole latitude band, so a meshlet
+        // came out as a ring with a bounding sphere larger than the model and
+        // a 49-degree cone. Clustering by locality took it to 51%.
+        //
+        // And the frame is unchanged by any of it: the comparison above is
+        // bit-identical, so every rejected meshlet was invisible.
+        Check(facing < build.meshlets.size() * 3 / 5,
+              "and about half of them -- the back-facing half -- are rejected");
+        Check(facing > build.meshlets.size() / 3,
+              "but not so many that something visible is being thrown away");
 
         // OFF SCREEN entirely: the camera turned away. The frustum test should
         // reject every meshlet, and the mesh stage should never run.

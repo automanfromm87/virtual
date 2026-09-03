@@ -80,14 +80,34 @@ struct MeshletBuild {
     [[nodiscard]] bool Empty() const { return meshlets.empty(); }
 };
 
-// Cuts `mesh` into meshlets.
+// Cuts `mesh` into meshlets, clustering by LOCALITY.
 //
-// Greedy and spatially coherent: triangles are taken in order and a meshlet is
-// closed when it fills up or when the next triangle would stretch it too far.
-// A proper implementation clusters by locality first, which produces tighter
-// bounds and tighter cones; this one relies on the index order already being
-// coherent, which it is for every generator in this engine and for anything a
-// modelling package exports.
+// A cluster grows from a seed triangle by repeatedly taking the best of its
+// neighbours, where "best" trades off vertex reuse, distance from the cluster's
+// centroid, and agreement with its average normal. Adjacency is by welded
+// POSITION rather than by vertex index, so a uv seam or a hard edge is not a
+// wall.
+//
+// This replaced a version that simply walked the index array, and the
+// difference is not marginal. On a 6016-triangle uv sphere the index-order
+// build produced RINGS -- one whole latitude band per meshlet, 0.14 units tall
+// and two across, with a bounding sphere of radius 1.05 on a sphere of radius
+// 1.00. A cluster whose bounds are larger than the model cannot be frustum
+// culled at all. Measured over 64 viewpoints:
+//
+//                       meshlets   bounding radius   cone     culled
+//   by index order        101          1.05 worst    49 deg    19%
+//   by locality            76          0.30 mean     18 deg    48%
+//
+// 48% is close to the ceiling for a sphere: exactly half of it faces away, and
+// the meshlets straddling the terminator can never be rejected.
+//
+// The three scoring terms are worth about a point each; the whole win is in
+// growing from a seed by adjacency rather than in how the candidates are
+// ranked. They stay because each one is a different pathology on a mesh that
+// is not a sphere -- no locality term and a cluster wanders, no cone term and
+// it straddles a silhouette, no reuse term and it hits the 64-vertex limit
+// long before the 124-triangle one.
 [[nodiscard]] MeshletBuild BuildMeshlets(const Mesh&);
 
 }  // namespace eng
