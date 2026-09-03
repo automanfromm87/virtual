@@ -139,10 +139,31 @@ struct Scene {
     // Half-extent, in world units, of the orthographic box the shadow map
     // covers, centred on the origin. 0 disables shadows entirely.
     //
-    // A single fixed box is the simplest thing that works. It is also the thing
-    // that stops working the moment a scene is bigger than the box — which is
-    // what cascaded shadow maps exist to fix.
+    // A single fixed box is the simplest thing that works, and it is what you
+    // get with one cascade. Used as the extent of the LAST cascade when there
+    // are several.
     float shadowExtent = 0.0f;
+
+    // CASCADES. One shadow map has to choose between covering the distance and
+    // having enough texels near the camera; a fixed box does the first and the
+    // shadows come out blocky underfoot. Splitting the view into ranges and
+    // giving each its own map spends the resolution where it is looked at.
+    //
+    // 1 is the old behaviour exactly: one box of `shadowExtent`, centred on the
+    // origin.
+    int shadowCascades = 1;
+    // How far from the camera the cascades reach. Beyond it, unshadowed.
+    float shadowDistance = 40.0f;
+    // Blend between a purely logarithmic split and a uniform one. Logarithmic
+    // is right for perspective — each cascade should cover a constant fraction
+    // of screen space, and depth is not linear — but it puts the first split
+    // absurdly close, so everyone mixes the two.
+    float cascadeBlend = 0.75f;
+
+    // Bounds of cascade `i`, in view distance from the camera.
+    [[nodiscard]] float CascadeSplit(int i) const;
+    // World -> cascade `i`'s clip space.
+    [[nodiscard]] Mat4 CascadeViewProj(int i, float aspect) const;
 
     // Hemisphere ambient: cool from the sky, dim warm bounce from the ground,
     // blended by which way a normal points. The cheapest useful stand-in for

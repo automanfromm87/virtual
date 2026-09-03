@@ -91,6 +91,19 @@ struct GpuLight {
     ENG_VEC4 shadow;
 };
 
+// The directional light's cascades, bound once per pass. Not in FrameUniforms:
+// four matrices is 256 bytes and every one of the scene's instances would carry
+// a copy of them.
+struct GpuCascades {
+    ENG_MAT4 viewProj[4];
+    // .x..w the far distance of each cascade, in view units. A fragment picks
+    // the first one it fits inside.
+    ENG_VEC4 splits;
+    // .x how many are live, .y tiles per side of the shadow map, .z the size of
+    // one tile in uv.
+    ENG_VEC4 info;
+};
+
 // Lights the fragment stage can read in one pass. A forward renderer pays for
 // every light on every fragment, so this is a budget rather than a limit of the
 // format — past a few dozen the answer is to cluster them, not to raise this.

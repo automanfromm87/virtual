@@ -164,6 +164,10 @@ class Renderer {
 
     // 4x4 tiles of 1024. Sixteen because a POINT light needs six of them —
     // one per cube face — so a 2x2 atlas could not hold a single one.
+    // What a directional shadow map should be created at. Cascades tile it, so
+    // four of them get 1024 each.
+    static constexpr int kDirectionalShadowSize = 2048;
+
     static constexpr int kShadowAtlasSize = 4096;
     static constexpr int kShadowTilesPerSide = 4;
     static constexpr int kShadowTiles = kShadowTilesPerSide * kShadowTilesPerSide;

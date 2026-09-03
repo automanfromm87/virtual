@@ -225,6 +225,8 @@ inline eng::Scene MakeScene(const Assets& a, float time) {
     s.lightDir = eng::Vec4{-0.44f, 0.72f, 0.53f, 0.0f};
     s.lightColor = eng::Vec4{4.0f, 3.9f, 3.7f, 1.0f};
     s.shadowExtent = 6.5f;
+    s.shadowCascades = 3;
+    s.shadowDistance = 18.0f;
 
     eng::anim::Pose pose;
     a.flag.clip.Sample(time, a.flag.skeleton, &pose);

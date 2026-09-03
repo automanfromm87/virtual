@@ -93,6 +93,92 @@ Mat4 Light::CubeFaceViewProj(int face) const {
     return Mat4::PerspectiveReverseZ(1.5707963f, 1.0f, shadow_near) * view;
 }
 
+float Scene::CascadeSplit(int i) const {
+    const int n = std::clamp(shadowCascades, 1, 4);
+    if (i <= 0) return camera.nearZ;
+    if (i >= n) return shadowDistance;
+    const float near = std::max(camera.nearZ, 0.01f);
+    const float far = std::max(shadowDistance, near * 2.0f);
+    const float f = float(i) / float(n);
+    // Logarithmic wants each cascade to cover a constant ratio of depth;
+    // uniform wants a constant slice. Neither alone is usable: the first puts
+    // split zero at a few centimetres, the second wastes the near cascade on
+    // distance nothing is looking at.
+    const float log_split = near * std::pow(far / near, f);
+    const float uniform = near + (far - near) * f;
+    return cascadeBlend * log_split + (1.0f - cascadeBlend) * uniform;
+}
+
+Mat4 Scene::CascadeViewProj(int i, float aspect) const {
+    const int n = std::clamp(shadowCascades, 1, 4);
+    if (n == 1) return LightViewProj();
+
+    const float split_near = CascadeSplit(i);
+    const float split_far = CascadeSplit(i + 1);
+
+    // The eight corners of this slice of the camera frustum, in world space.
+    const Vec3 forward = Normalize(camera.target - camera.eye);
+    const Vec3 right = Normalize(Cross(forward, camera.up));
+    const Vec3 up = Cross(right, forward);
+    const float tan_half = std::tan(camera.fovY * 0.5f);
+
+    Vec3 corners[8];
+    int c = 0;
+    for (int side = 0; side < 2; ++side) {
+        const float d = side ? split_far : split_near;
+        const float h = tan_half * d;
+        const float w = h * aspect;
+        const Vec3 centre = camera.eye + forward * d;
+        for (int sy = -1; sy <= 1; sy += 2)
+            for (int sx = -1; sx <= 1; sx += 2)
+                corners[c++] = centre + right * (w * float(sx)) + up * (h * float(sy));
+    }
+
+    // A SPHERE around the slice, not a box. A box fitted to the corners changes
+    // size as the camera turns, and a shadow map whose extent changes every
+    // frame shimmers along every edge. A sphere is rotation-invariant.
+    Vec3 centre{0.0f, 0.0f, 0.0f};
+    for (const Vec3& p : corners) centre = centre + p;
+    centre = centre * 0.125f;
+    float radius = 0.0f;
+    for (const Vec3& p : corners) radius = std::max(radius, Length(p - centre));
+    radius = std::ceil(radius * 16.0f) / 16.0f;  // quantised, for the same reason
+
+    const Vec3 dir = Normalize(Vec3{lightDir.x, lightDir.y, lightDir.z});
+    const Vec3 light_up = (std::fabs(dir.y) > 0.99f) ? Vec3{0.0f, 0.0f, 1.0f}
+                                                     : Vec3{0.0f, 1.0f, 0.0f};
+    // Pulled back far enough that casters BEHIND the slice still make it in —
+    // a shadow is cast by something outside the view as often as not.
+    const float pull = radius * 4.0f;
+
+    // TEXEL SNAPPING, in LIGHT SPACE and BEFORE the view matrix is built.
+    //
+    // Without it the map's origin slides a fraction of a texel as the camera
+    // walks, every shadow edge re-samples slightly differently, and the whole
+    // scene crawls. Quantising the centre locks the map's grid to the world, so
+    // a fixed point stays on its texel until the camera has moved a whole one.
+    //
+    // The obvious version of this — build the view, then round the centre's
+    // position in it — does nothing at all: the view is built LOOKING AT the
+    // centre, so the centre is at the origin by construction and rounding zero
+    // gives zero. The rounding has to happen in the light's basis while the
+    // centre is still a real position.
+    const Vec3 forward_l = dir * -1.0f;
+    const Vec3 right_l = Normalize(Cross(forward_l, light_up));
+    const Vec3 up_l = Cross(right_l, forward_l);
+    const float texels = 1024.0f;  // matches the tile size the renderer uses
+    const float units_per_texel = radius * 2.0f / texels;
+    const float cx = Dot(right_l, centre), cy = Dot(up_l, centre);
+    const float snapped_x = std::floor(cx / units_per_texel) * units_per_texel;
+    const float snapped_y = std::floor(cy / units_per_texel) * units_per_texel;
+    centre = centre + right_l * (snapped_x - cx) + up_l * (snapped_y - cy);
+
+    const Mat4 view = Mat4::LookAt(centre + dir * pull, centre, light_up);
+    const Mat4 proj =
+        Mat4::OrthographicReverseZ(radius, radius, 0.05f, pull + radius * 2.0f);
+    return proj * view;
+}
+
 Mat4 Scene::LightViewProj() const {
     const Vec3 dir = Normalize(Vec3{lightDir.x, lightDir.y, lightDir.z});
     // lightDir points TOWARD the light, so the virtual camera sits out along it

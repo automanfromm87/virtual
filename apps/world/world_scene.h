@@ -252,6 +252,10 @@ inline eng::Scene ToScene(const World& w) {
     s.lightDir = eng::Vec4{-0.42f, 0.74f, -0.52f, 0.0f};
     s.lightColor = eng::Vec4{4.4f, 4.2f, 3.9f, 1.0f};
     s.shadowExtent = 11.0f;
+    // Cascades: the tray is 18 m across and one box spread over it leaves the
+    // contact shadows under the balls blocky.
+    s.shadowCascades = 3;
+    s.shadowDistance = 26.0f;
     for (std::size_t i = 0; i < w.ecs.renderables.Size(); ++i) {
         const eng::ecs::Renderable& r = w.ecs.renderables.At(i);
         if (!r.visible) continue;

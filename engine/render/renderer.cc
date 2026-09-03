@@ -44,6 +44,7 @@ constexpr char kBloomSrc[] = {
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
 static_assert(sizeof(FrameUniforms) == 352, "FrameUniforms layout drifted");
 static_assert(sizeof(GpuLight) == 144, "GpuLight layout drifted");
+static_assert(sizeof(GpuCascades) == 288, "GpuCascades layout drifted");
 static_assert(sizeof(VertexIn) == 64, "VertexIn layout drifted");
 static_assert(offsetof(VertexIn, normal) == 16, "GPU float3 occupies 16 bytes");
 static_assert(offsetof(VertexIn, color) == 32, "GPU float3 occupies 16 bytes");
@@ -62,6 +63,7 @@ constexpr int kUniformSlot = 1;
 constexpr int kSkinSlot = 2;     // per-vertex joints and weights
 constexpr int kPaletteSlot = 3;  // this instance's joint matrices
 constexpr int kLightSlot = 2;    // FRAGMENT stage: the scene's local lights
+constexpr int kCascadeSlot = 3;  // FRAGMENT stage: the sun's cascades
 
 // Ring capacity per frame slot. Exceeding it drops draws rather than
 // corrupting the frame — see the clamp in DrawScene.
@@ -142,6 +144,10 @@ struct Renderer::Impl {
     // to look.
     std::vector<int> shadow_tile_of_light;
     int shadow_tiles_used = 0;
+    // Aspect of the last DrawScene, so DrawShadow can fit its cascades to the
+    // frustum the camera will actually use. The shadow pass runs first and has
+    // no width or height of its own.
+    float last_aspect = 0.0f;
     rhi::PipelineId ssao;
     rhi::TextureId dummy_shadow;  // bound when shadows are off
     // 1x1 opaque white. Standing in for an absent map keeps the shader
@@ -171,6 +177,11 @@ struct Renderer::Impl {
     rhi::BufferId lights;
     std::uint8_t* light_map = nullptr;
     std::size_t light_slot_bytes = 0;
+
+    // The sun's cascades, one copy per frame slot for the same reason.
+    rhi::BufferId cascades;
+    std::uint8_t* cascade_map = nullptr;
+    std::size_t cascade_slot_bytes = 0;
 
     rhi::BufferId palettes;
     std::uint8_t* palette_map = nullptr;
@@ -552,6 +563,17 @@ std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
     r->impl_->slot_bytes = r->impl_->uniform_stride * kMaxInstancesPerFrame;
     r->impl_->uniforms =
         dev.CreateDynamicBuffer(r->impl_->slot_bytes * rhi::kFramesInFlight);
+    r->impl_->cascade_slot_bytes =
+        AlignUp(sizeof(GpuCascades), dev.UniformAlignment());
+    r->impl_->cascades =
+        dev.CreateDynamicBuffer(r->impl_->cascade_slot_bytes * rhi::kFramesInFlight);
+    r->impl_->cascade_map =
+        static_cast<std::uint8_t*>(dev.MapBuffer(r->impl_->cascades));
+    if (!Valid(r->impl_->cascades) || !r->impl_->cascade_map) {
+        error = "failed to allocate the cascade buffer";
+        return nullptr;
+    }
+
     r->impl_->light_slot_bytes =
         AlignUp(sizeof(GpuLight) * ENG_MAX_LIGHTS, dev.UniformAlignment());
     r->impl_->lights =
@@ -588,7 +610,12 @@ std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
 void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
     impl_->shadow_draws = 0;
     if (scene.shadowExtent <= 0.0f) return;
-    const Mat4 lightViewProj = scene.LightViewProj();
+    // Cascades tile the map. One cascade uses the whole thing, which is the
+    // behaviour this had before they existed.
+    const int cascades = std::clamp(scene.shadowCascades, 1, 4);
+    const int per_side = cascades > 1 ? 2 : 1;
+    const int tile_px = kDirectionalShadowSize / per_side;
+    const float aspect = impl_->last_aspect > 0.0f ? impl_->last_aspect : 1.7778f;
 
     // The pipeline is set PER DRAW now rather than once, because a skinned
     // caster needs the skinned vertex stage. Tracked so an all-static scene
@@ -600,6 +627,15 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
     // mesh in this engine is closed.
     enc.SetCull(rhi::Cull::Front, rhi::Winding::CounterClockwise);
 
+    for (int cascade = 0; cascade < cascades; ++cascade) {
+    const Mat4 lightViewProj =
+        cascades > 1 ? scene.CascadeViewProj(cascade, aspect) : scene.LightViewProj();
+    if (cascades > 1) {
+        enc.SetViewport((cascade % per_side) * tile_px, (cascade / per_side) * tile_px,
+                        tile_px, tile_px);
+        enc.SetScissor((cascade % per_side) * tile_px, (cascade / per_side) * tile_px,
+                       tile_px, tile_px);
+    }
     for (const Instance& inst : scene.instances) {
         if (!Valid(inst.mesh) || inst.mesh.v >= impl_->meshes.size()) continue;
         // TRANSPARENT SURFACES DO NOT CAST. A window pane written into the
@@ -656,6 +692,11 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
         }
         enc.DrawIndexedU16(gm.ib, gm.index_count);
         ++impl_->shadow_draws;
+    }
+    }
+    if (cascades > 1) {
+        enc.SetViewport(0, 0, kDirectionalShadowSize, kDirectionalShadowSize);
+        enc.SetScissor(0, 0, kDirectionalShadowSize, kDirectionalShadowSize);
     }
 }
 
@@ -864,7 +905,26 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
         }
     }
 
+    impl_->last_aspect = float(width) / float(height);
     const bool shadows = scene.shadowExtent > 0.0f && Valid(shadow_map);
+
+    const std::size_t cascade_offset =
+        std::size_t(impl_->dev->FrameSlot()) * impl_->cascade_slot_bytes;
+    {
+        const int n = std::clamp(scene.shadowCascades, 1, 4);
+        auto* dst = reinterpret_cast<GpuCascades*>(impl_->cascade_map + cascade_offset);
+        GpuCascades g{};
+        for (int i = 0; i < n; ++i) {
+            g.viewProj[i] = n > 1 ? scene.CascadeViewProj(i, impl_->last_aspect)
+                                  : scene.LightViewProj();
+            (&g.splits.x)[i] = scene.CascadeSplit(i + 1);
+        }
+        // Anything past the last cascade falls back to it rather than going
+        // unshadowed at a hard line across the floor.
+        for (int i = n; i < 4; ++i) (&g.splits.x)[i] = 1e9f;
+        g.info = Vec4{float(n), float(n > 1 ? 2 : 1), n > 1 ? 0.5f : 1.0f, 0.0f};
+        *dst = g;
+    }
     const Mat4 lightViewProj = shadows ? scene.LightViewProj() : Mat4::Identity();
     const rhi::TextureId shadow_tex = shadows ? shadow_map : impl_->dummy_shadow;
 
@@ -1003,6 +1063,7 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
         enc.SetVertexBuffer(impl_->uniforms, offset, kUniformSlot);
         enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
         enc.SetFragmentBuffer(impl_->lights, light_offset, kLightSlot);
+        enc.SetFragmentBuffer(impl_->cascades, cascade_offset, kCascadeSlot);
         enc.SetFragmentTexture(mat.albedo, 0);
         enc.SetFragmentTexture(mat.roughness_map, 1);
         enc.SetFragmentTexture(shadow_tex, 2);

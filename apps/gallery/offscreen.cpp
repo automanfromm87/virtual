@@ -433,6 +433,121 @@ int main() {
         draw(full);
     }
 
+    std::printf("cascaded shadow maps\n");
+    {
+        // The claim: for the same total texels, cascades put more of them near
+        // the camera. Measured against a REFERENCE — a single map fitted
+        // tightly around the near field, which is as good as this resolution
+        // gets there but covers nothing else.
+        //
+        // A wide single map has to cover the same distance the cascades do, so
+        // it spends most of its texels far away and comes out blocky underfoot.
+        // Cascades should agree with the tight reference; the wide one should
+        // not.
+        //
+        // Counting "shadow boundary pixels" was tried first and gave 157 for
+        // both, which was a coincidence of the metric rather than a result —
+        // the two images differ, they just happen to have the same number of
+        // steep horizontal steps in that window.
+        auto render_with = [&](int cascade_count, float extent, float distance) {
+            eng::Scene s2 = full;
+            s2.shadowCascades = cascade_count;
+            s2.shadowExtent = extent;
+            s2.shadowDistance = distance;
+            draw(s2);
+            return pixels;
+        };
+        const std::vector<std::uint8_t> tight = render_with(1, 7.0f, 7.0f);
+        const std::vector<std::uint8_t> wide = render_with(1, 30.0f, 30.0f);
+        const std::vector<std::uint8_t> csm = render_with(4, 30.0f, 30.0f);
+
+        // How far each is from the reference, over the near half of the floor.
+        auto distance_from_tight = [&](const std::vector<std::uint8_t>& img) {
+            long long sum = 0;
+            for (int y = 380; y < 620; ++y)
+                for (int x = 180; x < 860; ++x) {
+                    const std::size_t i = (std::size_t(y) * kW + x) * 4;
+                    sum += std::abs(int(img[i]) - int(tight[i]));
+                }
+            return sum;
+        };
+        const long long wide_err = distance_from_tight(wide);
+        const long long csm_err = distance_from_tight(csm);
+        std::printf("    near-field difference from a tight map: wide %lld, "
+                    "cascaded %lld\n", wide_err, csm_err);
+        Check(csm_err < wide_err * 0.8,
+              "cascades match a tight map near the camera; one wide map does not");
+
+        // TEXEL SNAPPING, tested directly on the matrix rather than through a
+        // render. Shimmer is a property of MOTION — the map's origin sliding a
+        // fraction of a texel per frame, so every shadow edge re-samples and
+        // the whole scene crawls — and a gate that renders from a fixed camera
+        // cannot see it at all. A mutation that removed the snap passed the
+        // image comparison above without a mark.
+        {
+            eng::Scene a = full;
+            a.shadowCascades = 4;
+            a.shadowDistance = 30.0f;
+            a.camera.eye = kEye;
+            a.camera.target = kTarget;
+
+            const eng::Vec3 fixed_point{1.4f, 0.4f, 0.9f};
+            auto texel_of = [&](float nudge) {
+                eng::Scene b = a;
+                // A sub-texel sideways step: far too small to change what is
+                // visible, and exactly the size of step that makes an unsnapped
+                // map crawl.
+                b.camera.eye = eng::Vec3{kEye.x + nudge, kEye.y, kEye.z};
+                b.camera.target = eng::Vec3{kTarget.x + nudge, kTarget.y, kTarget.z};
+                const eng::Vec4 clip =
+                    b.CascadeViewProj(0, float(kW) / float(kH)) *
+                    eng::Vec4{fixed_point.x, fixed_point.y, fixed_point.z, 1.0f};
+                // In texels of a 1024 tile.
+                return eng::Vec3{(clip.x / clip.w * 0.5f + 0.5f) * 1024.0f,
+                                 (clip.y / clip.w * 0.5f + 0.5f) * 1024.0f, 0.0f};
+            };
+            // The point DOES move as the camera does — that is not the
+            // question, and measuring total movement was the first mistake
+            // here: it comes out the same snapped or not, because it is just
+            // the camera's own motion expressed in texels.
+            //
+            // What snapping claims is that it moves in WHOLE texels. So the
+            // FRACTIONAL part of its texel coordinate should stay put; that
+            // fraction changing is exactly the sub-texel slide that makes every
+            // shadow edge re-sample and the scene crawl.
+            float lo = 2.0f, hi = -1.0f;
+            for (int k = 0; k <= 24; ++k) {
+                const eng::Vec3 at = texel_of(float(k) * 0.004f);
+                float frac = at.x - std::floor(at.x);
+                lo = std::fmin(lo, frac);
+                hi = std::fmax(hi, frac);
+            }
+            std::printf("    fractional texel position varies by %.3f as the "
+                        "camera creeps sideways\n", hi - lo);
+            Check(hi - lo < 0.25f, "the shadow map does not crawl under the camera");
+        }
+
+        // And the cascade split itself has to be sane: strictly increasing,
+        // starting near the camera and ending at the shadow distance.
+        eng::Scene s3 = full;
+        s3.shadowCascades = 4;
+        s3.shadowDistance = 40.0f;
+        bool rising = true;
+        for (int i = 0; i < 4; ++i)
+            if (s3.CascadeSplit(i) >= s3.CascadeSplit(i + 1)) rising = false;
+        std::printf("    splits: %.2f %.2f %.2f %.2f %.2f\n", s3.CascadeSplit(0),
+                    s3.CascadeSplit(1), s3.CascadeSplit(2), s3.CascadeSplit(3),
+                    s3.CascadeSplit(4));
+        Check(rising, "the splits increase");
+        Check(std::fabs(s3.CascadeSplit(4) - 40.0f) < 0.01f,
+              "and the last one reaches the shadow distance");
+        // A purely logarithmic split would put the first one absurdly close;
+        // a purely uniform one would waste the near cascade on distance.
+        Check(s3.CascadeSplit(1) > 1.0f && s3.CascadeSplit(1) < 10.0f,
+              "the first split is somewhere useful");
+        draw(full);
+    }
+
     std::printf("bloom\n");
     {
         // THE invariant. Binding the bloom texture with a strength of zero must

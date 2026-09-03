@@ -274,7 +274,16 @@ int main() {
         // Every joint after the root sways with its own phase, so the tip
         // travels much further than the base. A rigid rotation of the whole
         // mesh would move both by the same amount.
-        Check(shadow_draws == 4, "the skinned mesh was also drawn into the shadow map");
+        // Once per caster PER CASCADE: each cascade is its own pass over the
+        // casters into its own tile of the map. Spelling out the product rather
+        // than freezing the total is the difference between a test that
+        // survives turning cascades on and one that just has to be renumbered.
+        const int cascades = rest.shadowCascades;
+        const int expect = 4 * cascades;
+        std::printf("    %d shadow draws = 4 casters x %d cascades\n",
+                    shadow_draws, cascades);
+        Check(shadow_draws == expect,
+              "the skinned mesh was also drawn into every cascade");
     }
 
     std::printf("an unskinned instance is unaffected\n");

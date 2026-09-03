@@ -319,6 +319,7 @@ static inline float Falloff(float distance, float range)
 fragment float4 fs_lit(VSOut in [[stage_in]],
                        constant FrameUniforms& u [[buffer(1)]],
                        device const GpuLight* lights [[buffer(2)]],
+                       constant GpuCascades& cascades [[buffer(3)]],
                        texture2d<float> albedoMap    [[texture(0)]],
                        texture2d<float> roughnessMap [[texture(1)]],
                        depth2d<float>   shadowMap    [[texture(2)]],
@@ -343,9 +344,33 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
     const float3 N = normalize(in.normalW);
     const float3 V = normalize(u.eyePos.xyz - in.worldPos);
 
-    // --- the key light: directional, and the only one with a shadow map ------
+    // --- the key light: directional, and the only one with cascades ----------
     const float3 Lsun = normalize(u.lightDir.xyz);
-    const float shadow = ShadowFactor(in.lightClip, shadowMap, smp, u.surface.z);
+    float shadow = 1.0f;
+    if (u.surface.z > 0.5f) {
+        const int count = int(cascades.info.x);
+        if (count <= 1) {
+            shadow = ShadowFactor(in.lightClip, shadowMap, smp, u.surface.z);
+        } else {
+            // Pick by distance from the eye. The FIRST cascade the fragment
+            // fits inside — they are nested, so the nearest one that contains
+            // it is also the highest resolution one that does.
+            const float view_depth = length(in.worldPos - u.eyePos.xyz);
+            int c = count - 1;
+            for (int i = 0; i < count; ++i) {
+                if (view_depth < cascades.splits[i]) { c = i; break; }
+            }
+            const float per_side = cascades.info.y;
+            const float4 tile = AtlasTile(float(c), per_side);
+            const float4 clip = cascades.viewProj[c] * float4(in.worldPos, 1.0f);
+            const float3 ndc = clip.xyz / clip.w;
+            float2 uv = ndc.xy * 0.5f + 0.5f;
+            uv.y = 1.0f - uv.y;
+            // Orthographic, so depth is linear and a constant bias is right —
+            // unlike the perspective maps a spot or a point light uses.
+            shadow = SampleTile(shadowMap, smp, uv, tile, ndc.z, 1.2e-3f);
+        }
+    }
     float3 direct = Brdf(N, V, Lsun, albedo, roughness, metallic) *
                     u.lightColor.rgb * saturate(dot(N, Lsun)) * shadow;
 
