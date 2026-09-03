@@ -92,6 +92,11 @@ int Skeleton::Find(std::string_view name) const {
 }
 
 bool Channel::Valid(std::size_t joint_count) const {
+    // Morph weights are not a joint property and have no fixed component count;
+    // they belong in a MorphTrack. Refusing one here is what stops a weights
+    // channel that happens to target a joint node from being decoded as a
+    // translation and flinging the joint across the scene.
+    if (path == Path::Weights) return false;
     if (joint < 0 || std::size_t(joint) >= joint_count) return false;
     if (times.empty()) return false;
     const std::size_t per_key =
@@ -261,6 +266,104 @@ Vec3 SkinNormal(Vec3 normal, const SkinVertex& s, const std::vector<Mat4>& palet
     // Blending two opposed rotations can cancel to nothing; keeping the
     // original beats handing the shader a zero vector to normalise.
     return len > 1e-6f ? out * (1.0f / len) : normal;
+}
+
+bool MorphTrack::Valid() const {
+    if (targets <= 0 || times.empty()) return false;
+    const std::size_t per_key =
+        std::size_t(targets) * (interp == Interp::CubicSpline ? 3u : 1u);
+    if (values.size() != times.size() * per_key) return false;
+    for (std::size_t i = 1; i < times.size(); ++i)
+        if (times[i] < times[i - 1]) return false;
+    return true;
+}
+
+void MorphTrack::Sample(float time, std::vector<float>* out, bool loop) const {
+    if (!out || !Valid()) return;
+    out->assign(std::size_t(targets), 0.0f);
+
+    if (duration > 0.0f) {
+        if (loop) {
+            time = std::fmod(time, duration);
+            if (time < 0.0f) time += duration;
+        } else {
+            time = std::clamp(time, 0.0f, duration);
+        }
+    } else {
+        time = 0.0f;
+    }
+
+    const bool cubic = interp == Interp::CubicSpline;
+    const int per_key = targets * (cubic ? 3 : 1);
+    const std::size_t k0 = KeyBefore(times, time);
+    const std::size_t last = times.size() - 1;
+    const bool at_end = k0 >= last || time <= times.front();
+    const std::size_t k1 = at_end ? k0 : k0 + 1;
+
+    float u = 0.0f;
+    if (!at_end) {
+        const float span = times[k1] - times[k0];
+        u = span > 0.0f ? (time - times[k0]) / span : 0.0f;
+    }
+    if (interp == Interp::Step) u = 0.0f;
+
+    const std::size_t n = std::size_t(targets);
+    const std::size_t v0 =
+        std::size_t(k0) * std::size_t(per_key) + (cubic ? n : 0u);
+    const std::size_t v1 =
+        std::size_t(k1) * std::size_t(per_key) + (cubic ? n : 0u);
+
+    for (std::size_t c = 0; c < n; ++c) {
+        if (cubic && !at_end) {
+            (*out)[c] = Hermite(values[v0 + c], values[v0 + n + c],
+                                values[v1 + c], values[v1 - n + c], u,
+                                times[k1] - times[k0]);
+        } else {
+            (*out)[c] = values[v0 + c] + (values[v1 + c] - values[v0 + c]) * u;
+        }
+    }
+}
+
+void ApplyMorph(const std::vector<Vec3>& base,
+                const std::vector<MorphTarget>& targets,
+                const std::vector<float>& weights, std::vector<Vec3>* out) {
+    if (!out) return;
+    *out = base;
+    const std::size_t n =
+        std::min(targets.size(), weights.size());  // a short list is not fatal
+    for (std::size_t t = 0; t < n; ++t) {
+        const float w = weights[t];
+        if (w == 0.0f) continue;
+        const std::vector<Vec3>& d = targets[t].positions;
+        const std::size_t m = std::min(d.size(), out->size());
+        for (std::size_t i = 0; i < m; ++i) (*out)[i] = (*out)[i] + d[i] * w;
+    }
+}
+
+void ApplyMorphNormals(const std::vector<Vec3>& base,
+                       const std::vector<MorphTarget>& targets,
+                       const std::vector<float>& weights,
+                       std::vector<Vec3>* out) {
+    if (!out) return;
+    *out = base;
+    const std::size_t n = std::min(targets.size(), weights.size());
+    bool moved = false;
+    for (std::size_t t = 0; t < n; ++t) {
+        const float w = weights[t];
+        if (w == 0.0f || targets[t].normals.empty()) continue;
+        moved = true;
+        const std::vector<Vec3>& d = targets[t].normals;
+        const std::size_t m = std::min(d.size(), out->size());
+        for (std::size_t i = 0; i < m; ++i) (*out)[i] = (*out)[i] + d[i] * w;
+    }
+    // Renormalised, because the weighted sum of unit vectors is not one. Left
+    // alone, the shading darkens wherever two targets pull a normal apart --
+    // which looks like a lighting bug rather than a morph bug.
+    if (!moved) return;
+    for (Vec3& v : *out) {
+        const float len = Length(v);
+        if (len > 1e-6f) v = v * (1.0f / len);
+    }
 }
 
 }  // namespace eng::anim

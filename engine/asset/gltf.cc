@@ -478,6 +478,16 @@ Document ParseGltf(std::string_view json_text, const std::vector<std::uint8_t>& 
     const json::Value& meshes = root["meshes"];
     for (std::size_t mi = 0; mi < meshes.Size(); ++mi) {
         std::vector<int> prims;
+        // Target names live on the MESH, not the primitive, and in "extras" --
+        // glTF never standardised them, but every DCC tool writes them there
+        // and a face rig with 52 unnamed targets is unusable.
+        std::vector<std::string> target_names;
+        {
+            const json::Value& tn = meshes[mi]["extras"]["targetNames"];
+            for (std::size_t i = 0; i < tn.Size(); ++i)
+                target_names.push_back(tn[i].Str());
+        }
+        target_names.resize(64);  // so an unnamed target reads as "" not a crash
         const json::Value& prim_list = meshes[mi]["primitives"];
         for (std::size_t pi = 0; pi < prim_list.Size(); ++pi) {
             const json::Value& p = prim_list[pi];
@@ -574,6 +584,60 @@ Document ParseGltf(std::string_view json_text, const std::vector<std::uint8_t>& 
                     out.mesh.indices[std::size_t(i)] = std::uint16_t(i);
             }
 
+            // --- morph targets ---------------------------------------------
+            //
+            // Each entry of "targets" is an attribute dictionary like the
+            // primitive's own, but its accessors hold DELTAS. A target may
+            // carry POSITION, NORMAL, both, or (legally) neither.
+            const json::Value& targets = p["targets"];
+            for (std::size_t ti = 0; ti < targets.Size(); ++ti) {
+                const json::Value& t = targets[ti];
+                anim::MorphTarget mt;
+                if (t.Has("POSITION")) {
+                    const AccessorView v = reader.View(t["POSITION"].Int());
+                    if (!v.valid) return doc;
+                    // A target shorter than the mesh would silently morph only
+                    // the first part of it, which reads as the model tearing.
+                    if (v.count != pos.count) {
+                        error = "gltf: morph target has " +
+                                std::to_string(v.count) +
+                                " positions for a primitive of " +
+                                std::to_string(pos.count);
+                        return doc;
+                    }
+                    mt.positions.resize(std::size_t(v.count));
+                    for (int i = 0; i < v.count; ++i) {
+                        float f[4] = {0, 0, 0, 0};
+                        Reader::ReadFloats(v, i, f);
+                        mt.positions[std::size_t(i)] = Vec3{f[0], f[1], f[2]};
+                    }
+                }
+                if (t.Has("NORMAL")) {
+                    const AccessorView v = reader.View(t["NORMAL"].Int());
+                    if (!v.valid) return doc;
+                    if (v.count != pos.count) {
+                        error = "gltf: morph target has the wrong normal count";
+                        return doc;
+                    }
+                    mt.normals.resize(std::size_t(v.count));
+                    for (int i = 0; i < v.count; ++i) {
+                        float f[4] = {0, 0, 0, 0};
+                        Reader::ReadFloats(v, i, f);
+                        mt.normals[std::size_t(i)] = Vec3{f[0], f[1], f[2]};
+                    }
+                }
+                mt.name = target_names[ti];
+                out.morph_targets.push_back(std::move(mt));
+            }
+            // Defaults. glTF says an absent weights array means all zero, and
+            // sizing it here means nothing downstream has to special-case the
+            // empty case against the target count.
+            out.morph_weights.assign(out.morph_targets.size(), 0.0f);
+            const json::Value& mw = meshes[mi]["weights"];
+            for (std::size_t i = 0;
+                 i < mw.Size() && i < out.morph_weights.size(); ++i)
+                out.morph_weights[i] = float(mw[i].Number());
+
             FitBounds(out.mesh);
             prims.push_back(int(doc.primitives.size()));
             doc.primitives.push_back(std::move(out));
@@ -590,6 +654,9 @@ Document ParseGltf(std::string_view json_text, const std::vector<std::uint8_t>& 
         out.name = n["name"].Str();
         out.local = NodeTransform(n);
         out.skin = n["skin"].Int(-1);
+        const json::Value& nw = n["weights"];
+        for (std::size_t k = 0; k < nw.Size(); ++k)
+            out.morph_weights.push_back(float(nw[k].Number()));
         const int mesh = n["mesh"].Int(-1);
         if (mesh >= 0 && std::size_t(mesh) < mesh_to_prims.size())
             out.primitives = mesh_to_prims[std::size_t(mesh)];
@@ -689,7 +756,8 @@ Document ParseGltf(std::string_view json_text, const std::vector<std::uint8_t>& 
                 if (path == "translation") out.path = anim::Path::Translation;
                 else if (path == "rotation") out.path = anim::Path::Rotation;
                 else if (path == "scale") out.path = anim::Path::Scale;
-                else continue;  // "weights" is morph targets, which are not here
+                else if (path == "weights") out.path = anim::Path::Weights;
+                else continue;  // an extension path this reader does not know
 
                 const int si = ch["sampler"].Int(-1);
                 if (si < 0 || std::size_t(si) >= samplers.Size()) continue;
@@ -725,6 +793,34 @@ Document ParseGltf(std::string_view json_text, const std::vector<std::uint8_t>& 
     return doc;
 }
 
+anim::MorphTrack Document::MakeMorphTrack(int animation, int node) const {
+    anim::MorphTrack track;
+    if (animation < 0 || std::size_t(animation) >= animations.size()) return track;
+    if (node < 0 || std::size_t(node) >= nodes.size()) return track;
+
+    // How many targets the node's mesh has. A weights channel stores a flat run
+    // of floats with no count of its own -- glTF puts the count on the mesh, so
+    // reading the channel without the node it drives cannot tell where one key
+    // ends and the next begins.
+    int targets = 0;
+    for (int pi : nodes[std::size_t(node)].primitives)
+        if (pi >= 0 && std::size_t(pi) < primitives.size())
+            targets = std::max(
+                targets, int(primitives[std::size_t(pi)].morph_targets.size()));
+    if (targets == 0) return track;
+
+    for (const NodeChannel& ch : animations[std::size_t(animation)].channels) {
+        if (ch.node != node || ch.path != anim::Path::Weights) continue;
+        track.interp = ch.interp;
+        track.targets = targets;
+        track.times = ch.times;
+        track.values = ch.values;
+        track.duration = animations[std::size_t(animation)].duration;
+        break;  // one weights channel per node; a second would be a conflict
+    }
+    return track;
+}
+
 anim::Clip Document::MakeClip(int animation, int skin) const {
     anim::Clip clip;
     if (animation < 0 || std::size_t(animation) >= animations.size()) return clip;
@@ -746,6 +842,9 @@ anim::Clip Document::MakeClip(int animation, int skin) const {
         // silently applying one's walk cycle to the other is worse than
         // applying nothing.
         if (it == joint_of.end()) continue;
+        // Morph weights ride on the same channel list but are not a joint
+        // property; MakeMorphTrack is where they belong.
+        if (nc.path == anim::Path::Weights) continue;
         anim::Channel out;
         out.joint = it->second;
         out.path = nc.path;

@@ -42,6 +42,7 @@ cc_library(
         "testdata_quad_gltf.inc",
         "testdata_glb.inc",
         "testdata_skinned_gltf.inc",
+        "testdata_morph_gltf.inc",
         "testdata_textured_gltf.inc",
     ],
 )
@@ -74,6 +75,7 @@ cc_test(
         "testdata_textured_gltf.inc",
         "testdata_glb.inc",
         "testdata_skinned_gltf.inc",
+        "testdata_morph_gltf.inc",
     ],
     deps = [":asset"],
 )

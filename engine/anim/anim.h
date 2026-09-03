@@ -91,7 +91,10 @@ enum class Interp : std::uint8_t {
     CubicSpline,  // Hermite, with tangents stored either side of each value
 };
 
-enum class Path : std::uint8_t { Translation, Rotation, Scale };
+// Weights drives MORPH TARGET weights rather than a joint transform, so a
+// Weights channel has `joint` = -1 and its own component count: one float per
+// target per key, not 3 or 4.
+enum class Path : std::uint8_t { Translation, Rotation, Scale, Weights };
 
 // One animated property of one joint.
 struct Channel {
@@ -106,6 +109,10 @@ struct Channel {
     // vector of Vec3.
     std::vector<float> values;
 
+    // Rotation is a quaternion; translation and scale are vectors. Weights is
+    // not answerable here -- the count belongs to the mesh, not the path -- and
+    // Valid() rejects a Weights channel outright rather than letting one be
+    // read as a 3-component translation, which is what "return 3" would mean.
     [[nodiscard]] int Components() const { return path == Path::Rotation ? 4 : 3; }
     [[nodiscard]] std::size_t KeyCount() const { return times.size(); }
     // Cheap structural check: the right number of values, times ascending, a
@@ -163,5 +170,61 @@ struct SkinVertex {
 // an all-zero set falls back to joint 0 at full weight because dropping the
 // vertex to the origin is worse than putting it somewhere.
 void NormalizeWeights(SkinVertex*);
+
+// --- morph targets ----------------------------------------------------------
+//
+// A morph target is a per-vertex DELTA from the base mesh, and a mesh carries
+// several with a weight each: 0.7 of "smile" plus 0.3 of "blink". That is how
+// faces are animated, because a face does not bend around bones.
+//
+// Deltas, not absolute positions, is what makes them composable — two targets
+// that each move different parts of the mesh simply add, with no need to decide
+// which one owns a vertex the way skinning weights must.
+struct MorphTarget {
+    std::string name;  // from the mesh's "extras.targetNames" where present
+    // Both parallel to the base mesh's vertices, and either may be EMPTY: a
+    // target that only moves positions is common, and storing zeroed normals
+    // for it would be 12 bytes a vertex of nothing.
+    std::vector<Vec3> positions;
+    std::vector<Vec3> normals;
+};
+
+// A morph-weights animation channel. Not a Channel: that one has a joint and a
+// fixed 3 or 4 components, and this has neither. A weights channel carries one
+// float per TARGET per key, so its component count is a property of the mesh it
+// was authored against rather than of the path.
+struct MorphTrack {
+    Interp interp = Interp::Linear;
+    int targets = 0;
+    std::vector<float> times;   // ascending, seconds
+    std::vector<float> values;  // times.size() * targets, x3 under CubicSpline
+    float duration = 0.0f;
+
+    [[nodiscard]] bool Valid() const;
+    // Writes exactly `targets` weights, or leaves `out` untouched if the track
+    // is malformed -- holding the last good pose beats writing garbage.
+    void Sample(float time, std::vector<float>* out, bool loop = true) const;
+};
+
+// base + sum(weight_i * delta_i), into `out`. `out` is resized to match.
+//
+// A weight of exactly 0 is skipped, which is not just an optimisation: a face
+// rig has dozens of targets and at most a handful active, so the cost is
+// proportional to what is actually moving rather than to what exists.
+//
+// Weights are NOT clamped or normalised. glTF allows them outside [0,1] on
+// purpose -- overshooting a target is how an exaggerated expression is built --
+// and they do not sum to anything in particular.
+void ApplyMorph(const std::vector<Vec3>& base,
+                const std::vector<MorphTarget>& targets,
+                const std::vector<float>& weights, std::vector<Vec3>* out);
+
+// The same, for normals. Separate because a target may move positions without
+// touching normals, and because the result has to be renormalised: the sum of
+// unit vectors is not a unit vector.
+void ApplyMorphNormals(const std::vector<Vec3>& base,
+                       const std::vector<MorphTarget>& targets,
+                       const std::vector<float>& weights,
+                       std::vector<Vec3>* out);
 
 }  // namespace eng::anim

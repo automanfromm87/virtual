@@ -54,7 +54,16 @@ struct Primitive {
     // joint array is indexed by.
     std::vector<anim::SkinVertex> skin;
 
+    // MORPH TARGETS, in the file's order -- which is the order the weights
+    // array and any weights animation channel index by, so it must not be
+    // sorted or compacted.
+    std::vector<anim::MorphTarget> morph_targets;
+    // The mesh's default weights, from glTF's mesh.weights. A node may override
+    // them with its own, and an animation may override both.
+    std::vector<float> morph_weights;
+
     [[nodiscard]] bool Skinned() const { return !skin.empty(); }
+    [[nodiscard]] bool Morphed() const { return !morph_targets.empty(); }
 };
 
 struct Node {
@@ -63,6 +72,10 @@ struct Node {
     // a skinned mesh instance.
     int skin = -1;
     Mat4 local = Mat4::Identity();
+    // Overrides the mesh's default morph weights when non-empty. glTF puts them
+    // in both places and the node wins, so that one mesh can be instanced at
+    // several expressions.
+    std::vector<float> morph_weights;
     // Indices into Document::primitives. A glTF mesh may hold several
     // primitives, and each becomes its own draw.
     std::vector<int> primitives;
@@ -112,6 +125,13 @@ struct Document {
     std::vector<AnimationDef> animations;
 
     [[nodiscard]] bool Empty() const { return primitives.empty(); }
+
+    // The morph-weights track that animation `animation` drives on `node`, or
+    // an invalid track if there is none. Separate from MakeClip for the same
+    // reason MakeClip is separate from parsing: a file's weights channels and
+    // its joint channels are independent, and a mesh may have one without the
+    // other.
+    [[nodiscard]] anim::MorphTrack MakeMorphTrack(int animation, int node) const;
 
     // Retargets animation `animation` onto skin `skin`'s skeleton, dropping any
     // channel aimed at a node that skin does not use. Returns an empty clip for

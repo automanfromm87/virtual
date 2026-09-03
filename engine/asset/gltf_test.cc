@@ -32,6 +32,10 @@ const char* const kSkinnedGltf =
 #include "engine/asset/testdata_skinned_gltf.inc"
     ;
 
+const char* const kMorphGltf =
+#include "engine/asset/testdata_morph_gltf.inc"
+    ;
+
 const char* const kTexturedGltf =
 #include "engine/asset/testdata_textured_gltf.inc"
     ;
@@ -305,6 +309,140 @@ int main() {
         const std::uint8_t junk[12] = {'x', 'x', 'x', 'x'};
         CHECK(gltf::ParseGlb(junk, error).primitives.empty());
         CHECK(error.find("magic") != std::string::npos);
+    }
+
+    // --- morph targets --------------------------------------------------
+    {
+        std::printf("morph targets\n");
+        std::string error;
+        const gltf::Document doc = gltf::ParseGltf(kMorphGltf, {}, error);
+        CHECK(error.empty());
+        CHECK(doc.primitives.size() == 1);
+        const gltf::Primitive& prim = doc.primitives[0];
+        CHECK(prim.Morphed());
+        CHECK(prim.morph_targets.size() == 2);
+        CHECK(prim.morph_targets[0].name == "rise");
+        CHECK(prim.morph_targets[1].name == "lean");
+
+        // A target that touches only positions keeps an EMPTY normal array
+        // rather than a zeroed one -- a face rig has dozens of targets and the
+        // difference is 12 bytes a vertex each.
+        CHECK(prim.morph_targets[0].normals.size() == 4);
+        CHECK(prim.morph_targets[1].normals.empty());
+
+        // Deltas, not absolute positions. The base quad's top-right vertex is
+        // at (1,1,0); the target stores the (0,0.5,0) it MOVES BY.
+        CHECK(Near(prim.morph_targets[0].positions[3].y, 0.5f));
+        CHECK(Near(prim.morph_targets[0].positions[0].y, 0.0f));
+        CHECK(Near(prim.morph_targets[1].positions[3].x, 0.75f));
+
+        // The mesh's defaults, and a node that overrides them.
+        CHECK(prim.morph_weights.size() == 2);
+        CHECK(Near(prim.morph_weights[0], 0.25f));
+        CHECK(Near(prim.morph_weights[1], 0.0f));
+        CHECK(doc.nodes[0].morph_weights.empty());  // no override: mesh wins
+        CHECK(doc.nodes[1].morph_weights.size() == 2);
+        CHECK(Near(doc.nodes[1].morph_weights[1], 0.5f));
+
+        std::vector<Vec3> base;
+        for (const VertexIn& v : prim.mesh.vertices)
+            base.push_back(Vec3{v.position.x, v.position.y, v.position.z});
+
+        // Both targets at once, and they ADD: the top-right vertex is the only
+        // one both move, and it must pick up both deltas. Anything that treats
+        // targets as alternatives rather than a sum leaves it short.
+        std::vector<Vec3> out;
+        anim::ApplyMorph(base, prim.morph_targets, {1.0f, 1.0f}, &out);
+        CHECK(out.size() == 4);
+        CHECK(Near(out[3].x, 1.75f) && Near(out[3].y, 1.5f));
+        CHECK(Near(out[2].x, 0.0f) && Near(out[2].y, 1.5f));   // rise only
+        CHECK(Near(out[1].x, 1.75f) && Near(out[1].y, 0.0f));  // lean only
+        CHECK(Near(out[0].x, 0.0f) && Near(out[0].y, 0.0f));   // neither
+
+        // Fractional and OVERSHOOTING weights. glTF permits weights outside
+        // [0,1] deliberately, and clamping them silently caps an exaggerated
+        // expression at its neutral extreme.
+        anim::ApplyMorph(base, prim.morph_targets, {0.5f, -1.0f}, &out);
+        CHECK(Near(out[3].y, 1.25f));
+        CHECK(Near(out[3].x, 1.0f - 0.75f));
+
+        // All weights zero must give back the base mesh exactly.
+        anim::ApplyMorph(base, prim.morph_targets, {0.0f, 0.0f}, &out);
+        for (std::size_t i = 0; i < out.size(); ++i)
+            CHECK(Near(out[i].x, base[i].x) && Near(out[i].y, base[i].y));
+
+        // Normals: only "rise" has any, so a pure "lean" leaves them alone.
+        std::vector<Vec3> nbase;
+        for (const VertexIn& v : prim.mesh.vertices)
+            nbase.push_back(Vec3{v.normal.x, v.normal.y, v.normal.z});
+        std::vector<Vec3> nout;
+        anim::ApplyMorphNormals(nbase, prim.morph_targets, {0.0f, 1.0f}, &nout);
+        CHECK(Near(nout[3].z, 1.0f) && Near(nout[3].y, 0.0f));
+        anim::ApplyMorphNormals(nbase, prim.morph_targets, {1.0f, 0.0f}, &nout);
+        CHECK(nout[3].y > 0.2f);
+        // Renormalised: the weighted sum of unit vectors is not a unit vector,
+        // and leaving it long shades as a lighting bug rather than a morph one.
+        CHECK(Near(Length(nout[3]), 1.0f));
+
+        // --- the weights animation channel ---
+        CHECK(doc.animations.size() == 1);
+        const anim::MorphTrack track = doc.MakeMorphTrack(0, 1);
+        CHECK(track.Valid());
+        CHECK(track.targets == 2);   // from the MESH; the channel does not say
+        CHECK(track.times.size() == 3);
+        CHECK(track.values.size() == 6);
+
+        std::vector<float> w;
+        track.Sample(0.0f, &w);
+        CHECK(w.size() == 2 && Near(w[0], 0.0f) && Near(w[1], 0.0f));
+        track.Sample(0.5f, &w);
+        CHECK(Near(w[0], 1.0f) && Near(w[1], 0.5f));
+        // Between keys, and the two targets interpolate INDEPENDENTLY -- a
+        // stride bug that reads one float per key instead of two gives both
+        // the same value here.
+        track.Sample(0.25f, &w);
+        CHECK(Near(w[0], 0.5f) && Near(w[1], 0.25f));
+        track.Sample(0.75f, &w);
+        CHECK(Near(w[0], 0.5f) && Near(w[1], 0.75f));
+
+        // A weights channel is not a joint channel, and must be rejected as
+        // one on PURPOSE rather than by accident. A mesh with THREE targets and
+        // two keys stores six floats -- exactly what a two-key translation
+        // channel stores -- so nothing about its shape gives it away. Read as a
+        // translation it would throw the joint across the scene.
+        anim::Channel as_joint;
+        as_joint.joint = 0;
+        as_joint.path = anim::Path::Weights;
+        as_joint.times = {0.0f, 1.0f};
+        as_joint.values = {0, 0, 0, 1, 1, 1};
+        CHECK(as_joint.values.size() ==
+              as_joint.times.size() * std::size_t(as_joint.Components()));
+        CHECK(!as_joint.Valid(4));
+
+        // And it does not survive into a clip either.
+        for (const anim::Channel& c : doc.MakeClip(0, 0).channels)
+            CHECK(c.path != anim::Path::Weights);
+
+        // A node with no morph targets has no track, rather than an empty one
+        // that would sample zeros over a mesh that has no weights at all.
+        CHECK(!doc.MakeMorphTrack(0, 0).Valid());  // node 0 is not animated
+        CHECK(!doc.MakeMorphTrack(9, 1).Valid());
+        CHECK(!doc.MakeMorphTrack(0, 99).Valid());
+    }
+
+    // A morph target must cover every vertex. One that is short would morph
+    // the front of the mesh and leave the rest behind, which reads as the
+    // model tearing rather than as a bad file.
+    {
+        std::string doc(kMorphGltf);
+        const std::string from = R"("bufferView":3,"componentType":5126,"count":4)";
+        const std::string to = R"("bufferView":3,"componentType":5126,"count":3)";
+        const std::size_t at = doc.find(from);
+        CHECK(at != std::string::npos);
+        doc.replace(at, from.size(), to);
+        std::string error;
+        CHECK(gltf::ParseGltf(doc, {}, error).primitives.empty());
+        CHECK(error.find("morph target") != std::string::npos);
     }
 
     if (g_failures == 0) std::printf("gltf_test: all checks passed\n");
