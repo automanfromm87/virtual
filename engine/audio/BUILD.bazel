@@ -41,12 +41,22 @@ cc_library(
     ],
     deps = [
         ":audio",
-        "//engine/platform",
+        "//engine/platform:audio_out",
     ],
 )
 
 cc_test(
     name = "queue_test",
     srcs = ["queue_test.cc"],
+    deps = [":system"],
+)
+
+# The layer between the game and the mixer: the command queue, the handle
+# table, and the order Drain does things in. None of it needs a speaker --
+# CreateSilent and RenderForTest exist so it can be driven a block at a time --
+# and every bug found in it so far was invisible from mixer_test.
+cc_test(
+    name = "system_test",
+    srcs = ["system_test.cc"],
     deps = [":system"],
 )

@@ -23,6 +23,8 @@ MTLPixelFormat ToMTL(Format f) {
         case Format::BGRA8Unorm: return MTLPixelFormatBGRA8Unorm;
         case Format::RGBA16Float: return MTLPixelFormatRGBA16Float;
         case Format::Depth32Float: return MTLPixelFormatDepth32Float;
+        case Format::RG16Float: return MTLPixelFormatRG16Float;
+        case Format::RGBA32Float: return MTLPixelFormatRGBA32Float;
     }
     return MTLPixelFormatInvalid;
 }
@@ -91,6 +93,28 @@ struct Device::Impl {
     id<MTLRenderCommandEncoder> enc = nil;
     bool pass_has_depth = false;
 
+    // --- GPU timing -----------------------------------------------------------
+    //
+    // ONE sample buffer, reused every frame, with two slots per timed pass.
+    // Metal writes a GPU tick into a slot at a stage boundary; the difference
+    // between the pair is the pass's duration.
+    //
+    // Reused rather than allocated per frame because a counter sample buffer is
+    // a real allocation and there are at most a couple of dozen passes. The
+    // reuse is safe for the same reason the uniform ring is: the frame that
+    // last wrote these slots has provably completed before this one is allowed
+    // to start.
+    bool timing_supported = false;
+    id<MTLCounterSampleBuffer> counters = nil;
+    static constexpr int kMaxTimedPasses = 32;
+    // Labels recorded while encoding THIS frame, in the order the passes were
+    // begun. Resolved into `timings` when the buffer completes.
+    std::vector<const char*> timing_labels;
+    std::vector<GpuTiming> timings;      // last completed frame, for the caller
+    std::vector<GpuTiming> timings_next; // being resolved
+    std::atomic<double> gpu_ms{0.0};
+    int timed_this_frame = 0;
+
     // Throttles the CPU to kFramesInFlight outstanding frames. Signalled from
     // each command buffer's completion handler.
     dispatch_semaphore_t frame_sem = nil;
@@ -104,6 +128,18 @@ struct Device::Impl {
     // Slots freed by DestroyTexture, ready to be handed out again. Without
     // this the table grows by one entry per window resize forever.
     std::vector<std::uint32_t> free_textures;
+
+    // Claims a pair of timestamp slots for a pass, or -1 when the pass asked
+    // for no timing, the hardware cannot sample, or the frame has already used
+    // all of them. Dropping the extras silently is deliberate: running out of
+    // timer slots must degrade the profile, not the frame.
+    int BeginTiming(const char* label) {
+        if (!label || !timing_supported) return -1;
+        if (timed_this_frame >= kMaxTimedPasses) return -1;
+        const int slot = timed_this_frame++;
+        timing_labels.push_back(label);
+        return slot;
+    }
 
     // Never recycles slot 0 (null) or kDrawableSlot.
     std::uint32_t AllocTextureSlot(id<MTLTexture> t) {
@@ -343,6 +379,34 @@ std::unique_ptr<Device> Device::Create(std::string& error) {
     d->impl_->dev = dev;
     d->impl_->queue = queue;
     d->impl_->frame_sem = dispatch_semaphore_create(kFramesInFlight);
+
+    // --- GPU timestamps, if the hardware will do them --------------------------
+    //
+    // Two separate capabilities, and both are required. The device must expose
+    // a TIMESTAMP counter set at all, and it must be able to sample AT STAGE
+    // BOUNDARIES -- some hardware can only sample between whole command
+    // buffers, which is a number the frame time already tells us.
+    if ([dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        id<MTLCounterSet> timestamps = nil;
+        for (id<MTLCounterSet> set in dev.counterSets)
+            if ([set.name isEqualToString:MTLCommonCounterSetTimestamp])
+                timestamps = set;
+        if (timestamps) {
+            MTLCounterSampleBufferDescriptor* cd =
+                [[MTLCounterSampleBufferDescriptor alloc] init];
+            cd.counterSet = timestamps;
+            cd.sampleCount = NSUInteger(Device::Impl::kMaxTimedPasses * 2);
+            // SHARED, so resolveCounterRange can read it without a blit. The
+            // buffer is a few hundred bytes and is read once a frame.
+            cd.storageMode = MTLStorageModeShared;
+            NSError* err = nil;
+            d->impl_->counters = [dev newCounterSampleBufferWithDescriptor:cd
+                                                                     error:&err];
+            // Failure here is NOT an error for the caller. Timing is a
+            // diagnostic; a device that will not give us one still renders.
+            d->impl_->timing_supported = (d->impl_->counters != nil);
+        }
+    }
     return d;
 }
 
@@ -401,11 +465,22 @@ ComputePipelineId Device::CreateComputePipeline(const std::string& source,
     }
 }
 
-ComputeEncoder Device::BeginCompute() {
-    impl_->compute_enc = [impl_->cb computeCommandEncoder];
+ComputeEncoder Device::BeginCompute(const char* timer) { @autoreleasepool {
+    const int slot = impl_->BeginTiming(timer);
+    if (slot < 0) {
+        impl_->compute_enc = [impl_->cb computeCommandEncoder];
+    } else {
+        // A compute pass has only one stage, so the pair is dispatch-start and
+        // dispatch-end rather than vertex-start and fragment-end.
+        MTLComputePassDescriptor* cp = [MTLComputePassDescriptor computePassDescriptor];
+        cp.sampleBufferAttachments[0].sampleBuffer = impl_->counters;
+        cp.sampleBufferAttachments[0].startOfEncoderSampleIndex = NSUInteger(slot * 2);
+        cp.sampleBufferAttachments[0].endOfEncoderSampleIndex = NSUInteger(slot * 2 + 1);
+        impl_->compute_enc = [impl_->cb computeCommandEncoderWithDescriptor:cp];
+    }
     impl_->compute_group_max = 64;
     return ComputeEncoder(this);
-}
+}}
 
 void Device::EndCompute() {
     [impl_->compute_enc endEncoding];
@@ -437,11 +512,48 @@ void ComputeEncoder::SetTexture(TextureId t, int slot) {
                                     atIndex:NSUInteger(slot)];
 }
 
+void ComputeEncoder::SetSampler(SamplerId sampler, int slot) {
+    if (!device_ || !Valid(sampler) || sampler.v >= device_->impl_->samplers.size())
+        return;
+    [device_->impl_->compute_enc setSamplerState:device_->impl_->samplers[sampler.v]
+                                         atIndex:NSUInteger(slot)];
+}
+
 void ComputeEncoder::SetBytes(const void* data, std::size_t bytes, int slot) {
     if (!device_ || !data || bytes == 0) return;
     [device_->impl_->compute_enc setBytes:data
                                    length:bytes
                                   atIndex:NSUInteger(slot)];
+}
+
+void ComputeEncoder::Dispatch2D(int width, int height, int gx, int gy) {
+    if (!device_ || width <= 0 || height <= 0) return;
+    // The product must fit the pipeline's own maximum, which is why the clamp
+    // is on gx*gy and not on each separately: 32x32 is a legal-looking pair
+    // that asks for 1024 threads, and a pipeline that wants at most 512 would
+    // have the dispatch rejected at runtime rather than at the call site.
+    int ax = std::max(1, gx), ay = std::max(1, gy);
+    while (ax * ay > device_->impl_->compute_group_max && ay > 1) ay /= 2;
+    while (ax * ay > device_->impl_->compute_group_max && ax > 1) ax /= 2;
+    [device_->impl_->compute_enc
+        dispatchThreadgroups:MTLSizeMake(NSUInteger((width + ax - 1) / ax),
+                                         NSUInteger((height + ay - 1) / ay), 1)
+       threadsPerThreadgroup:MTLSizeMake(NSUInteger(ax), NSUInteger(ay), 1)];
+}
+
+void ComputeEncoder::Dispatch3D(int width, int height, int depth, int gx, int gy,
+                                int gz) {
+    if (!device_ || width <= 0 || height <= 0 || depth <= 0) return;
+    int ax = std::max(1, gx), ay = std::max(1, gy), az = std::max(1, gz);
+    while (ax * ay * az > device_->impl_->compute_group_max && ay > 1) ay /= 2;
+    while (ax * ay * az > device_->impl_->compute_group_max && ax > 1) ax /= 2;
+    while (ax * ay * az > device_->impl_->compute_group_max && az > 1) az /= 2;
+    [device_->impl_->compute_enc
+        dispatchThreadgroups:MTLSizeMake(NSUInteger((width + ax - 1) / ax),
+                                         NSUInteger((height + ay - 1) / ay),
+                                         NSUInteger((depth + az - 1) / az))
+       threadsPerThreadgroup:MTLSizeMake(NSUInteger(ax), NSUInteger(ay),
+                                         NSUInteger(az))];
 }
 
 void ComputeEncoder::Dispatch(int count, int group) {
@@ -549,6 +661,96 @@ TextureId Device::CreateDepthTarget(int width, int height, bool sampleable,
     return TextureId{impl_->AllocTextureSlot(t)};
 }
 
+TextureId Device::CreateTexture2DFloat(int width, int height,
+                                       const float* rgba32f) {
+    if (width <= 0 || height <= 0 || !rgba32f) return {};
+    MTLTextureDescriptor* td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                     width:NSUInteger(width)
+                                    height:NSUInteger(height)
+                                 mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> t = [impl_->dev newTextureWithDescriptor:td];
+    if (!t) return {};
+    [t replaceRegion:MTLRegionMake2D(0, 0, NSUInteger(width), NSUInteger(height))
+         mipmapLevel:0
+           withBytes:rgba32f
+         bytesPerRow:NSUInteger(width) * 16];
+    return TextureId{impl_->AllocTextureSlot(t)};
+}
+
+TextureId Device::CreateCubemap(int size, Format format, int mip_levels) {
+    if (size <= 0) return {};
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:ToMTL(format)
+                                                              size:NSUInteger(size)
+                                                         mipmapped:mip_levels != 1];
+    if (mip_levels > 0) td.mipmapLevelCount = NSUInteger(mip_levels);
+    // READ and WRITE and RENDER, plus PIXEL FORMAT VIEW. The last is the one
+    // that is easy to miss and fails late: without it newTextureViewWithFormat
+    // returns nil, and the mip views this class hands out for the prefilter
+    // chain are exactly that call.
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+               MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> t = [impl_->dev newTextureWithDescriptor:td];
+    if (!t) return {};
+    return TextureId{impl_->AllocTextureSlot(t)};
+}
+
+TextureId Device::CreateStorageTexture2D(int width, int height, Format format,
+                                         int mip_levels) {
+    if (width <= 0 || height <= 0) return {};
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:ToMTL(format)
+                                                           width:NSUInteger(width)
+                                                          height:NSUInteger(height)
+                                                       mipmapped:mip_levels != 1];
+    if (mip_levels > 0) td.mipmapLevelCount = NSUInteger(mip_levels);
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+               MTLTextureUsagePixelFormatView;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> t = [impl_->dev newTextureWithDescriptor:td];
+    if (!t) return {};
+    return TextureId{impl_->AllocTextureSlot(t)};
+}
+
+TextureId Device::CreateMipView(TextureId src, int mip) {
+    if (!Valid(src) || src.v >= impl_->textures.size()) return {};
+    id<MTLTexture> t = impl_->textures[src.v];
+    if (!t || mip < 0 || NSUInteger(mip) >= t.mipmapLevelCount) return {};
+    // A CUBE becomes a 2D ARRAY of six slices. A compute kernel cannot write to
+    // a texturecube -- the type has no write access qualifier in MSL -- and it
+    // does not need to: the six faces are six array slices in memory, and the
+    // cube-ness is a sampling-time interpretation. So the view keeps the
+    // storage and changes only how the shader is allowed to address it.
+    const MTLTextureType type =
+        (t.textureType == MTLTextureTypeCube) ? MTLTextureType2DArray
+                                              : MTLTextureType2D;
+    const NSUInteger slices = (type == MTLTextureType2DArray) ? 6 : 1;
+    id<MTLTexture> view =
+        [t newTextureViewWithPixelFormat:t.pixelFormat
+                             textureType:type
+                                  levels:NSMakeRange(NSUInteger(mip), 1)
+                                  slices:NSMakeRange(0, slices)];
+    if (!view) return {};
+    return TextureId{impl_->AllocTextureSlot(view)};
+}
+
+int Device::TextureWidth(TextureId h) const {
+    if (!Valid(h) || h.v >= impl_->textures.size() || !impl_->textures[h.v]) return 0;
+    return int(impl_->textures[h.v].width);
+}
+int Device::TextureHeight(TextureId h) const {
+    if (!Valid(h) || h.v >= impl_->textures.size() || !impl_->textures[h.v]) return 0;
+    return int(impl_->textures[h.v].height);
+}
+int Device::TextureMipLevels(TextureId h) const {
+    if (!Valid(h) || h.v >= impl_->textures.size() || !impl_->textures[h.v]) return 0;
+    return int(impl_->textures[h.v].mipmapLevelCount);
+}
+
 TextureId Device::CreateTexture2D(int width, int height, const void* rgba8) {
     if (width <= 0 || height <= 0 || !rgba8) return {};
     MTLTextureDescriptor* td = [MTLTextureDescriptor
@@ -582,6 +784,26 @@ SamplerId Device::CreateSampler(Filter filter, Wrap wrap) {
                                         : MTLSamplerAddressModeClampToEdge;
     sd.sAddressMode = a;
     sd.tAddressMode = a;
+    id<MTLSamplerState> ss = [impl_->dev newSamplerStateWithDescriptor:sd];
+    if (!ss) return {};
+    impl_->samplers.push_back(ss);
+    return SamplerId{std::uint32_t(impl_->samplers.size() - 1)};
+}
+
+SamplerId Device::CreateMipSampler(Wrap wrap) {
+    MTLSamplerDescriptor* sd = [[MTLSamplerDescriptor alloc] init];
+    sd.minFilter = MTLSamplerMinMagFilterLinear;
+    sd.magFilter = MTLSamplerMinMagFilterLinear;
+    // LINEAR between levels, which is the whole reason this exists. Nearest
+    // would snap to the closest mip and put a visible ring on every surface
+    // whose roughness crosses a level boundary.
+    sd.mipFilter = MTLSamplerMipFilterLinear;
+    const MTLSamplerAddressMode a = (wrap == Wrap::Repeat)
+                                        ? MTLSamplerAddressModeRepeat
+                                        : MTLSamplerAddressModeClampToEdge;
+    sd.sAddressMode = a;
+    sd.tAddressMode = a;
+    sd.rAddressMode = a;
     id<MTLSamplerState> ss = [impl_->dev newSamplerStateWithDescriptor:sd];
     if (!ss) return {};
     impl_->samplers.push_back(ss);
@@ -734,10 +956,56 @@ void Device::BeginFrame() { @autoreleasepool {
 
     impl_->cb = [impl_->queue commandBuffer];
     ++impl_->frame_index;
+    impl_->timed_this_frame = 0;
+    impl_->timing_labels.clear();
 
     dispatch_semaphore_t sem = impl_->frame_sem;
     std::atomic<int>* counter = &impl_->in_flight;
-    [impl_->cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+    Impl* impl = impl_.get();
+    // The labels are COPIED into the block. The vector is cleared at the top of
+    // the next BeginFrame, and the completion handler runs on a driver thread
+    // at an unpredictable time -- capturing the member would be a data race
+    // whose symptom is a garbage label, or a crash if it reallocated.
+    std::vector<const char*> labels = impl_->timing_labels;
+    const int timed = impl_->timed_this_frame;
+    id<MTLCounterSampleBuffer> counters = impl_->counters;
+    [impl_->cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        // GPUEndTime and GPUStartTime are seconds, and available whether or not
+        // stage-boundary sampling is. This is the number to trust: the per-pass
+        // times below do not sum to it, because a tiler overlaps the vertex
+        // work of one pass with the fragment work of the last.
+        impl->gpu_ms.store((done.GPUEndTime - done.GPUStartTime) * 1000.0,
+                           std::memory_order_relaxed);
+        if (timed > 0 && counters) {
+            NSData* data = [counters resolveCounterRange:NSMakeRange(0, NSUInteger(timed * 2))];
+            if (data && data.length >= sizeof(MTLCounterResultTimestamp) * std::size_t(timed * 2)) {
+                const auto* t = static_cast<const MTLCounterResultTimestamp*>(data.bytes);
+                std::vector<GpuTiming> out;
+                out.reserve(std::size_t(timed));
+                for (int i = 0; i < timed; ++i) {
+                    const MTLTimestamp a = t[i * 2].timestamp;
+                    const MTLTimestamp b = t[i * 2 + 1].timestamp;
+                    // MTLCounterErrorValue marks a sample the GPU did not take
+                    // -- a pass that was culled, or one whose encoder produced
+                    // no work. Reporting the subtraction of two error values as
+                    // a duration would put an enormous number in the profile.
+                    const bool bad = a == MTLCounterErrorValue ||
+                                     b == MTLCounterErrorValue || b < a;
+                    GpuTiming g;
+                    g.label = labels[std::size_t(i)];
+                    // Ticks are NANOSECONDS on Apple Silicon: the GPU and CPU
+                    // share a timebase, which is exactly why no correlation
+                    // call is needed here.
+                    g.milliseconds = bad ? 0.0 : double(b - a) * 1e-6;
+                    out.push_back(g);
+                }
+                impl->timings_next = std::move(out);
+            }
+        }
+        // Published LAST, so a reader never sees a half-filled list. Single
+        // producer, and the reader is the game thread reading a vector it only
+        // ever swaps whole -- see LastFrameTimings for why that is enough here.
+        impl->timings.swap(impl->timings_next);
         counter->fetch_sub(1);
         dispatch_semaphore_signal(sem);
     }];
@@ -756,6 +1024,16 @@ std::uint64_t Device::FrameIndex() const { return impl_->frame_index; }
 int Device::PeakFramesInFlight() const { return impl_->peak_in_flight.load(); }
 
 int Device::TextureSlotCount() const { return int(impl_->textures.size()); }
+
+bool Device::SupportsGpuTiming() const { return impl_->timing_supported; }
+
+std::span<const GpuTiming> Device::LastFrameTimings() const {
+    return {impl_->timings.data(), impl_->timings.size()};
+}
+
+double Device::LastFrameGpuMilliseconds() const {
+    return impl_->gpu_ms.load(std::memory_order_relaxed);
+}
 
 Encoder Device::BeginPass(const PassDesc& desc) { @autoreleasepool {
     // Descriptors are autoreleased. Without a pool here the engine leaks one
@@ -794,6 +1072,16 @@ Encoder Device::BeginPass(const PassDesc& desc) { @autoreleasepool {
         rp.depthAttachment.storeAction =
             desc.keep_depth ? MTLStoreActionStore : MTLStoreActionDontCare;
         rp.depthAttachment.clearDepth = desc.clear_depth;
+    }
+    const int slot = impl_->BeginTiming(desc.timer);
+    if (slot >= 0) {
+        // START OF VERTEX to END OF FRAGMENT, which brackets the whole pass.
+        // Sampling at the encoder boundaries instead would include the driver's
+        // setup, and on a tiler it would include the wait for the previous
+        // pass's tiles to flush -- time that belongs to the other pass.
+        rp.sampleBufferAttachments[0].sampleBuffer = impl_->counters;
+        rp.sampleBufferAttachments[0].startOfVertexSampleIndex = NSUInteger(slot * 2);
+        rp.sampleBufferAttachments[0].endOfFragmentSampleIndex = NSUInteger(slot * 2 + 1);
     }
     // The encoder is held by a strong ivar, so it outlives this pool.
     impl_->pass_has_depth = Valid(desc.depth);

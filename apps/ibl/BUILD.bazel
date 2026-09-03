@@ -1,0 +1,16 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# The IBL bake, checked against known answers rather than looked at. A white
+# furnace has an exact expected result at every stage; a picture does not.
+cc_test(
+    name = "ibl_test",
+    srcs = ["offscreen.cpp"],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/scene",
+        "//engine/rhi",
+    ],
+)

@@ -49,6 +49,17 @@ class AudioSystem {
     // Commands lost because the queue was full. Non-zero means sounds are being
     // silently dropped, which is indistinguishable from never triggering them.
     [[nodiscard]] int DroppedCommands() const;
+    // Play calls the MIXER refused because every voice was busy. A different
+    // number from DroppedCommands, and the one a game actually hits: the queue
+    // holds 511 commands and rarely fills, but 64 voices is a busy second in a
+    // firefight. Play returns a valid-looking handle either way, so without
+    // this a game has no way to learn that its sounds are being refused.
+    [[nodiscard]] int StarvedVoices() const;
+    // Whether a handle still names something audible. False for a one-shot that
+    // has run out, for a sound that was refused a voice, and for a handle whose
+    // slot has been reused -- all three of which a caller has to tell apart
+    // from "still playing" to know when to trigger the next thing.
+    [[nodiscard]] bool Playing(Sound) const;
     // The loudest sample the last block produced BEFORE clamping. Above 1 the
     // mix is clipping, which is audible as distortion and shows up nowhere else.
     [[nodiscard]] float LastPeak() const;

@@ -24,9 +24,15 @@ class RenderGraph {
   public:
     // Records draws for one pass. The encoder's pass is already open.
     using ExecuteFn = std::function<void(rhi::Encoder&)>;
+    // The same for a COMPUTE pass. A separate type because the two encoders
+    // cannot be substituted -- see rhi::ComputeEncoder for why that is a
+    // hardware fact rather than a rule invented here.
+    using ComputeFn = std::function<void(rhi::ComputeEncoder&)>;
 
     struct Pass {
         std::string name;
+        // Names this pass in the GPU timing report. Null means untimed.
+        const char* timer = nullptr;
         // A depth-only pass (a shadow map) legitimately has no colour target,
         // so `color` may be null when `depth` is not.
         rhi::TextureId color;                 // written by this pass
@@ -44,10 +50,31 @@ class RenderGraph {
         float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         float clear_depth = 0.0f;             // reversed-Z far value
         bool keep_depth = false;              // true for a shadow map
+        // Resources this pass writes that are NOT attachments. A compute pass
+        // has no attachments at all, so this is the only thing that can order
+        // it against the passes that read what it produced -- an environment
+        // probe baked in compute and sampled by the lit pass is exactly that.
+        std::vector<rhi::TextureId> writes;
         ExecuteFn execute;
+        // Set INSTEAD of `execute` to make this a compute pass. Both set is
+        // rejected at Compile: a pass is one or the other, and silently
+        // preferring one would make the other's draws vanish.
+        ComputeFn compute;
     };
 
     void AddPass(Pass p) { passes_.push_back(std::move(p)); }
+
+    // A compute pass in one line, which is the shape nearly every one takes:
+    // it writes some textures and runs some dispatches.
+    void AddCompute(std::string name, std::vector<rhi::TextureId> writes,
+                    ComputeFn fn, const char* timer = nullptr) {
+        Pass p;
+        p.name = std::move(name);
+        p.writes = std::move(writes);
+        p.compute = std::move(fn);
+        p.timer = timer;
+        passes_.push_back(std::move(p));
+    }
 
     // Declares a texture that already holds what this graph needs, written
     // before it -- last frame, or at load time. Without it the graph rejects

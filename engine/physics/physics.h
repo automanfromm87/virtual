@@ -12,7 +12,7 @@
 //     decoupled from the frame rate.
 //   * Distance and ball-socket joints.
 //   * Sleeping, so a settled pile stops costing anything.
-//   * Brute-force broadphase.
+//   * A BVH broadphase, rebuilt per step, shared with the queries.
 // Not here: convex hulls, continuous collision.
 #pragma once
 
@@ -23,6 +23,7 @@
 
 #include "engine/core/math.h"
 #include "engine/geometry/hull.h"
+#include "engine/physics/bvh.h"
 
 namespace eng::physics {
 
@@ -249,12 +250,33 @@ struct QueryFilter {
 struct WorldStats {
     int steps = 0;
     int contacts = 0;
+    // Pairs the narrowphase was actually asked about. With the BVH this is the
+    // number that shows whether the broadphase is doing its job: on a scattered
+    // scene it is a small multiple of the body count, and if it ever approaches
+    // N^2/2 the tree has degenerated into a list.
     int pairs_tested = 0;
     // How many times a bullet's step was cut short by an impact. Zero on a
     // scene with nothing fast in it, and the number to look at when something
     // fast still goes through a wall.
     int toi_clamps = 0;
+    // Broadphase tree shape. `bvh_depth` against log2(bodies/4) is the health
+    // check: equal means balanced, much larger means the split has stopped
+    // separating things and the traversal is walking a list.
+    int bvh_nodes = 0;
+    int bvh_depth = 0;
+    // How many times the tree has been rebuilt. One per step plus one per
+    // query batch that follows an external mutation; a number climbing much
+    // faster than the step count means something is dirtying the tree between
+    // every query, which turns each query into an O(N log N) build.
+    int bvh_rebuilds = 0;
 };
+
+// A body's world-space bounding box, expanded by `margin`.
+//
+// Exposed because the broadphase, the queries and the CCD sweep all need the
+// same answer, and three copies of "what is the AABB of a rotated capsule"
+// would be three chances to write it differently.
+[[nodiscard]] Aabb BodyBounds(const Body&, float margin = 0.0f);
 
 // A constraint between two bodies, solved alongside the contacts.
 //
@@ -322,7 +344,21 @@ class World {
     void Wake(int i);
     void WakeAll();
     [[nodiscard]] int SleepingCount() const;
-    [[nodiscard]] Body& operator[](int i) { return bodies_[std::size_t(i)]; }
+    // The NON-CONST accessor invalidates the broadphase, on the assumption that
+    // a caller who asked for a mutable body is about to move it. That is
+    // pessimistic -- reading through it costs a rebuild too -- and it is the
+    // only sound rule available: this class hands out a raw reference, so there
+    // is no other moment at which it could learn that a body moved. The
+    // alternative, a Dirty() the caller must remember to call, fails silently
+    // and intermittently, which is the worst way for a spatial index to be
+    // wrong.
+    //
+    // Reading through a `const World&` -- which is what every query and the
+    // character controller take -- does not invalidate anything.
+    [[nodiscard]] Body& operator[](int i) {
+        bvh_dirty_ = true;
+        return bodies_[std::size_t(i)];
+    }
     [[nodiscard]] const Body& operator[](int i) const { return bodies_[std::size_t(i)]; }
     [[nodiscard]] int Count() const { return int(bodies_.size()); }
     void Clear();
@@ -386,6 +422,11 @@ class World {
     void SolveJoints();
     void UpdateSleep();
 
+    // Rebuilds the broadphase if anything has invalidated it. Const because
+    // every query needs it and a query does not conceptually change the world;
+    // the tree is a cache of the bodies, not part of their state.
+    void RefreshBroadphase() const;
+
     std::vector<Body> bodies_;
     std::vector<Joint> joints_;
     std::vector<Contact> contacts_;
@@ -411,8 +452,36 @@ class World {
     // Union-find parents for the sleeping islands. A member so a settled scene
     // allocates nothing per step.
     std::vector<int> islands_;
-    WorldStats stats_;
+    // MUTABLE only so a const query can record that it rebuilt the tree. The
+    // simulation half of these is written from non-const code as before.
+    mutable WorldStats stats_;
     float accumulator_ = 0.0f;
+
+    // --- broadphase ------------------------------------------------------------
+    //
+    // MUTABLE, and the const-correctness argument is worth stating because it
+    // is the usual excuse for a bug: the tree carries no information that is not
+    // already in bodies_. Rebuilding it changes what this object COMPUTES WITH
+    // and not what it MEANS, which is exactly the case mutable is for. A query
+    // that had to be non-const to work would push the problem to every caller,
+    // and CharacterController -- which takes a `const World&` precisely so it
+    // cannot disturb the simulation -- could not run one at all.
+    mutable Bvh bvh_;
+    mutable std::vector<Aabb> body_boxes_;
+    mutable bool bvh_dirty_ = true;
+    // Scratch for the broadphase's per-body query, so a steady-state step does
+    // not allocate. Mutable for the same reason as the tree.
+    mutable std::vector<int> query_scratch_;
+    // Broadphase pairs, packed as (low << 32 | high) so one sort orders them
+    // the way the old double loop produced them. A member so a steady-state
+    // step allocates nothing.
+    std::vector<std::uint64_t> pairs_;
+    // The margin every body's box is grown by when the tree is built. It has to
+    // cover a step's worth of motion, because the tree built at the START of a
+    // step is queried against positions the integrator has ALREADY advanced.
+    // Without it a body moving 30 cm per step can leave its own leaf box and
+    // stop being reported against things it is now overlapping.
+    float broadphase_margin_ = 0.05f;
 };
 
 // Narrowphase, exposed for testing. Returns false when the pair is apart.

@@ -63,6 +63,15 @@ int main() {
     //
     // Optional, deliberately: a machine with no output device, or a missing
     // music file, should cost the sound and not the game.
+    //
+    // THE CLIPS ARE DECLARED FIRST, and that is not a style choice. Locals
+    // destruct in REVERSE order, so declaring them before the system puts the
+    // device's teardown first and the samples it was reading second. The other
+    // way round frees the sample vectors while the audio callback can still
+    // run -- a use-after-free on a real-time thread, which appears in no stack
+    // trace the crash report contains. The looping music guarantees a voice is
+    // still live at the return, so it is not a narrow window either.
+    eng::audio::Clip music, coin_sfx, step_sfx;
     auto audio = eng::audio::AudioSystem::Create(error);
     if (!audio) std::fprintf(stderr, "no audio: %s\n", error.c_str());
 
@@ -70,7 +79,6 @@ int main() {
     // nothing. A path baked into the source only exists on the machine it was
     // written on, and the sound effects below are synthesised precisely so the
     // demo needs no asset it did not ship with.
-    eng::audio::Clip music;
     if (audio) {
         if (const char* track = std::getenv("VIRTUAL_MUSIC")) {
             std::string e;
@@ -85,7 +93,6 @@ int main() {
     // ship with. A coin is a two-note arpeggio and a footstep is filtered
     // noise -- both are a few lines and neither needs an artist.
     const int rate = audio ? audio->SampleRate() : 48000;
-    eng::audio::Clip coin_sfx, step_sfx;
     {
         coin_sfx.rate = rate;
         coin_sfx.channels = 1;

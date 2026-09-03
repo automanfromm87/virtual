@@ -15,6 +15,7 @@
 #include "engine/anim/anim.h"
 #include "engine/geometry/mesh.h"
 #include "engine/resource/handles.h"
+#include "engine/render/ibl.h"
 #include "engine/rhi/rhi.h"
 #include "engine/scene/scene.h"
 
@@ -99,6 +100,18 @@ struct RenderStats {
 // (RGBA).
 class Renderer {
   public:
+    // The environment probe every lit pass will sample. Set once after baking;
+    // an unset environment leaves the probe textures unbound, and the shader
+    // falls back to the two-colour hemisphere rather than sampling nothing.
+    //
+    // Held here rather than passed per draw because it is a property of the
+    // SCENE's surroundings, not of any one object, and threading it through
+    // every draw call would put an IBL parameter in the signature of a shadow
+    // pass that has no use for one.
+    void SetEnvironment(const EnvironmentBindings&);
+    void ClearEnvironment();
+    [[nodiscard]] bool HasEnvironment() const;
+
     // `samples` is the multisample count the SCENE passes will run at. It has
     // to be known here rather than per-pass: a pipeline is compiled against a
     // sample count and Metal rejects a mismatch, so the renderer builds its

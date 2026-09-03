@@ -108,6 +108,16 @@ Clip DecodeWav(std::span<const std::uint8_t> bytes, std::string& error) {
         error = "wav: " + std::to_string(bits) + " bits per sample";
         return Clip{};
     }
+    // IEEE float is 32 or 64 bits and nothing else. Checked HERE rather than in
+    // the loop, because the loop's else-branch copies eight bytes unconditionally
+    // while the stride is bits/8: a float wav claiming 16 bits reads six bytes
+    // past the end of the data chunk on its last sample, which for the usual
+    // layout -- data last in the file -- is six bytes past the buffer.
+    if (format == kFloat && bits != 32 && bits != 64) {
+        error = "wav: " + std::to_string(bits) +
+                "-bit float is not a thing (IEEE float wav is 32 or 64)";
+        return Clip{};
+    }
     const std::size_t count = data.size() / std::size_t(bytes_per);
 
     clip.channels = channels;

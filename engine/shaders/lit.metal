@@ -113,7 +113,13 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
                        texture2d<float> roughnessMap [[texture(1)]],
                        depth2d<float>   shadowMap    [[texture(2)]],
                        depth2d<float>   shadowAtlas  [[texture(3)]],
-                       sampler          smp          [[sampler(0)]])
+                       // The environment probe, slots 5-7. Left unbound when
+                       // there is none, which ShadeSurface detects.
+                       texturecube<float> irradianceMap [[texture(5)]],
+                       texturecube<float> specularMap   [[texture(6)]],
+                       texture2d<float>   brdfLut       [[texture(7)]],
+                       sampler          smp          [[sampler(0)]],
+                       sampler          envSmp       [[sampler(1)]])
 {
     // SECTION CUT before anything else: no point shading a fragment that is
     // about to be thrown away. This is what lets you look inside a building
@@ -137,6 +143,7 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
     // paper. Brightness has to survive to the end of the frame to be usable.
     const float3 lit = ShadeSurface(in.worldPos, in.normalW, albedo, roughness,
                                     metallic, in.lightClip, u, lights, cascades,
-                                    shadowMap, shadowAtlas, smp);
+                                    shadowMap, shadowAtlas, smp,
+                                    irradianceMap, specularMap, brdfLut, envSmp);
     return float4(lit, in.color.a);
 }

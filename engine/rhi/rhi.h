@@ -28,6 +28,15 @@ enum class Format : std::uint8_t {
     // indistinguishable, and a bloom built on that glows off the paper.
     RGBA16Float,
     Depth32Float,
+    // Two half-floats. The BRDF integration lookup table is exactly this: a
+    // scale and a bias, both in 0..1, and nothing else. RGBA16Float would work
+    // and would waste half the bandwidth of a texture sampled once per pixel.
+    RG16Float,
+    // Full float, for the places where half is measurably not enough. An
+    // equirectangular sky holds a sun at tens of thousands of nits, and half
+    // saturates at 65504 -- close enough to matter, and the failure is a sun
+    // that is a flat disc instead of a gradient.
+    RGBA32Float,
 };
 enum class Cull : std::uint8_t { None, Back, Front };
 enum class Winding : std::uint8_t { Clockwise, CounterClockwise };
@@ -113,8 +122,27 @@ struct PipelineDesc {
     bool depth_write = true;
 };
 
+// How long one pass took ON THE GPU.
+//
+// Not the CPU time spent recording it, which is what a CPU profiler measures
+// and which is unrelated: a pass that costs 40 microseconds to encode can cost
+// eight milliseconds to run. Without GPU timings, optimising a renderer is
+// guesswork -- the frame is slow, and the only way to find out which pass is
+// responsible is to comment passes out one at a time.
+struct GpuTiming {
+    // Points at the caller's own string literal. Not copied: these are set from
+    // a PassDesc every frame and allocating a string per pass per frame to
+    // report a timing would be its own performance problem.
+    const char* label = "";
+    double milliseconds = 0.0;
+};
+
 struct PassDesc {
     TextureId color;
+    // Names this pass in the GPU timing report and in a frame capture. Null
+    // means untimed, which costs nothing at all -- a sample-buffer attachment
+    // is only added to passes that asked for one.
+    const char* timer = nullptr;
     // Attachments 1..n, paired with PipelineDesc::extra_colors. All are
     // cleared to `clear_color` -- a G-buffer wants every channel cleared to a
     // known value anyway, and a per-attachment clear colour would be four more
@@ -207,6 +235,14 @@ class ComputeEncoder {
     void SetPipeline(ComputePipelineId);
     void SetBuffer(BufferId, std::size_t offset, int slot);
     void SetTexture(TextureId, int slot);
+    // A sampler, for kernels that READ a texture rather than index it.
+    //
+    // Not redundant with SetTexture. A compute kernel writing to a storage
+    // texture addresses texels directly and needs none, but one that filters --
+    // a mip reduction, a cubemap convolution -- needs the hardware's
+    // interpolation and, for a cube, its cross-face blending, and there is no
+    // way to ask for either without a sampler.
+    void SetSampler(SamplerId, int slot);
     // Small constants, copied immediately.
     void SetBytes(const void* data, std::size_t bytes, int slot);
 
@@ -219,6 +255,16 @@ class ComputeEncoder {
     // last group runs threads past the end, and nothing else stops them writing
     // there.
     void Dispatch(int count, int group = 64);
+
+    // A 2D or 3D grid, for kernels whose work IS 2D or 3D -- an image filter, a
+    // cubemap's six faces. Flattening those onto Dispatch() and unpacking the
+    // index in the shader works and costs a divide and a modulo per thread, and
+    // more importantly it destroys the 2D locality the texture cache is built
+    // around: a linear index walks a whole row before touching the next, while
+    // an 8x8 group stays inside one tile.
+    void Dispatch2D(int width, int height, int gx = 8, int gy = 8);
+    void Dispatch3D(int width, int height, int depth, int gx = 8, int gy = 8,
+                    int gz = 1);
 
   private:
     friend class Device;
@@ -287,7 +333,58 @@ class Device {
     // width*height*4 bytes, first row at the top.
     [[nodiscard]] TextureId CreateTexture2D(int width, int height,
                                             const void* rgba8);
+    // The same, from FLOAT pixels: `rgba32f` holds width*height*4 floats.
+    // What an HDR environment arrives as, and the reason it cannot go through
+    // the 8-bit path -- the whole point of an environment map is the values
+    // above one, and an 8-bit texture has none.
+    [[nodiscard]] TextureId CreateTexture2DFloat(int width, int height,
+                                                 const float* rgba32f);
     [[nodiscard]] SamplerId CreateSampler(Filter, Wrap);
+    // A sampler that filters ACROSS MIP LEVELS as well as within one. Separate
+    // from the ordinary one because it is wrong nearly everywhere else: a UI
+    // atlas or a shadow map has no mip chain, and asking for trilinear on one
+    // samples level zero anyway while paying for the decision.
+    //
+    // The prefiltered specular probe is the case that needs it. Roughness
+    // selects a mip continuously, and without interpolation between levels a
+    // surface whose roughness varies smoothly shows hard bands where the mip
+    // index steps.
+    [[nodiscard]] SamplerId CreateMipSampler(Wrap);
+
+    // --- cubemaps and storage textures -----------------------------------------
+    //
+    // A CUBEMAP is six square faces sharing one texture. It exists rather than
+    // six separate textures because the hardware can filter ACROSS the seams:
+    // sampling near an edge blends texels from the neighbouring face, and doing
+    // that by hand needs to know the adjacency and the winding of all twelve
+    // edges. A prefiltered environment map with visible seams is the classic
+    // symptom of having tried.
+    //
+    // `mip_levels` of 0 means the full chain down to 1x1.
+    [[nodiscard]] TextureId CreateCubemap(int size, Format, int mip_levels = 1);
+    // A 2D texture a COMPUTE kernel writes into. Distinct from a render target
+    // because the usage flags differ and Metal validates them: a texture
+    // created for rendering cannot be bound for shader writes.
+    [[nodiscard]] TextureId CreateStorageTexture2D(int width, int height, Format,
+                                                   int mip_levels = 1);
+
+    // A VIEW of one mip level of a texture, as a handle that can be bound for
+    // writing.
+    //
+    // Needed because a compute kernel writes to a texture at ONE size, and a
+    // mip chain is a different size at every level. Metal expresses that as a
+    // view over a level range; without it the only way to fill mip 3 of a probe
+    // would be to allocate a separate texture per level and blit them together.
+    //
+    // For a cubemap the view is a 2D ARRAY of six slices, because that is what
+    // a compute kernel can write: `texture2d_array<float, access::write>` with
+    // the face in gid.z. Cube adjacency is a sampling-time property, not a
+    // storage one, so nothing is lost.
+    [[nodiscard]] TextureId CreateMipView(TextureId, int mip);
+
+    [[nodiscard]] int TextureWidth(TextureId) const;
+    [[nodiscard]] int TextureHeight(TextureId) const;
+    [[nodiscard]] int TextureMipLevels(TextureId) const;
 
     // --- ray tracing ---------------------------------------------------------
     //
@@ -366,13 +463,31 @@ class Device {
     // Diagnostics: entries in the texture handle table. Should stay bounded
     // when textures are destroyed and recreated (e.g. on window resize).
     [[nodiscard]] int TextureSlotCount() const;
+
+    // --- GPU timing ------------------------------------------------------------
+    //
+    // Whether the hardware can timestamp at pass boundaries. False on older
+    // Macs, and everything below then reports zero rather than failing --
+    // a profiler that cannot be built into the engine because it might not be
+    // supported is a profiler nobody has when they need it.
+    [[nodiscard]] bool SupportsGpuTiming() const;
+    // Per-pass times from the most recently COMPLETED frame -- which is two or
+    // three frames behind the one being recorded, because reading them any
+    // sooner would mean waiting for the GPU. That lag is why these are for a
+    // HUD and a log, not for anything that feeds back into the frame.
+    [[nodiscard]] std::span<const GpuTiming> LastFrameTimings() const;
+    // Wall-clock GPU time for the whole of the last completed command buffer.
+    // Available even without stage-boundary sampling, and the honest headline
+    // number: the per-pass timings do not sum to it, because passes overlap.
+    [[nodiscard]] double LastFrameGpuMilliseconds() const;
+
     [[nodiscard]] Encoder BeginPass(const PassDesc&);
     void EndPass();
 
     // A compute pass. Must not overlap a render pass on the same device -- see
     // ComputeEncoder for why that is a hardware fact and not a rule this layer
-    // invented.
-    [[nodiscard]] ComputeEncoder BeginCompute();
+    // invented. `timer` behaves as PassDesc::timer does.
+    [[nodiscard]] ComputeEncoder BeginCompute(const char* timer = nullptr);
     void EndCompute();
     // Whether the pass currently open has a depth attachment. A pipeline built
     // without depth cannot be used in a pass that has one, and vice versa —

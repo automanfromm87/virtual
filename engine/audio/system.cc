@@ -45,11 +45,39 @@ struct AudioSystem::Impl {
     };
     std::vector<Live> live;
 
+    // A PUBLISHED MIRROR of `live`, so the game thread can ask whether a handle
+    // is still audible without touching the table the audio thread owns. Copied
+    // out at the end of every Drain; relaxed on both sides, because a stale
+    // answer here is a frame old and nothing is ordered against it.
+    std::vector<std::atomic<std::uint32_t>> published;
+    // The highest Play id the audio thread has actually seen. A command sits in
+    // the queue for up to a block, and without this a sound triggered on the
+    // game thread reads as "finished" for the ten milliseconds before the audio
+    // thread gets to it -- which is the wrong answer at the only moment anyone
+    // asks. Compared with wrapping arithmetic, so the 32-bit id rolling over
+    // after four billion sounds is not a cliff.
+    std::atomic<std::uint32_t> drained_plays{0};
+    std::atomic<int> starved{0};
+
     void Drain() {
+        // RETIRE FIRST, then the commands. The other order -- which this was --
+        // loses handles: with the table full and one voice having ended during
+        // the last Render, a Play succeeds in the mixer but finds no free Live
+        // slot, because the slot it should have taken is not released until the
+        // bottom of the function. The sound plays and the caller's handle is
+        // bound to nothing, so Stop, SetGain and SetPosition on it are silent
+        // no-ops for the life of the voice.
+        for (Live& l : live)
+            if (l.id != 0 && !mixer->Playing(l.voice)) l.id = 0;
+
         Command c;
         while (queue.Pop(&c)) {
             switch (c.op) {
                 case Op::Play: {
+                    // Recorded whether or not a voice was found, because the
+                    // question it answers is "has the audio thread seen this
+                    // yet", not "did it succeed".
+                    drained_plays.store(c.id, std::memory_order_relaxed);
                     const VoiceId v = mixer->Play(c.desc);
                     if (!v.Valid()) break;
                     for (Live& l : live)
@@ -80,10 +108,10 @@ struct AudioSystem::Impl {
                     break;
             }
         }
-        // Retire handles whose voice has finished, so the table does not fill
-        // with the ids of sounds that ended minutes ago.
-        for (Live& l : live)
-            if (l.id != 0 && !mixer->Playing(l.voice)) l.id = 0;
+
+        for (std::size_t i = 0; i < live.size(); ++i)
+            published[i].store(live[i].id, std::memory_order_relaxed);
+        starved.store(mixer->Starved(), std::memory_order_relaxed);
     }
 
     void Render(float* out, int frames) {
@@ -120,8 +148,10 @@ AudioSystem::~AudioSystem() {
 
 std::unique_ptr<AudioSystem> AudioSystem::CreateSilent(int rate, int max_voices) {
     std::unique_ptr<AudioSystem> s(new AudioSystem());
+    const std::size_t n = std::size_t(std::max(1, max_voices));
     s->impl_->mixer = std::make_unique<Mixer>(rate, max_voices);
-    s->impl_->live.resize(std::size_t(std::max(1, max_voices)));
+    s->impl_->live.resize(n);
+    s->impl_->published = std::vector<std::atomic<std::uint32_t>>(n);
     return s;
 }
 
@@ -130,7 +160,9 @@ std::unique_ptr<AudioSystem> AudioSystem::Create(std::string& error,
                                                  int max_voices) {
     std::unique_ptr<AudioSystem> s(new AudioSystem());
     Impl& im = *s->impl_;
-    im.live.resize(std::size_t(std::max(1, max_voices)));
+    const std::size_t n = std::size_t(std::max(1, max_voices));
+    im.live.resize(n);
+    im.published = std::vector<std::atomic<std::uint32_t>>(n);
     im.device = platform::AudioOut::Create(sample_rate, &RenderThunk, &im, error);
     if (!im.device) return nullptr;
     // Built at the rate the DEVICE settled on, not the one asked for. A mixer
@@ -138,6 +170,15 @@ std::unique_ptr<AudioSystem> AudioSystem::Create(std::string& error,
     // of sync with the game over minutes.
     im.mixer = std::make_unique<Mixer>(im.device->SampleRate(), max_voices);
     im.device->Start();
+    // CHECKED. Start() reports failure only through Running(), and a system
+    // that was created but never started is worse than one that failed: the
+    // game takes the `if (audio)` branch forever, posts commands into a queue
+    // nothing drains, and after a few hundred frames is silently dropping every
+    // one of them with no error anywhere to say why.
+    if (!im.device->Running()) {
+        error = "audio: the output device was created but would not start";
+        return nullptr;
+    }
     return s;
 }
 
@@ -208,6 +249,21 @@ int AudioSystem::ActiveVoices() const {
 }
 int AudioSystem::DroppedCommands() const {
     return impl_->dropped.load(std::memory_order_relaxed);
+}
+int AudioSystem::StarvedVoices() const {
+    return impl_->starved.load(std::memory_order_relaxed);
+}
+bool AudioSystem::Playing(Sound s) const {
+    if (!s.Valid()) return false;
+    // Still in the queue counts as playing. The cast to signed is SERIAL NUMBER
+    // arithmetic, not a sloppy comparison: it answers "is s.id after drained"
+    // correctly across the point where the 32-bit counter wraps, which a plain
+    // `>` does not.
+    const std::uint32_t drained = impl_->drained_plays.load(std::memory_order_relaxed);
+    if (std::int32_t(s.id - drained) > 0) return true;
+    for (const auto& p : impl_->published)
+        if (p.load(std::memory_order_relaxed) == s.id) return true;
+    return false;
 }
 float AudioSystem::LastPeak() const {
     return impl_->peak.load(std::memory_order_relaxed);

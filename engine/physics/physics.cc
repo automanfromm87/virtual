@@ -345,13 +345,87 @@ int World::AddJoint(const Joint& j) {
     return int(joints_.size()) - 1;
 }
 
+Aabb BodyBounds(const Body& b, float margin) {
+    Aabb box;
+    switch (b.shape.type) {
+        case ShapeType::Sphere:
+            // Rotation-invariant, so the exact box is the trivial one. Not a
+            // special case for speed -- the general path below would give the
+            // same answer -- but because a sphere's half_extents field is
+            // meaningless and reading it would be a bug waiting for someone to
+            // set it.
+            box.lo = b.position - Vec3{b.shape.radius, b.shape.radius, b.shape.radius};
+            box.hi = b.position + Vec3{b.shape.radius, b.shape.radius, b.shape.radius};
+            break;
+        case ShapeType::Capsule: {
+            // The two cap CENTRES, swept by the radius. Exact, and much tighter
+            // than treating the capsule as a sphere of its bounding radius --
+            // which for a 1.8 m character is a 1.8 m wide box instead of a
+            // 0.7 m one, and every extra centimetre is broadphase pairs.
+            const Vec3 axis = Rotate(b.orientation, Vec3{0.0f, b.shape.half_extents.y, 0.0f});
+            const Vec3 a = b.position + axis, c = b.position - axis;
+            box.Add(a);
+            box.Add(c);
+            box.Expand(b.shape.radius);
+            break;
+        }
+        case ShapeType::Box:
+        case ShapeType::Hull: {
+            // The rotated box's extent along each world axis is the row of the
+            // absolute rotation matrix dotted with the half extents. Cheaper
+            // than transforming eight corners and exactly as tight, and for a
+            // hull it is the AABB of the hull's own box -- conservative, since
+            // the hull is inside it, which is all a broadphase needs.
+            const Vec3 h = b.shape.half_extents;
+            const Vec3 rx = Rotate(b.orientation, Vec3{1.0f, 0.0f, 0.0f});
+            const Vec3 ry = Rotate(b.orientation, Vec3{0.0f, 1.0f, 0.0f});
+            const Vec3 rz = Rotate(b.orientation, Vec3{0.0f, 0.0f, 1.0f});
+            const Vec3 e{
+                std::fabs(rx.x) * h.x + std::fabs(ry.x) * h.y + std::fabs(rz.x) * h.z,
+                std::fabs(rx.y) * h.x + std::fabs(ry.y) * h.y + std::fabs(rz.y) * h.z,
+                std::fabs(rx.z) * h.x + std::fabs(ry.z) * h.y + std::fabs(rz.z) * h.z};
+            box.lo = b.position - e;
+            box.hi = b.position + e;
+            break;
+        }
+    }
+    if (margin > 0.0f) box.Expand(margin);
+    return box;
+}
+
+void World::RefreshBroadphase() const {
+    if (!bvh_dirty_) return;
+    body_boxes_.resize(bodies_.size());
+    for (std::size_t i = 0; i < bodies_.size(); ++i) {
+        const Body& b = bodies_[i];
+        // A body's box is grown by the distance it can travel in one step, so
+        // the tree built before the integrator runs is still valid after it.
+        // Static and sleeping bodies get no motion margin because they have no
+        // motion, and a static floor is the body most worth keeping tight.
+        const float motion = (b.IsStatic() || b.sleeping)
+                                 ? 0.0f
+                                 : Length(b.velocity) * fixed_dt;
+        body_boxes_[i] = BodyBounds(b, broadphase_margin_ + motion);
+    }
+    bvh_.Build(body_boxes_);
+    bvh_dirty_ = false;
+    ++stats_.bvh_rebuilds;
+    stats_.bvh_nodes = bvh_.NodeCount();
+    stats_.bvh_depth = bvh_.MaxDepth();
+}
+
 void World::Wake(int i) {
     if (i < 0 || std::size_t(i) >= bodies_.size()) return;
     bodies_[std::size_t(i)].sleeping = false;
     bodies_[std::size_t(i)].still_for = 0.0f;
+    // Waking changes the motion margin the tree was built with -- a sleeping
+    // body got none -- so the box it is in is now too tight for where it is
+    // about to go.
+    bvh_dirty_ = true;
 }
 
 void World::WakeAll() {
+    bvh_dirty_ = true;
     for (Body& b : bodies_) {
         b.sleeping = false;
         b.still_for = 0.0f;
@@ -366,6 +440,7 @@ int World::SleepingCount() const {
 }
 
 int World::Add(const Body& b) {
+    bvh_dirty_ = true;
     bodies_.push_back(b);
     Body& added = bodies_.back();
     // A dynamic body whose inertia was never filled in would have every axis
@@ -383,6 +458,9 @@ void World::Clear() {
     contacts_.clear();
     stats_ = WorldStats{};
     accumulator_ = 0.0f;
+    bvh_.Clear();
+    body_boxes_.clear();
+    bvh_dirty_ = true;
 }
 
 float World::Energy() const {
@@ -1034,12 +1112,22 @@ bool World::Raycast(Vec3 origin, Vec3 direction, float max_distance, RayHit* out
     const float len = Length(direction);
     if (len < 1e-12f || max_distance <= 0.0f) return false;
 
+    RefreshBroadphase();
+
     float best_t = max_distance;
-    for (int i = 0; i < int(bodies_.size()); ++i) {
-        if (i == filter.ignore) continue;
+    // THE TREE, not every body. `best_t` shrinks as hits are found and the slab
+    // test reads it, so a ray down a corridor of a thousand crates stops
+    // descending into the ones behind the first wall.
+    //
+    // Note this is NOT an ordered traversal -- the nearest child is not visited
+    // first -- so `best_t` only tightens as luck has it. Ordering the descent
+    // would help a long ray in a dense scene and costs a comparison and a swap
+    // per node; it is the next thing to do here if a profile ever asks.
+    bvh_.QueryRay(origin, direction, max_distance, [&](int i) {
+        if (i == filter.ignore) return;
         const Body& b = bodies_[std::size_t(i)];
-        if ((b.layer & filter.mask) == 0u) continue;
-        if (b.trigger && !filter.hit_triggers) continue;
+        if ((b.layer & filter.mask) == 0u) return;
+        if (b.trigger && !filter.hit_triggers) return;
 
         // A cheap reject against the bounding sphere first. Every shape keeps
         // its radius up to date, and the exact tests below are ten times the
@@ -1048,13 +1136,13 @@ bool World::Raycast(Vec3 origin, Vec3 direction, float max_distance, RayHit* out
         Vec3 n{0, 1, 0};
         if (!RaySphere(origin, direction, b.position, b.shape.bounds_radius,
                        best_t, &t, &n))
-            continue;
+            return;
 
         switch (b.shape.type) {
             case ShapeType::Sphere:
                 break;  // the bounding test WAS the exact test
             case ShapeType::Box:
-                if (!RayBox(origin, direction, b, best_t, &t, &n)) continue;
+                if (!RayBox(origin, direction, b, best_t, &t, &n)) return;
                 break;
             case ShapeType::Capsule:
             case ShapeType::Hull: {
@@ -1082,7 +1170,7 @@ bool World::Raycast(Vec3 origin, Vec3 direction, float max_distance, RayHit* out
                     if (march > best_t) break;
                     n = dir_to * -1.0f;  // Distance points probe -> body
                 }
-                if (!hit || march > best_t) continue;
+                if (!hit || march > best_t) return;
                 t = march;
                 break;
             }
@@ -1099,7 +1187,7 @@ bool World::Raycast(Vec3 origin, Vec3 direction, float max_distance, RayHit* out
             out->point = origin + direction * t;
             out->normal = n;
         }
-    }
+    });
     return out->Hit();
 }
 
@@ -1112,24 +1200,35 @@ int World::OverlapShape(const Shape& shape, Vec3 position, Quat orientation,
     probe.orientation = orientation;
     probe.inverse_mass = 0.0f;
 
+    RefreshBroadphase();
+    // The probe's own box is what the tree is asked for. No margin: the tree's
+    // leaves already carry one, so a body whose true shape is just outside the
+    // probe is still reported here and rejected by the exact test below.
+    const Aabb probe_box = BodyBounds(probe);
+
     int found = 0;
-    for (int i = 0; i < int(bodies_.size()); ++i) {
-        if (i == filter.ignore) continue;
+    bvh_.QueryBox(probe_box, [&](int i) {
+        if (i == filter.ignore) return;
         const Body& b = bodies_[std::size_t(i)];
-        if ((b.layer & filter.mask) == 0u) continue;
-        if (b.trigger && !filter.hit_triggers) continue;
+        if ((b.layer & filter.mask) == 0u) return;
+        if (b.trigger && !filter.hit_triggers) return;
         // Bounding spheres first, for the same reason as the raycast.
         const float reach = probe.shape.bounds_radius + b.shape.bounds_radius;
         if (Dot(b.position - position, b.position - position) > reach * reach)
-            continue;
+            return;
         // The general convex test, not the specialised ones: a query shape can
         // be any of the three against any of the three, and CollideConvex is
         // the path that needs no case analysis.
         Contact c;
-        if (!CollideConvex(probe, b, &c)) continue;
+        if (!CollideConvex(probe, b, &c)) return;
         out->push_back(i);
         ++found;
-    }
+    });
+    // SORTED, because a tree traversal reports in whatever order the nodes
+    // happen to lie and the old linear scan reported in index order. Callers
+    // that iterate the result and take the first, or that compare two runs,
+    // were relying on that without anyone writing it down.
+    std::sort(out->end() - found, out->end());
     return found;
 }
 
@@ -1147,25 +1246,56 @@ void World::Collide() {
     contacts_.clear();
     stats_.pairs_tested = 0;
 
-    // Brute force. At a few hundred bodies this is faster than any acceleration
-    // structure that has to be rebuilt every step; past that it is the first
-    // thing to replace.
-    for (int i = 0; i < int(bodies_.size()); ++i) {
-        for (int j = i + 1; j < int(bodies_.size()); ++j) {
+    // --- broadphase ------------------------------------------------------------
+    //
+    // The tree, queried once per body that could move. A settled scene queries
+    // almost nothing; a scene of a thousand scattered crates queries a thousand
+    // small boxes against a balanced tree instead of testing half a million
+    // pairs.
+    RefreshBroadphase();
+    pairs_.clear();
+    for (int q = 0; q < int(bodies_.size()); ++q) {
+        const Body& a = bodies_[std::size_t(q)];
+        // Nothing that could move: two static bodies, two sleeping ones, or one
+        // of each. A contact between them has nothing to resolve, and skipping
+        // the narrowphase is what makes sleeping cost less rather than merely
+        // look calmer — without it the broadphase still walks every body in a
+        // settled scene and dominates the step.
+        //
+        // Safe because waking is contact-driven from the OTHER side: a moving
+        // body still generates a contact against a sleeping one, and that is
+        // what wakes it. Which is also why only NON-inert bodies query at all:
+        // every pair an inert body is in is found from the other end.
+        if (a.IsStatic() || a.sleeping) continue;
+        bvh_.QueryBox(body_boxes_[std::size_t(q)], [&](int j) {
+            if (j == q) return;
+            const Body& b = bodies_[std::size_t(j)];
+            const bool b_inert = b.IsStatic() || b.sleeping;
+            // Each pair recorded exactly ONCE. Two non-inert bodies are seen
+            // from both ends, so only the ascending direction is kept; an inert
+            // partner is only ever seen from here, so it is kept whichever way
+            // round the indices are, and then normalised below.
+            if (!b_inert && j < q) return;
+            const int lo = std::min(q, j), hi = std::max(q, j);
+            pairs_.push_back((std::uint64_t(lo) << 32) | std::uint32_t(hi));
+        });
+    }
+
+    // SORTED, and this is not tidiness. A tree traversal visits nodes in
+    // whatever order the build laid them out, so without this the contact list
+    // — and therefore the order the solver applies impulses, and therefore the
+    // answer — would depend on the shape of the tree. Sorting restores exactly
+    // the order the brute-force double loop produced, which is what makes every
+    // existing physics test a regression test on this change rather than a set
+    // of numbers that had to be re-tuned to match a new ordering.
+    std::sort(pairs_.begin(), pairs_.end());
+
+    for (std::uint64_t packed : pairs_) {
+        const int i = int(packed >> 32);
+        const int j = int(packed & 0xFFFFFFFFu);
+        {
             const Body& a = bodies_[std::size_t(i)];
             const Body& b = bodies_[std::size_t(j)];
-            // Nothing that could move: two static bodies, two sleeping ones, or
-            // one of each. A contact between them has nothing to resolve, and
-            // skipping the narrowphase here is what makes sleeping cost less
-            // rather than merely look calmer — without it the broadphase still
-            // tests every pair in a settled scene and dominates the step.
-            //
-            // Safe because waking is contact-driven from the OTHER side: a
-            // moving body still generates a contact against a sleeping one, and
-            // that is what wakes it.
-            const bool a_inert = a.IsStatic() || a.sleeping;
-            const bool b_inert = b.IsStatic() || b.sleeping;
-            if (a_inert && b_inert) continue;
             ++stats_.pairs_tested;
 
             Contact c;
@@ -1590,6 +1720,10 @@ void World::UpdateSleep() {
 }
 
 void World::StepFixed() {
+    // The integrator below moves bodies directly, not through operator[], so
+    // nothing else would notice. Marked here rather than at each of the four
+    // loops that write a position.
+    bvh_dirty_ = true;
     // Semi-implicit Euler: velocity first, then integrate position with the NEW
     // velocity. Explicit Euler (position from the old velocity) pumps energy
     // into every orbit and bounce, and no amount of solver tuning hides it.

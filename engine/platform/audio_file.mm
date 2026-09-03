@@ -12,7 +12,18 @@ audio::Clip DecodeAudioFile(const std::string& path, std::string& error) {
         audio::Clip clip;
         error.clear();
 
-        NSString* p = [NSString stringWithUTF8String:path.c_str()];
+        // Through the FILE MANAGER, not stringWithUTF8String:. A path is a byte
+        // string and the filesystem permits bytes that are not valid UTF-8;
+        // stringWithUTF8String: answers nil for those, and
+        // [NSURL fileURLWithPath:nil] RAISES rather than returning nil, so a
+        // badly named file would kill the process instead of costing a sound.
+        NSString* p = [[NSFileManager defaultManager]
+            stringWithFileSystemRepresentation:path.c_str()
+                                        length:path.size()];
+        if (!p) {
+            error = "audio: " + path + " is not a usable path";
+            return clip;
+        }
         NSURL* url = [NSURL fileURLWithPath:p];
         ExtAudioFileRef file = nullptr;
         if (ExtAudioFileOpenURL((__bridge CFURLRef)url, &file) != noErr || !file) {
@@ -56,9 +67,17 @@ audio::Clip DecodeAudioFile(const std::string& path, std::string& error) {
         size = sizeof(frames);
         ExtAudioFileGetProperty(file, kExtAudioFileProperty_FileLengthFrames, &size,
                                 &frames);
-        if (frames <= 0 || frames > 200000000) {
+        // Bounded in BYTES, not frames. The resize below is frames * channels *
+        // 4, and channels is whatever the file's header claims -- so a frame
+        // count that looks reasonable on its own is 6.4 GB at eight channels,
+        // allocated up front, from a number read straight out of an untrusted
+        // header before a single sample has been decoded.
+        constexpr SInt64 kMaxBytes = 2ll << 30;  // 2 GiB of decoded float
+        const SInt64 bytes = frames * SInt64(channels) * 4;
+        if (frames <= 0 || bytes > kMaxBytes) {
             error = "audio: " + path + " reports " + std::to_string(frames) +
-                    " frames, which is nothing or far too much to hold";
+                    " frames of " + std::to_string(channels) +
+                    " channels, which is nothing or far too much to hold";
             ExtAudioFileDispose(file);
             return clip;
         }

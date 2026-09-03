@@ -7,10 +7,12 @@ package(default_visibility = ["//visibility:public"])
 cc_library(
     name = "physics",
     srcs = [
+        "bvh.cc",
         "character.cc",
         "physics.cc",
     ],
     hdrs = [
+        "bvh.h",
         "character.h",
         "physics.h",
     ],
@@ -25,5 +27,11 @@ cc_library(
 cc_test(
     name = "physics_test",
     srcs = ["physics_test.cc"],
+    deps = [":physics"],
+)
+
+cc_test(
+    name = "bvh_test",
+    srcs = ["bvh_test.cc"],
     deps = [":physics"],
 )

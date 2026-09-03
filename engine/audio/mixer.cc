@@ -38,9 +38,11 @@ struct Mixer::Voice {
     float pan = 0.0f;
 
     // The gains actually applied, which chase the targets. See kRampSeconds.
+    // Both start at ZERO, which is what ramps a new voice up from silence: a
+    // voice that began at its full gain would click at its own first sample.
+    // There is no separate "primed" step; the initialiser is the whole of it.
     float left = 0.0f, right = 0.0f;
     float target_left = 0.0f, target_right = 0.0f;
-    bool primed = false;
 };
 
 Mixer::Mixer(int sample_rate, int max_voices)
@@ -83,7 +85,6 @@ void Mixer::SetListener(Vec3 position, Vec3 forward, Vec3 up) {
     if (Dot(r, r) < 1e-8f) r = Cross(f, Vec3{1.0f, 0.0f, 0.0f});
     if (Dot(r, r) < 1e-8f) r = Vec3{1.0f, 0.0f, 0.0f};
     listener_right_ = Normalize(r);
-    listener_forward_ = f;
 }
 
 VoiceId Mixer::Play(const PlayDesc& d) {
@@ -112,7 +113,14 @@ VoiceId Mixer::Play(const PlayDesc& d) {
     v.pan = std::clamp(d.pan, -1.0f, 1.0f);
     // The clip's rate against the device's IS the resampling. A 44.1 kHz clip
     // played on a 48 kHz device without this is a semitone sharp and 9% short.
-    v.step = double(d.clip->rate) / double(rate_) * double(std::max(0.01f, d.pitch));
+    //
+    // Clamped at BOTH ends. The floor stops a zero or negative pitch freezing
+    // the cursor in place; the ceiling of five octaves is not about safety --
+    // the wrap below is a remainder and survives any step -- but about the fact
+    // that a step of a million is inaudible garbage that still costs a full
+    // block of mixing.
+    v.step = double(d.clip->rate) / double(rate_) *
+             double(std::clamp(d.pitch, 0.01f, 32.0f));
     v.generation = next_generation_++;
     if (next_generation_ > 0xFFFFu) next_generation_ = 1;
     return VoiceId{(v.generation << 16) | std::uint32_t(slot)};
@@ -183,18 +191,22 @@ void Mixer::Render(float* out, int frames) {
         v.target_left = amplitude * std::cos(angle) * master_;
         v.target_right = amplitude * std::sin(angle) * master_;
         if (v.stopping) { v.target_left = 0.0f; v.target_right = 0.0f; }
-        // A voice starting is ramped up from silence like any other change; a
-        // voice that began at full gain would click at its own first sample.
-        if (!v.primed) { v.primed = true; }
 
         for (int i = 0; i < frames; ++i) {
             if (v.cursor >= double(clip_frames)) {
                 if (!v.loop) { v.active = false; break; }
-                // Wrapped by SUBTRACTION, not reset to zero: the cursor is
+                // Wrapped by REMAINDER, not reset to zero: the cursor is
                 // fractional, and dropping the fraction at every loop point
                 // shortens the clip by up to a sample each time round and
                 // makes the seam audible.
-                v.cursor -= double(clip_frames);
+                //
+                // And a remainder rather than one subtraction, which is what
+                // this was: a step LONGER than the clip -- a very short sound
+                // at a high pitch -- leaves the cursor still past the end after
+                // subtracting once, and `i0` below then indexes off the end of
+                // the sample vector, further every frame because the single
+                // subtraction never catches up.
+                v.cursor = std::fmod(v.cursor, double(clip_frames));
             }
 
             const std::size_t i0 = std::size_t(v.cursor);
@@ -223,7 +235,14 @@ void Mixer::Render(float* out, int frames) {
 
         // A stopping voice is freed only once it has actually faded, or the
         // fade never happens.
-        if (v.stopping && v.left < 1e-4f && v.right < 1e-4f) v.active = false;
+        //
+        // MAGNITUDE, not value. A gain can legitimately be negative -- an
+        // inverted master, a phase-flipped channel -- and `v.left < 1e-4f` is
+        // satisfied by every negative number, so the voice would be freed at
+        // full amplitude on the first block instead of fading, producing
+        // exactly the click the ramp exists to prevent.
+        if (v.stopping && std::fabs(v.left) < 1e-4f && std::fabs(v.right) < 1e-4f)
+            v.active = false;
         if (!v.active) v.generation = 0;
     }
 

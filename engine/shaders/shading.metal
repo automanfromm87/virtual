@@ -264,7 +264,17 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
                                   constant GpuCascades& cascades,
                                   depth2d<float> shadowMap,
                                   depth2d<float> shadowAtlas,
-                                  sampler smp)
+                                  sampler smp,
+                                  // The environment probe. OPTIONAL, and checked
+                                  // with is_null_texture rather than with a flag
+                                  // in the uniforms: a flag can disagree with
+                                  // what was actually bound, and the failure
+                                  // when it does is sampling an unbound texture,
+                                  // which is undefined rather than merely wrong.
+                                  texturecube<float> irradianceMap,
+                                  texturecube<float> specularMap,
+                                  texture2d<float> brdfLut,
+                                  sampler envSmp)
 {
     // Renormalize per fragment: interpolating unit vectors across a triangle
     // does not preserve length, and the error is worst mid-face.
@@ -367,8 +377,40 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
         f0amb + (max(float3(1.0f - roughness), f0amb) - f0amb) *
                     pow(1.0f - NdotVamb, 5.0f);
 
-    const float3 ambient =
+    float3 ambient =
         albedo * (1.0f - metallic) * skyAtN * (1.0f - Famb) + skyAtR * Famb;
+
+    // ...AND THE REAL THING, when a probe is bound. Same two halves, same
+    // Fresnel split; the only change is where the incoming radiance comes from.
+    //
+    // DIFFUSE reads the irradiance map along the normal. That map already
+    // contains the cosine-weighted integral over the hemisphere, so there is no
+    // further cosine here -- applying one is the most common mistake with an
+    // irradiance probe and it makes everything about 40% too dark in a way that
+    // looks like a lighting choice.
+    //
+    // SPECULAR is Karis's split sum: the prefiltered environment at a mip
+    // chosen by roughness, times a two-term polynomial in F0 read out of the
+    // BRDF table. The table's two channels are a SCALE and a BIAS on F0, which
+    // is what lets one table serve every material -- Schlick's Fresnel is
+    // linear in F0, so the integral splits along that line exactly.
+    if (!is_null_texture(irradianceMap) && !is_null_texture(brdfLut)) {
+        const float3 irradiance = irradianceMap.sample(envSmp, N).rgb;
+
+        // LINEAR in roughness, matching the way the prefilter assigned
+        // roughness to mips. A perceptual curve on one side and not the other
+        // gives reflections that are sharp or blurry at the wrong roughness,
+        // and nothing about the picture says which end is wrong.
+        const float mips = max(u.lighting.y, 1.0f);
+        const float lod = saturate(roughness) * (mips - 1.0f);
+        const float3 prefiltered = specularMap.sample(envSmp, R, level(lod)).rgb;
+        const float2 ab = brdfLut.sample(envSmp, float2(NdotVamb, saturate(roughness))).xy;
+
+        // The energy NOT taken by the specular lobe is what is left for the
+        // diffuse one, and a metal has no diffuse lobe at all.
+        const float3 kD = (float3(1.0f) - Famb) * (1.0f - metallic);
+        ambient = kD * albedo * irradiance + prefiltered * (f0amb * ab.x + ab.y);
+    }
 
     // LINEAR HDR out, un-tone-mapped and un-gamma-corrected. The scene target
     // is half-float and the composite does both at the end.

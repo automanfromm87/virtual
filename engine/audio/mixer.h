@@ -11,6 +11,7 @@
 // produce dropouts; engine/audio/engine.h owns the queue that avoids that.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -67,7 +68,10 @@ class Mixer {
     // Where the listener is and which way it faces. `forward` and `up` need not
     // be normalised or exactly perpendicular.
     void SetListener(Vec3 position, Vec3 forward, Vec3 up);
-    void SetMasterGain(float g) { master_ = g; }
+    // Clamped to >= 0, like SetGain. A negative master is not a quieter mix, it
+    // is an inverted one -- and it defeats the fade-out test in Render, which
+    // asks whether a gain has reached zero.
+    void SetMasterGain(float g) { master_ = std::max(0.0f, g); }
 
     // Renders `frames` of INTERLEAVED STEREO into `out`, which must hold
     // frames * 2 floats. Adds nothing: the buffer is overwritten.
@@ -95,8 +99,10 @@ class Mixer {
     float peak_ = 0.0f;
     float master_ = 1.0f;
     Vec3 listener_{0.0f, 0.0f, 0.0f};
+    // The listener's RIGHT is the only part of its orientation the pan needs --
+    // the forward it was derived from is not stored, because storing a vector
+    // nothing reads implies a front/back attenuation that does not exist.
     Vec3 listener_right_{1.0f, 0.0f, 0.0f};
-    Vec3 listener_forward_{0.0f, 0.0f, -1.0f};
 };
 
 }  // namespace eng::audio

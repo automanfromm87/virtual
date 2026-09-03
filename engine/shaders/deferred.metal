@@ -78,7 +78,11 @@ fragment float4 fs_deferred(FullscreenOut in [[stage_in]],
                             depth2d<float>   shadowMap   [[texture(2)]],
                             depth2d<float>   shadowAtlas [[texture(3)]],
                             depth2d<float>   sceneDepth  [[texture(4)]],
-                            sampler          smp         [[sampler(0)]])
+                            texturecube<float> irradianceMap [[texture(5)]],
+                            texturecube<float> specularMap   [[texture(6)]],
+                            texture2d<float>   brdfLut       [[texture(7)]],
+                            sampler          smp         [[sampler(0)]],
+                            sampler          envSmp      [[sampler(1)]])
 {
     const float depth = sceneDepth.sample(smp, in.uv);
     // Reversed-Z: 0 is the far plane, and it is what an untouched pixel holds.
@@ -110,6 +114,7 @@ fragment float4 fs_deferred(FullscreenOut in [[stage_in]],
     const float3 lit =
         ShadeSurface(worldPos, nm.xyz, ar.rgb, ar.a, nm.a,
                      u.lightViewProj * float4(worldPos, 1.0f), u, lights,
-                     cascades, shadowMap, shadowAtlas, smp);
+                     cascades, shadowMap, shadowAtlas, smp,
+                     irradianceMap, specularMap, brdfLut, envSmp);
     return float4(lit, 1.0f);
 }

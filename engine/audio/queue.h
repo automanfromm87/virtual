@@ -61,12 +61,23 @@ class SpscQueue {
     [[nodiscard]] static constexpr std::size_t Capacity() { return kCapacity - 1; }
 
   private:
+    // A cache line. Not std::hardware_destructive_interference_size, which is
+    // a constant the compiler bakes in and which libc++ still does not define;
+    // 64 is right on Apple Silicon and on x86-64 both.
+    static constexpr std::size_t kLine = 64;
+
     // One slot is always left empty, which is what makes full and empty
     // distinguishable without a third variable that both threads would have to
     // agree on.
-    std::array<T, kCapacity> slots_{};
-    std::atomic<std::size_t> head_{0};
-    std::atomic<std::size_t> tail_{0};
+    alignas(kLine) std::array<T, kCapacity> slots_{};
+    // EACH INDEX ON ITS OWN LINE. Written 8 bytes apart -- which is what
+    // declaring them adjacently gives -- the producer's store to head_ dirties
+    // the line holding tail_, and the audio thread's next load of either goes
+    // through a coherence miss. That is a stall on the one thread with a hard
+    // deadline, and it is exactly the cost this file's header argues a mutex
+    // would impose. A few hundred bytes of padding on a ~49 KB object.
+    alignas(kLine) std::atomic<std::size_t> head_{0};
+    alignas(kLine) std::atomic<std::size_t> tail_{0};
 };
 
 }  // namespace eng::audio

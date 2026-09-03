@@ -6,11 +6,22 @@ package(default_visibility = ["//visibility:public"])
 # Everything else in the engine may depend on this; it depends on nothing.
 cc_library(
     name = "core",
-    hdrs = ["math.h"],
+    srcs = ["jobs.cc"],
+    hdrs = [
+        "jobs.h",
+        "math.h",
+    ],
+    linkopts = ["-lpthread"],
 )
 
 cc_test(
     name = "math_test",
     srcs = ["math_test.cc"],
+    deps = [":core"],
+)
+
+cc_test(
+    name = "jobs_test",
+    srcs = ["jobs_test.cc"],
     deps = [":core"],
 )

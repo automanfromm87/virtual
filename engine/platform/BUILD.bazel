@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "objc_library")
+load("@rules_cc//cc:defs.bzl", "cc_test", "objc_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -11,14 +11,10 @@ package(default_visibility = ["//visibility:public"])
 objc_library(
     name = "platform",
     srcs = [
-        "audio_file.mm",
-        "audio_out.mm",
         "font.mm",
         "window.mm",
     ],
     hdrs = [
-        "audio_file.h",
-        "audio_out.h",
         "font.h",
         "window.h",
     ],
@@ -35,11 +31,64 @@ objc_library(
         "CoreText",
         "-framework",
         "CoreGraphics",
-        # AudioToolbox is both the speaker and the decoder for every
-        # compressed format the OS knows.
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+)
+
+# The speaker, split out and DEPENDENCY-FREE. It is here rather than in
+# engine/audio because it is the OS's, and it is not in :platform because a
+# target that opens a window has no business linking an audio unit.
+objc_library(
+    name = "audio_out",
+    srcs = ["audio_out.mm"],
+    hdrs = ["audio_out.h"],
+    linkopts = [
         "-framework",
         "AudioToolbox",
+        "-framework",
+        "Foundation",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+)
+
+# The decoder, and the ONE piece of the platform layer that knows an engine
+# type: it returns an audio::Clip. Split out for exactly that reason -- folding
+# it into :platform would make every target that draws text link the mixer, and
+# would tangle the two packages, since //engine/audio:system depends back on
+# this one.
+objc_library(
+    name = "audio_file",
+    srcs = ["audio_file.mm"],
+    hdrs = ["audio_file.h"],
+    linkopts = [
+        "-framework",
+        "AudioToolbox",
+        "-framework",
+        "Foundation",
     ],
     deps = ["//engine/audio"],
     target_compatible_with = ["@platforms//os:macos"],
+)
+
+# Controllers, through GameController. A separate target because a gamepad is
+# not attached to a window: a headless tool that reads one should not have to
+# link AppKit, and :platform should not grow a framework for a device it does
+# not own.
+objc_library(
+    name = "gamepad",
+    srcs = ["gamepad.mm"],
+    hdrs = ["gamepad.h"],
+    linkopts = [
+        "-framework",
+        "GameController",
+        "-framework",
+        "Foundation",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+)
+
+cc_test(
+    name = "gamepad_test",
+    srcs = ["gamepad_test.cc"],
+    deps = [":gamepad"],
 )

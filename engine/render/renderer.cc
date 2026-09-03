@@ -174,6 +174,10 @@ struct DrawItem {
 };
 
 struct Renderer::Impl {
+    // The environment probe, or an all-null set when there is none. Binding a
+    // null texture is legal and is what the shader's is_null_texture check
+    // reads, so there is no separate "enabled" flag to fall out of step.
+    EnvironmentBindings env;
     rhi::Device* dev = nullptr;
     // The format of whatever the LAST pass writes into: a drawable, or an
     // offscreen target a test reads back.
@@ -1248,7 +1252,8 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
         u.eyePos = Vec4{scene.camera.eye.x, scene.camera.eye.y,
                         scene.camera.eye.z, 1.0f};
         u.invViewProj = inv_view_proj;
-        u.lighting = Vec4{float(light_count), 0.0f, 0.0f, 0.0f};
+        u.lighting = Vec4{float(light_count),
+                          float(env.specular_mips), 0.0f, 0.0f};
         u.ambientSky = Vec4{scene.ambientSky.x, scene.ambientSky.y,
                             scene.ambientSky.z, 0.0f};
         u.ambientGround = Vec4{scene.ambientGround.x, scene.ambientGround.y,
@@ -1271,6 +1276,13 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
         enc.SetFragmentTexture(
             Valid(shadow_atlas) ? shadow_atlas : dummy_shadow, 3);
         enc.SetFragmentSampler(sampler, 0);
+        // The environment probe. All three may be null handles, which binds
+        // nothing -- and nothing is exactly what the shader's is_null_texture
+        // check is looking for.
+        enc.SetFragmentTexture(env.irradiance, 5);
+        enc.SetFragmentTexture(env.specular, 6);
+        enc.SetFragmentTexture(env.brdf_lut, 7);
+        enc.SetFragmentSampler(env.cube_sampler, 1);
         if (skinned) {
             enc.SetVertexBuffer(gm.skin_vb, 0, kSkinSlot);
             enc.SetVertexBuffer(palettes, palette_offset, kPaletteSlot);
@@ -1371,7 +1383,8 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
     u.surface = Vec4{1.0f, 0.0f, shadows ? 1.0f : 0.0f, 1e30f};
     u.eyePos = Vec4{scene.camera.eye.x, scene.camera.eye.y, scene.camera.eye.z,
                     1.0f};
-    u.lighting = Vec4{float(light_count), 0.0f, 0.0f, 0.0f};
+    u.lighting = Vec4{float(light_count),
+                      float(impl_->env.specular_mips), 0.0f, 0.0f};
     u.ambientSky = Vec4{scene.ambientSky.x, scene.ambientSky.y,
                         scene.ambientSky.z, 0.0f};
     u.ambientGround = Vec4{scene.ambientGround.x, scene.ambientGround.y,
@@ -1393,6 +1406,13 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
         Valid(impl_->shadow_atlas) ? impl_->shadow_atlas : impl_->dummy_shadow, 3);
     enc.SetFragmentTexture(depth, 4);
     enc.SetFragmentSampler(impl_->sampler, 0);
+    // The environment probe. All three may be null handles, which binds
+    // nothing -- and nothing is exactly what the shader's is_null_texture
+    // check is looking for.
+    enc.SetFragmentTexture(impl_->env.irradiance, 5);
+    enc.SetFragmentTexture(impl_->env.specular, 6);
+    enc.SetFragmentTexture(impl_->env.brdf_lut, 7);
+    enc.SetFragmentSampler(impl_->env.cube_sampler, 1);
     enc.Draw(3);
 }
 
@@ -1583,7 +1603,8 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
                          scene.clipY};
         u.eyePos = Vec4{scene.camera.eye.x, scene.camera.eye.y, scene.camera.eye.z,
                         1.0f};
-        u.lighting = Vec4{float(light_count), 0.0f, 0.0f, 0.0f};
+        u.lighting = Vec4{float(light_count),
+                          float(impl_->env.specular_mips), 0.0f, 0.0f};
         u.ambientSky = Vec4{scene.ambientSky.x, scene.ambientSky.y,
                             scene.ambientSky.z, 0.0f};
         u.ambientGround = Vec4{scene.ambientGround.x, scene.ambientGround.y,
@@ -1605,6 +1626,13 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
         enc.SetFragmentTexture(
             Valid(impl_->shadow_atlas) ? impl_->shadow_atlas : impl_->dummy_shadow, 3);
         enc.SetFragmentSampler(impl_->sampler, 0);
+        // The environment probe. All three may be null handles, which binds
+        // nothing -- and nothing is exactly what the shader's is_null_texture
+        // check is looking for.
+        enc.SetFragmentTexture(impl_->env.irradiance, 5);
+        enc.SetFragmentTexture(impl_->env.specular, 6);
+        enc.SetFragmentTexture(impl_->env.brdf_lut, 7);
+        enc.SetFragmentSampler(impl_->env.cube_sampler, 1);
         enc.DrawIndexedIndirectU16(gm.ib, b.args, 0);
         ++impl_->stats.draws;
         ++impl_->stats.pipeline_switches;
@@ -1966,5 +1994,9 @@ Image RenderTriangleOffscreen(int width, int height, std::string& error) {
                                r.DrawTriangle(e, width, height);
                            });
 }
+
+void Renderer::SetEnvironment(const EnvironmentBindings& e) { impl_->env = e; }
+void Renderer::ClearEnvironment() { impl_->env = EnvironmentBindings{}; }
+bool Renderer::HasEnvironment() const { return impl_->env.Valid(); }
 
 }  // namespace eng

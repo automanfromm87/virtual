@@ -31,15 +31,36 @@ bool RenderGraph::Compile(std::string& error) {
     // Rejecting is the honest behaviour.
     std::unordered_map<std::uint32_t, int> producer;
     for (int i = 0; i < n; ++i) {
-        // A pass must write SOMEWHERE. Colour is the usual answer; a
-        // depth-only shadow pass writes depth instead.
-        if (!Valid(passes_[i].color)) {
-            if (!Valid(passes_[i].depth)) {
-                error = "pass '" + passes_[i].name +
-                        "' writes neither colour nor depth";
+        if (passes_[i].execute && passes_[i].compute) {
+            error = "pass '" + passes_[i].name +
+                    "' has both a render body and a compute body; it is one or "
+                    "the other, and running one would silently drop the other";
+            return false;
+        }
+        // Anything named in `writes` produces that texture, whatever kind of
+        // pass it is. Entered first so a compute pass with no attachments is
+        // still a producer.
+        for (const rhi::TextureId& w : passes_[i].writes) {
+            if (!Valid(w)) continue;
+            auto [wit, wok] = producer.emplace(w.v, i);
+            if (!wok) {
+                error = "passes '" + passes_[wit->second].name + "' and '" +
+                        passes_[i].name + "' both write the same texture";
                 return false;
             }
-            continue;  // depth-only: nothing to enter in the colour producer map
+        }
+        // A pass must write SOMEWHERE. Colour is the usual answer; a
+        // depth-only shadow pass writes depth instead, and a compute pass
+        // writes whatever it declared.
+        if (!Valid(passes_[i].color)) {
+            if (!Valid(passes_[i].depth) && passes_[i].writes.empty()) {
+                error = "pass '" + passes_[i].name +
+                        "' writes neither colour nor depth nor any declared "
+                        "texture, so nothing can depend on it and it would run "
+                        "in an arbitrary place";
+                return false;
+            }
+            continue;  // nothing more to enter in the colour producer map
         }
         auto [it, inserted] = producer.emplace(passes_[i].color.v, i);
         if (!inserted) {
@@ -160,7 +181,15 @@ bool RenderGraph::Compile(std::string& error) {
 void RenderGraph::Execute(rhi::Device& dev) {
     for (int i : order_) {
         const Pass& p = passes_[i];
+        if (p.compute) {
+            rhi::ComputeEncoder enc = dev.BeginCompute(p.timer);
+            p.compute(enc);
+            dev.EndCompute();
+            continue;
+        }
+
         rhi::PassDesc desc;
+        desc.timer = p.timer;
         desc.color = p.color;
         desc.resolve = p.resolve;
         desc.extra_colors = p.extra_colors;

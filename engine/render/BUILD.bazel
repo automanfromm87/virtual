@@ -9,12 +9,14 @@ cc_library(
     name = "render",
     srcs = [
         "fluid.cc",
+        "ibl.cc",
         "particles.cc",
         "rendergraph.cc",
         "renderer.cc",
     ],
     hdrs = [
         "fluid.h",
+        "ibl.h",
         "particles.h",
         "rendergraph.h",
         "renderer.h",

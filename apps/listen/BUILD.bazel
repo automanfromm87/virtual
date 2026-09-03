@@ -7,6 +7,6 @@ cc_binary(
     srcs = ["listen.cpp"],
     deps = [
         "//engine/audio:system",
-        "//engine/platform",
+        "//engine/platform:audio_file",
     ],
 )

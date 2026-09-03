@@ -36,6 +36,16 @@ int main(int argc, char** argv) {
     std::printf("%s\n  %d channels, %d Hz, %.2f seconds\n", path.c_str(),
                 music.channels, music.rate, music.Seconds());
 
+    // A short blip, synthesised rather than loaded: it needs no asset and its
+    // frequency is known, which makes it the thing to move around.
+    //
+    // DECLARED BEFORE THE SYSTEM, like `music` above. Locals destruct in
+    // reverse order, so this is what puts the device's teardown ahead of the
+    // samples it was reading; the other order frees them under a live audio
+    // callback. The blips are the ones that matter -- they are never stopped,
+    // so one triggered near the end is still playing at the return.
+    eng::audio::Clip blip;
+
     auto audio = eng::audio::AudioSystem::Create(error);
     if (!audio) {
         std::fprintf(stderr, "FAIL: %s\n", error.c_str());
@@ -43,9 +53,6 @@ int main(int argc, char** argv) {
     }
     std::printf("  device running at %d Hz\n", audio->SampleRate());
 
-    // A short blip, synthesised rather than loaded: it needs no asset and its
-    // frequency is known, which makes it the thing to move around.
-    eng::audio::Clip blip;
     blip.rate = audio->SampleRate();
     blip.channels = 1;
     {
@@ -67,7 +74,7 @@ int main(int argc, char** argv) {
     m.clip = &music;
     m.gain = 1.4f;  // the track's rms is 0.06; it is a quiet master
     m.loop = true;
-    const eng::audio::Sound song = audio->Play(m);
+    (void)audio->Play(m);
     std::printf("  playing, and a blip orbits the listener once every 4 s\n"
                 "  (ctrl-c to stop)\n");
 
@@ -108,7 +115,10 @@ int main(int argc, char** argv) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
     }
-    audio->Stop(song);
+    // EVERYTHING, not just the song: the orbiting blips were never stopped and
+    // one of them is always mid-flight here. The sleep is what lets the 5 ms
+    // fade actually happen before the device goes away.
+    audio->StopAll();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     std::printf("\n  dropped commands: %d\n", audio->DroppedCommands());
     return 0;

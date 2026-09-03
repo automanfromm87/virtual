@@ -3,15 +3,12 @@ load("@rules_cc//cc:defs.bzl", "cc_binary")
 package(default_visibility = ["//visibility:public"])
 
 cc_binary(
-    name = "iso",
-    srcs = ["iso.cpp"],
+    name = "sky",
+    srcs = ["viewer.cpp"],
     deps = [
         "//engine/app",
-        "//engine/audio:system",
         "//engine/geometry",
-        "//engine/physics",
         "//engine/platform",
-        "//engine/platform:audio_file",
         "//engine/render",
         "//engine/text:ui",
     ],
