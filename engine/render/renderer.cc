@@ -137,10 +137,28 @@ std::string ShadingSource(const char* body) {
 
 // One entry of the mesh registry: the GPU buffers plus the CPU-side bounds
 // that frustum culling needs.
+// The most levels of detail one mesh may carry. Four is not a compromise: each
+// level covers roughly a quarter of the screen area of the one before, so four
+// spans a factor of sixteen in distance, and past that the object is a handful
+// of pixels and the next thing to do is not draw it.
+constexpr int kMaxLods = 4;
+
 struct GpuMesh {
     rhi::BufferId vb;
     rhi::BufferId ib;
     std::size_t index_count = 0;
+    // ADDITIONAL levels, coarsest last. Level 0 is `vb`/`ib` above rather than
+    // lods[0], so every existing path -- the forward draw, the shadow pass,
+    // skinning, the ray tracing build -- keeps working untouched and only the
+    // GPU-driven path knows levels exist.
+    struct Lod {
+        rhi::BufferId vb;
+        rhi::BufferId ib;
+        std::size_t index_count = 0;
+        std::size_t vertex_count = 0;
+    };
+    Lod lods[kMaxLods];
+    int lod_count = 1;
     // Needed by compute skinning, which dispatches one thread per VERTEX while
     // every draw path counts indices.
     std::size_t vertex_count = 0;
@@ -187,6 +205,20 @@ struct DrawItem {
 };
 
 struct Renderer::Impl {
+    // --- occlusion and levels of detail ---------------------------------------
+    rhi::TextureId hiz;
+    int hiz_width = 0, hiz_height = 0, hiz_mips = 1;
+    std::vector<rhi::TextureId> hiz_views;
+    rhi::ComputePipelineId hiz_copy, hiz_reduce;
+    bool hiz_tried = false;
+    // Which frame the pyramid was last filled on. The cull refuses to use one
+    // from an earlier frame: it was built for a different camera.
+    std::uint64_t hiz_built_frame = ~0ull;
+    bool occlusion_enabled = true;
+    // Screen radius in pixels at which each level takes over. Level 0 above
+    // 60 px, then 24, then 9 -- roughly halving the linear size each step,
+    // which is quartering the area.
+    Vec3 lod_thresholds{60.0f, 24.0f, 9.0f};
     ColorGrade grade;
     rhi::BufferId exposure;
     // A one-float buffer holding 1.0, bound when the caller supplied no
@@ -556,8 +588,52 @@ MeshHandle Renderer::UploadMesh(const Mesh& mesh) {
     gm.index_count = mesh.indices.size();
     gm.vertex_count = mesh.vertices.size();
     gm.bounds = mesh.bounds;
+    gm.lods[0].vb = gm.vb;
+    gm.lods[0].ib = gm.ib;
+    gm.lods[0].index_count = gm.index_count;
+    gm.lods[0].vertex_count = gm.vertex_count;
+    gm.lod_count = 1;
     impl_->meshes.push_back(gm);
     return MeshHandle{std::uint32_t(impl_->meshes.size() - 1)};
+}
+
+MeshHandle Renderer::UploadMeshLods(std::span<const Mesh> levels) {
+    if (levels.empty()) return {};
+    const MeshHandle h = UploadMesh(levels[0]);
+    if (!Valid(h)) return {};
+    GpuMesh& gm = impl_->meshes[h.v];
+    const int count = std::min(int(levels.size()), kMaxLods);
+    for (int i = 1; i < count; ++i) {
+        const Mesh& m = levels[std::size_t(i)];
+        if (m.vertices.empty() || m.indices.empty()) break;
+        GpuMesh::Lod lod;
+        lod.vb = impl_->dev->CreateBuffer(m.vertices.data(),
+                                          m.vertices.size() * sizeof(VertexIn));
+        lod.ib = impl_->dev->CreateBuffer(m.indices.data(),
+                                          m.indices.size() * sizeof(std::uint16_t));
+        // A level that fails to allocate TRUNCATES the chain rather than
+        // leaving a hole. A null buffer in the middle would be selected by the
+        // cull pass and drawn as nothing, so the object would vanish at one
+        // distance and come back at the next.
+        if (!Valid(lod.vb) || !Valid(lod.ib)) break;
+        lod.index_count = m.indices.size();
+        lod.vertex_count = m.vertices.size();
+        gm.lods[i] = lod;
+        gm.lod_count = i + 1;
+    }
+    return h;
+}
+
+int Renderer::MeshLodCount(MeshHandle m) const {
+    if (!Valid(m) || m.v >= impl_->meshes.size()) return 0;
+    return impl_->meshes[m.v].lod_count;
+}
+
+int Renderer::MeshLodIndexCount(MeshHandle m, int lod) const {
+    if (!Valid(m) || m.v >= impl_->meshes.size()) return 0;
+    const GpuMesh& gm = impl_->meshes[m.v];
+    if (lod < 0 || lod >= gm.lod_count) return 0;
+    return int(gm.lods[lod].index_count);
 }
 
 MeshHandle Renderer::UploadSkinnedMesh(const Mesh& mesh,
@@ -1358,6 +1434,78 @@ void Renderer::DrawTriangle(rhi::Encoder& enc, int width, int height) {
     enc.Draw(3);
 }
 
+void Renderer::BuildHiZ(rhi::ComputeEncoder& enc, rhi::TextureId depth, int width,
+                        int height) {
+    Impl& im = *impl_;
+    if (!Valid(depth) || width <= 0 || height <= 0) return;
+    if (!im.hiz_tried) {
+        im.hiz_tried = true;
+        std::string err;
+        im.hiz_copy = im.dev->CreateComputePipeline(ShaderSource(kCullSrc),
+                                                    "cs_hiz_copy", err);
+        im.hiz_reduce = im.dev->CreateComputePipeline(ShaderSource(kCullSrc),
+                                                      "cs_hiz_reduce", err);
+        if (!im.cull_error.empty() || (!Valid(im.hiz_copy) && im.cull_error.empty()))
+            im.cull_error = err;
+    }
+    if (!Valid(im.hiz_copy) || !Valid(im.hiz_reduce)) return;
+
+    if (width != im.hiz_width || height != im.hiz_height || !Valid(im.hiz)) {
+        for (rhi::TextureId v : im.hiz_views)
+            if (Valid(v)) im.dev->DestroyTexture(v);
+        im.hiz_views.clear();
+        if (Valid(im.hiz)) im.dev->DestroyTexture(im.hiz);
+        int mips = 1;
+        for (int w = width, h = height; w > 1 || h > 1; ++mips) {
+            w = std::max(w / 2, 1);
+            h = std::max(h / 2, 1);
+        }
+        // R32Float, not the depth format: a depth texture cannot be bound for
+        // shader writes, and the pyramid is written by compute at every level.
+        im.hiz = im.dev->CreateStorageTexture2D(width, height,
+                                                rhi::Format::RGBA16Float, mips);
+        if (!Valid(im.hiz)) return;
+        im.hiz_width = width;
+        im.hiz_height = height;
+        im.hiz_mips = mips;
+        for (int m = 0; m < mips; ++m)
+            im.hiz_views.push_back(im.dev->CreateMipView(im.hiz, m));
+    }
+
+    EngUVec4 size{};
+    size.x = std::uint32_t(width);
+    size.y = std::uint32_t(height);
+    enc.SetPipeline(im.hiz_copy);
+    enc.SetTexture(depth, 0);
+    enc.SetTexture(im.hiz_views[0], 1);
+    enc.SetBytes(&size, sizeof(size), 0);
+    enc.Dispatch2D(width, height);
+
+    int sw = width, sh = height;
+    for (int m = 1; m < im.hiz_mips; ++m) {
+        const int dw = std::max(sw / 2, 1), dh = std::max(sh / 2, 1);
+        EngUVec4 s2{};
+        s2.x = std::uint32_t(dw);
+        s2.y = std::uint32_t(dh);
+        s2.z = std::uint32_t(sw);
+        s2.w = std::uint32_t(sh);
+        enc.SetPipeline(im.hiz_reduce);
+        enc.SetTexture(im.hiz_views[std::size_t(m - 1)], 0);
+        enc.SetTexture(im.hiz_views[std::size_t(m)], 1);
+        enc.SetBytes(&s2, sizeof(s2), 0);
+        enc.Dispatch2D(dw, dh);
+        sw = dw;
+        sh = dh;
+    }
+    im.hiz_built_frame = im.dev->FrameIndex();
+}
+
+void Renderer::SetOcclusionCulling(bool on) { impl_->occlusion_enabled = on; }
+bool Renderer::OcclusionCulling() const { return impl_->occlusion_enabled; }
+void Renderer::SetLodThresholds(Vec3 pixels) { impl_->lod_thresholds = pixels; }
+Vec3 Renderer::LodThresholds() const { return impl_->lod_thresholds; }
+rhi::TextureId Renderer::HiZ() const { return impl_->hiz; }
+
 void Renderer::SetGrade(const ColorGrade& g) { impl_->grade = g; }
 const ColorGrade& Renderer::Grade() const { return impl_->grade; }
 void Renderer::SetExposureBuffer(rhi::BufferId b) { impl_->exposure = b; }
@@ -1480,7 +1628,35 @@ int Renderer::VisibleAfterCull() const {
     for (int i = 0; i < impl_->live_batches; ++i) {
         const auto* args = static_cast<const GpuDrawArgs*>(
             impl_->dev->MapBuffer(impl_->batches[std::size_t(i)].args));
-        if (args) total += int(args->instance_count);
+        if (!args) continue;
+        // EVERY LEVEL. Reading only the first would report a scene that had all
+        // gone to level 2 as entirely culled, which is a very convincing way to
+        // conclude the frustum test is broken.
+        for (int l = 0; l < kMaxLods; ++l) total += int(args[l].instance_count);
+    }
+    return total;
+}
+
+int Renderer::VisibleAtLod(int lod) const {
+    if (lod < 0 || lod >= kMaxLods) return 0;
+    int total = 0;
+    for (int i = 0; i < impl_->live_batches; ++i) {
+        const auto* args = static_cast<const GpuDrawArgs*>(
+            impl_->dev->MapBuffer(impl_->batches[std::size_t(i)].args));
+        if (args) total += int(args[lod].instance_count);
+    }
+    return total;
+}
+
+long long Renderer::IndirectTriangles() const {
+    long long total = 0;
+    for (int i = 0; i < impl_->live_batches; ++i) {
+        const auto* args = static_cast<const GpuDrawArgs*>(
+            impl_->dev->MapBuffer(impl_->batches[std::size_t(i)].args));
+        if (!args) continue;
+        for (int l = 0; l < kMaxLods; ++l)
+            total += static_cast<long long>(args[l].instance_count) *
+                     static_cast<long long>(args[l].index_count) / 3;
     }
     return total;
 }
@@ -1534,15 +1710,35 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
 
     const Mat4 viewProj = scene.camera.ViewProj(float(width) / float(height));
     const Frustum frustum = Frustum::FromViewProj(viewProj);
+    const Vec3 lod_thresholds = impl_->lod_thresholds;
+    // Only when a pyramid was actually built this frame. A stale one from a
+    // different camera would cull things that are plainly visible, and the
+    // symptom -- objects missing near the edges of occluders -- looks like a
+    // frustum bug rather than a stale texture.
+    const bool use_occlusion = impl_->occlusion_enabled && Valid(impl_->hiz) &&
+                               impl_->hiz_built_frame == impl_->dev->FrameIndex();
     impl_->last_aspect = float(width) / float(height);
     impl_->inv_view_proj = Inverse(viewProj);
 
+    // Mirrors cull.metal's CullParams.
     struct CullParams {
+        Mat4 viewProj;
         Vec4 planes[6];
-        std::uint32_t instance_count = 0;
-        std::uint32_t index_count = 0;
-        std::uint32_t pad0 = 0, pad1 = 0;
+        Vec4 eye;
+        Vec4 screen;
+        Vec4 lod_px;
+        EngUVec4 counts;
+        EngUVec4 index_counts;
     };
+    static_assert(sizeof(CullParams) == 240, "CullParams layout drifted");
+
+    // PIXELS PER WORLD UNIT AT ONE METRE. The projected radius of a sphere of
+    // radius r at distance d is r * this / d, which is what the level choice
+    // and the occlusion footprint both need.
+    const float half_height =
+        scene.camera.projection == Projection::Orthographic
+            ? float(height) * 0.5f / std::max(scene.camera.orthoHeight, 1e-4f)
+            : float(height) * 0.5f / std::tan(scene.camera.fovY * 0.5f);
 
     for (std::size_t g = 0; g < groups.size(); ++g) {
         if (impl_->batches.size() <= g) impl_->batches.emplace_back();
@@ -1557,9 +1753,13 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
             // by one a frame would otherwise reallocate every frame forever.
             const std::size_t cap = std::max<std::size_t>(need * 2, 64);
             b.instances = impl_->dev->CreateDynamicBuffer(sizeof(GpuInstance) * cap);
-            b.visible = impl_->dev->CreateStorageBuffer(sizeof(GpuInstance) * cap);
-            b.counter = impl_->dev->CreateStorageBuffer(sizeof(std::uint32_t) * 4);
-            b.args = impl_->dev->CreateStorageBuffer(sizeof(GpuDrawArgs) * 2);
+            // ONE REGION PER LEVEL. An instance can land in any of them, so
+            // each has to be sized for the whole group -- there is no
+            // distribution to exploit, because the camera decides it.
+            b.visible =
+                impl_->dev->CreateStorageBuffer(sizeof(GpuInstance) * cap * kMaxLods);
+            b.counter = impl_->dev->CreateStorageBuffer(sizeof(std::uint32_t) * kMaxLods);
+            b.args = impl_->dev->CreateStorageBuffer(sizeof(GpuDrawArgs) * kMaxLods);
             b.capacity = cap;
             if (!Valid(b.instances) || !Valid(b.visible) || !Valid(b.counter) ||
                 !Valid(b.args))
@@ -1580,18 +1780,32 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
                                  gm.bounds.center.z, gm.bounds.radius};
         }
 
-        // The counter must start at zero EVERY frame. It is a storage buffer,
-        // so it holds last frame's total otherwise, and the draw would ask for
-        // twice as many instances as the buffer has.
+        // EVERY counter must start at zero. They are storage buffers, so they
+        // hold last frame's totals otherwise, and the draw would ask for twice
+        // as many instances as the buffer has.
         auto* zero = static_cast<std::uint32_t*>(impl_->dev->MapBuffer(b.counter));
-        if (zero) zero[0] = 0;
+        if (zero)
+            for (int l = 0; l < kMaxLods; ++l) zero[l] = 0;
 
-        CullParams params;
+        CullParams params{};
+        params.viewProj = viewProj;
         for (int i = 0; i < 6; ++i)
             params.planes[i] = Vec4{frustum.planes[i].n.x, frustum.planes[i].n.y,
                                     frustum.planes[i].n.z, frustum.planes[i].d};
-        params.instance_count = std::uint32_t(need);
-        params.index_count = std::uint32_t(gm.index_count);
+        params.eye = Vec4{scene.camera.eye.x, scene.camera.eye.y,
+                          scene.camera.eye.z, scene.camera.nearZ};
+        params.screen = Vec4{float(width), float(height), half_height,
+                             float(impl_->hiz_mips)};
+        params.lod_px = Vec4{lod_thresholds.x, lod_thresholds.y, lod_thresholds.z,
+                             0.0f};
+        params.counts.x = std::uint32_t(need);
+        params.counts.y = std::uint32_t(gm.lod_count);
+        params.counts.z = std::uint32_t(b.capacity);
+        params.counts.w = use_occlusion ? 1u : 0u;
+        std::uint32_t* index_counts = &params.index_counts.x;
+        for (int l = 0; l < kMaxLods; ++l)
+            index_counts[l] = std::uint32_t(
+                l < gm.lod_count ? gm.lods[l].index_count : 0);
 
         enc.SetPipeline(impl_->cull_pipeline);
         enc.SetBuffer(b.instances, 0, 0);
@@ -1599,14 +1813,16 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
         enc.SetBuffer(b.visible, 0, 2);
         enc.SetBuffer(b.counter, 0, 3);
         enc.SetBuffer(b.args, 0, 4);
+        if (use_occlusion) enc.SetTexture(impl_->hiz, 0);
         enc.Dispatch(int(need));
 
-        // A SECOND dispatch to publish the count. Writing it from inside the
+        // A SECOND dispatch to publish the counts. Writing them from inside the
         // cull kernel would race with the threads still counting -- the last
         // thread to increment is not the last thread to run.
         enc.SetPipeline(impl_->cull_finish_pipeline);
         enc.SetBuffer(b.counter, 0, 0);
         enc.SetBuffer(b.args, 0, 1);
+        enc.SetBytes(&params, sizeof(params), 2);
         enc.Dispatch(1);
 
         impl_->batched_instances += int(need);
@@ -1669,10 +1885,7 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
 
         enc.SetPipeline(mat.instanced_pipeline);
         enc.SetCull(mat.cull, rhi::Winding::CounterClockwise);
-        enc.SetVertexBuffer(gm.vb, 0, kVertexSlot);
         enc.SetVertexBuffer(impl_->uniforms, offset, kUniformSlot);
-        // The SURVIVORS, not the instances that were offered.
-        enc.SetVertexBuffer(b.visible, 0, kInstanceSlot);
         enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
         enc.SetFragmentBuffer(impl_->lights, light_offset, kLightSlot);
         enc.SetFragmentBuffer(impl_->cascades, cascade_offset, kCascadeSlot);
@@ -1689,8 +1902,26 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
         enc.SetFragmentTexture(impl_->env.specular, 6);
         enc.SetFragmentTexture(impl_->env.brdf_lut, 7);
         enc.SetFragmentSampler(impl_->env.cube_sampler, 1);
-        enc.DrawIndexedIndirectU16(gm.ib, b.args, 0);
-        ++impl_->stats.draws;
+
+        // ONE INDIRECT DRAW PER LEVEL, and the instance count of each comes out
+        // of the buffer the cull wrote -- so the CPU still never learns how the
+        // instances were distributed between them.
+        //
+        // A level with no survivors costs a draw call with a zero instance
+        // count, which the hardware discards immediately. Skipping it would
+        // need the count, and asking for the count is the readback this whole
+        // path exists to avoid.
+        for (int l = 0; l < gm.lod_count; ++l) {
+            const GpuMesh::Lod& lod = gm.lods[l];
+            if (!Valid(lod.vb) || !Valid(lod.ib)) continue;
+            enc.SetVertexBuffer(lod.vb, 0, kVertexSlot);
+            // The SURVIVORS of this level, not the instances that were offered.
+            // Each level owns a fixed-stride region of one buffer.
+            enc.SetVertexBuffer(b.visible, sizeof(GpuInstance) * b.capacity * std::size_t(l),
+                                kInstanceSlot);
+            enc.DrawIndexedIndirectU16(lod.ib, b.args, sizeof(GpuDrawArgs) * std::size_t(l));
+            ++impl_->stats.draws;
+        }
         ++impl_->stats.pipeline_switches;
     }
 }

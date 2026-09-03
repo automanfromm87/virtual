@@ -7,11 +7,13 @@ package(default_visibility = ["//visibility:public"])
 cc_library(
     name = "geometry",
     srcs = [
+        "simplify.cc",
         "floorplan.cc",
         "hull.cc",
         "mesh.cc",
     ],
     hdrs = [
+        "simplify.h",
         "floorplan.h",
         "hull.h",
         "mesh.h",
@@ -37,5 +39,11 @@ cc_test(
 cc_test(
     name = "hull_test",
     srcs = ["hull_test.cc"],
+    deps = [":geometry"],
+)
+
+cc_test(
+    name = "simplify_test",
+    srcs = ["simplify_test.cc"],
     deps = [":geometry"],
 )

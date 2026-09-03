@@ -15,6 +15,8 @@
 #include "engine/anim/anim.h"
 #include "engine/geometry/mesh.h"
 #include "engine/resource/handles.h"
+#include <span>
+
 #include "engine/render/ibl.h"
 #include "engine/rhi/rhi.h"
 #include "engine/scene/scene.h"
@@ -311,6 +313,14 @@ class Renderer {
     // a cull that keeps everything draws the same picture, because the extra
     // instances are off screen and rasterise nothing.
     [[nodiscard]] int VisibleAfterCull() const;
+    // How many survivors landed on one level of detail. A DIAGNOSTIC and not a
+    // number to render from: it reads the buffer the GPU wrote, so it is only
+    // meaningful after the frame has completed.
+    [[nodiscard]] int VisibleAtLod(int lod) const;
+    // Triangles the indirect draws will actually submit, summed over every
+    // level. The number LOD exists to move, and the only one that shows whether
+    // it did: the survivor count is unchanged by levels of detail.
+    [[nodiscard]] long long IndirectTriangles() const;
 
     // --- ray tracing ---------------------------------------------------------
     //
@@ -390,6 +400,50 @@ class Renderer {
     // is a property of the LOOK, not of one call -- and threading eight more
     // parameters through a function that already takes five would make the
     // common call unreadable to configure something that changes once a scene.
+    // A mesh with LEVELS OF DETAIL, coarsest last. Level 0 is the one every
+    // non-GPU-driven path uses, so a mesh uploaded this way behaves exactly
+    // like an ordinary one everywhere except in DrawSceneIndirect.
+    //
+    // At most four levels; extras are ignored. geom::BuildLodChain produces a
+    // suitable list from one mesh.
+    [[nodiscard]] MeshHandle UploadMeshLods(std::span<const Mesh> levels);
+    [[nodiscard]] int MeshLodCount(MeshHandle) const;
+    [[nodiscard]] int MeshLodIndexCount(MeshHandle, int lod) const;
+
+    // --- occlusion culling ----------------------------------------------------
+    //
+    // Builds the depth pyramid the GPU cull reads. `depth` must be a SAMPLEABLE
+    // depth target that already holds this frame's scene -- a depth prepass, or
+    // a previous pass with keep_depth.
+    //
+    // THIS FRAME'S DEPTH, not last frame's, which is the other common design.
+    // Reusing last frame's needs no prepass and costs a frame of latency, and
+    // that latency is visible: rotate quickly and objects that should have
+    // appeared at the edge of an occluder are culled for a frame. Requiring a
+    // prepass costs a geometry pass with no fragment shader, and buys an exact
+    // answer plus zero overdraw in the pass that follows.
+    //
+    // The pyramid holds the FARTHEST depth in each region, which is the minimum
+    // value under reversed-Z. An averaged pyramid -- what a blit-generated mip
+    // chain gives -- is not conservative and culls visible geometry.
+    void BuildHiZ(rhi::ComputeEncoder&, rhi::TextureId depth, int width,
+                  int height);
+    // On by default, but inert until BuildHiZ has run this frame: the cull
+    // checks that the pyramid is current rather than trusting a stale one.
+    void SetOcclusionCulling(bool);
+    [[nodiscard]] bool OcclusionCulling() const;
+    [[nodiscard]] rhi::TextureId HiZ() const;
+
+    // Screen radius in PIXELS at which each level of detail takes over: x is
+    // where level 1 starts, y level 2, z level 3.
+    //
+    // In pixels rather than in metres because that is the quantity that decides
+    // whether the detail can be seen. A distance threshold has to be re-tuned
+    // for every object size and again whenever the field of view changes; one
+    // set of screen sizes works for a pebble and a mountain at once.
+    void SetLodThresholds(Vec3 pixels);
+    [[nodiscard]] Vec3 LodThresholds() const;
+
     void SetGrade(const ColorGrade&);
     [[nodiscard]] const ColorGrade& Grade() const;
     // A buffer holding one float, the linear exposure multiplier. Null means a
