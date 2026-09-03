@@ -16,3 +16,18 @@ cc_test(
     srcs = ["texture_test.cc"],
     deps = [":texture"],
 )
+
+# Block compression, encoder and decoder. Separate from :texture because a
+# procedural pattern generator has no business pulling in a codec.
+cc_library(
+    name = "compress",
+    srcs = ["compress.cc"],
+    hdrs = ["compress.h"],
+    deps = [":texture"],
+)
+
+cc_test(
+    name = "compress_test",
+    srcs = ["compress_test.cc"],
+    deps = [":compress"],
+)

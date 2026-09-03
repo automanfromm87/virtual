@@ -40,6 +40,16 @@ enum class Format : std::uint8_t {
     // the hardware averages after decoding rather than averaging gamma-encoded
     // bytes, which darkens every mip level.
     RGBA8Srgb,
+    // BLOCK-COMPRESSED, decoded by the sampler at no cost. A 4x4 tile in 8
+    // bytes (BC1) or 16 (BC3, BC5) against the 64 an RGBA8 tile costs.
+    //
+    // These cannot be render targets and their mip chains cannot be generated
+    // on the GPU -- generateMipmaps has nothing to write through. Every level
+    // is compressed on the CPU and uploaded, which is what
+    // CreateTexture2DCompressed exists for.
+    BC1, BC1Srgb,   // RGB
+    BC3, BC3Srgb,   // RGBA
+    BC5,            // two channels; a normal map's x and y
     // Full float, for the places where half is measurably not enough. An
     // equirectangular sky holds a sun at tens of thousands of nits, and half
     // saturates at 65504 -- close enough to matter, and the failure is a sun
@@ -386,6 +396,20 @@ class Device {
     // above one, and an 8-bit texture has none.
     [[nodiscard]] TextureId CreateTexture2DFloat(int width, int height,
                                                  const float* rgba32f);
+    // A block-compressed texture, every mip level supplied.
+    //
+    // `level_offsets` gives each level's start in `data`, and its size is the
+    // level count. Levels halve from `width` x `height` and are laid out as
+    // ceil(w/4) x ceil(h/4) blocks -- so a 5-texel-wide level is two blocks
+    // across, and the last block's right-hand column is never sampled.
+    //
+    // All levels in one call because a compressed texture has no other way to
+    // get them: the GPU cannot generate them, so the alternative is a call per
+    // level and a chance to forget one, and a missing level does not fail --
+    // it samples whatever was in that memory.
+    [[nodiscard]] TextureId CreateTexture2DCompressed(
+        int width, int height, Format, std::span<const std::uint8_t> data,
+        std::span<const std::size_t> level_offsets);
     // `max_anisotropy` above 1 turns on anisotropic filtering: up to that many
     // samples along the axis of greatest compression.
     //

@@ -13,5 +13,6 @@ cc_test(
         "//engine/render",
         "//engine/rhi",
         "//engine/scene",
+        "//engine/texture:compress",
     ],
 )

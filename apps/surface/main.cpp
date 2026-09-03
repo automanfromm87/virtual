@@ -19,10 +19,12 @@
 #include "engine/render/renderer.h"
 #include "engine/rhi/rhi.h"
 #include "engine/scene/scene.h"
+#include "engine/texture/compress.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -151,6 +153,13 @@ int main() {
         dev->CreateRenderTarget(kW, kH, kFmt, /*cpu_readable=*/true);
     const eng::rhi::TextureId depth = dev->CreateDepthTarget(kW, kH);
     std::vector<std::uint8_t> px(std::size_t(kW) * kH * 4);
+    // Set by the normals section and reused by the compression one below, which
+    // needs the same flat quad and the same bump map to compare against.
+    eng::MeshHandle quad_mesh;
+    std::vector<std::uint8_t> bumps;
+    constexpr int kMapSize = 256;
+    eng::rhi::TextureId bump_tex;
+    std::function<eng::Scene(eng::rhi::TextureId, float)> build;
 
     const auto render = [&](const eng::Scene& scene) -> bool {
         dev->BeginFrame();
@@ -184,8 +193,7 @@ int main() {
     // ---------------------------------------------------------------- normals --
     {
         std::printf("normal maps\n");
-        constexpr int kMapSize = 256;
-        const std::vector<std::uint8_t> bumps = BumpNormals(kMapSize, 8);
+        bumps = BumpNormals(kMapSize, 8);
         std::vector<std::uint8_t> flat(std::size_t(kMapSize) * kMapSize * 4);
         for (std::size_t i = 0; i < std::size_t(kMapSize) * kMapSize; ++i) {
             flat[i * 4 + 0] = 128;
@@ -197,8 +205,7 @@ int main() {
         // and an sRGB decode would bend every component toward zero -- which
         // reads as bumps that are subtly too shallow near flat and far too
         // steep at the edges.
-        const eng::rhi::TextureId bump_tex =
-            dev->CreateTexture2D(kMapSize, kMapSize, bumps.data(), true, false);
+        bump_tex = dev->CreateTexture2D(kMapSize, kMapSize, bumps.data(), true, false);
         const eng::rhi::TextureId flat_tex =
             dev->CreateTexture2D(kMapSize, kMapSize, flat.data(), true, false);
 
@@ -208,8 +215,9 @@ int main() {
         const eng::MeshHandle quad =
             r->UploadMesh(eng::MakeBox(eng::Vec3{2.0f, 2.0f, 0.05f},
                                        eng::Vec4{1, 1, 1, 1}));
+        quad_mesh = quad;
 
-        const auto build = [&](eng::rhi::TextureId nmap, float light_x) {
+        build = [&](eng::rhi::TextureId nmap, float light_x) {
             eng::Scene s;
             s.camera.eye = eng::Vec3{0.0f, 0.0f, 5.0f};
             s.camera.target = eng::Vec3{0.0f, 0.0f, 0.0f};
@@ -720,6 +728,121 @@ int main() {
                     as_linear.mean, as_srgb.mean);
         Check(as_srgb.mean < as_linear.mean * 0.80,
               "an sRGB texture decodes darker than the same bytes read linear");
+    }
+
+    // ------------------------------------------------- block compression, on GPU --
+    {
+        // The CPU test in engine/texture proves the encoder agrees with its own
+        // decoder. That is worth having and it is not the question that
+        // matters: the hardware decodes these, and an encoder can be perfectly
+        // self-consistent while writing a byte layout the sampler reads
+        // differently. Nothing but a render can tell the two apart.
+        std::printf("\nblock compression, decoded by the sampler\n");
+        constexpr int kTex = 256;
+        eng::Texture2D albedo;
+        albedo.width = albedo.height = kTex;
+        albedo.rgba.resize(std::size_t(kTex) * kTex * 4);
+        for (int y = 0; y < kTex; ++y)
+            for (int x = 0; x < kTex; ++x) {
+                const std::size_t i = (std::size_t(y) * kTex + x) * 4;
+                // Coloured bands plus a smooth ramp: flat regions BC1 stores
+                // exactly, and gradients it has to interpolate across.
+                const bool band = ((x / 32) + (y / 32)) & 1;
+                albedo.rgba[i + 0] = std::uint8_t(band ? 200 : 40 + x / 2);
+                albedo.rgba[i + 1] = std::uint8_t(band ? 60 + y / 3 : 150);
+                albedo.rgba[i + 2] = std::uint8_t(band ? 90 : 210 - y / 4);
+                albedo.rgba[i + 3] = 255;
+            }
+
+        const eng::rhi::TextureId raw =
+            dev->CreateTexture2D(kTex, kTex, albedo.rgba.data(), true, false);
+        const eng::CompressedTexture bc1 =
+            eng::Compress(albedo, eng::BlockFormat::BC1, true, false);
+        const eng::rhi::TextureId comp = dev->CreateTexture2DCompressed(
+            kTex, kTex, eng::rhi::Format::BC1, bc1.data, bc1.level_offsets);
+        if (!eng::rhi::Valid(comp)) {
+            std::fprintf(stderr, "FAIL: the GPU refused the BC1 texture\n");
+            return 1;
+        }
+        std::printf("    %zu KB uncompressed -> %zu KB as BC1 with mips\n",
+                    albedo.rgba.size() / 1024, bc1.data.size() / 1024);
+
+        const auto flat_scene = [&](eng::rhi::TextureId tex) {
+            eng::Scene sc;
+            sc.camera.eye = eng::Vec3{0.0f, 0.0f, 5.0f};
+            sc.camera.target = eng::Vec3{0.0f, 0.0f, 0.0f};
+            sc.lightDir = eng::Vec4{0.0f, 0.0f, 1.0f, 0.0f};
+            sc.lightColor = eng::Vec4{2.5f, 2.5f, 2.5f, 1.0f};
+            sc.ambientSky = eng::Vec3{0.0f, 0.0f, 0.0f};
+            sc.ambientGround = eng::Vec3{0.0f, 0.0f, 0.0f};
+            eng::MaterialDesc m;
+            m.base_color = eng::Vec4{1, 1, 1, 1};
+            m.roughness = 1.0f;
+            m.albedo = tex;
+            eng::Instance in;
+            in.mesh = quad_mesh;
+            in.material = r->CreateMaterial(m, error);
+            sc.instances.push_back(in);
+            return sc;
+        };
+
+        if (!render(flat_scene(raw))) return 1;
+        const std::vector<std::uint8_t> uncompressed = px;
+        if (!render(flat_scene(comp))) return 1;
+
+        double sum = 0.0, worst = 0.0;
+        int n = 0;
+        for (int y = 130; y < 270; ++y)
+            for (int x = 130; x < 270; ++x, ++n) {
+                const std::size_t i = (std::size_t(y) * kW + x) * 4;
+                double d = 0.0;
+                for (int c = 0; c < 3; ++c)
+                    d = std::max(d, std::fabs(double(px[i + c]) -
+                                              double(uncompressed[i + c])));
+                sum += d;
+                worst = std::max(worst, d);
+            }
+        std::printf("    against the uncompressed texture: mean %.2f/255, "
+                    "worst %.0f\n", sum / n, worst);
+        // A HANDFUL of levels of error, not none: BC1 is lossy and the point is
+        // that it is lossy by a few units and not by a hundred. A layout the
+        // hardware reads differently -- endpoints swapped, indices in the wrong
+        // bit order, bytesPerRow given per texel row instead of per block row --
+        // does not produce a slightly wrong image, it produces noise.
+        Check(worst < 40.0, "the GPU decodes BC1 to nearly the same image");
+        Check(sum / n < 6.0, "and is within a few levels on average");
+
+        // BC5 for the normal map, which is what it is for. The shader already
+        // rebuilds z from xy, so a two-channel format costs it nothing.
+        eng::Texture2D nrm;
+        nrm.width = nrm.height = kMapSize;
+        nrm.rgba.assign(bumps.begin(), bumps.end());
+        const eng::CompressedTexture bc5 =
+            eng::Compress(nrm, eng::BlockFormat::BC5, true, false);
+        const eng::rhi::TextureId nmap_bc5 = dev->CreateTexture2DCompressed(
+            kMapSize, kMapSize, eng::rhi::Format::BC5, bc5.data, bc5.level_offsets);
+        if (!eng::rhi::Valid(nmap_bc5)) {
+            std::fprintf(stderr, "FAIL: the GPU refused the BC5 texture\n");
+            return 1;
+        }
+        if (!render(build(bump_tex, -0.85f))) return 1;
+        const std::vector<std::uint8_t> raw_normals = px;
+        if (!render(build(nmap_bc5, -0.85f))) return 1;
+        double nsum = 0.0, nworst = 0.0;
+        n = 0;
+        for (int y = 130; y < 270; ++y)
+            for (int x = 130; x < 270; ++x, ++n) {
+                const std::size_t i = (std::size_t(y) * kW + x) * 4;
+                const double d = std::fabs(Luma(px, i) - Luma(raw_normals, i));
+                nsum += d;
+                nworst = std::max(nworst, d);
+            }
+        std::printf("    BC5 normal map (%zu KB vs %zu KB): shading differs by "
+                    "%.2f/255 on average, %.0f at worst\n",
+                    bc5.data.size() / 1024, nrm.rgba.size() / 1024, nsum / n,
+                    nworst);
+        Check(nsum / n < 8.0,
+              "and a BC5 normal map shades almost identically to an 8-bit one");
     }
 
     std::printf(g_failures == 0 ? "\nsurface_test: all checks passed\n"

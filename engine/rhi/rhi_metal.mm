@@ -21,6 +21,11 @@ MTLPixelFormat ToMTL(Format f) {
     switch (f) {
         case Format::RGBA8Unorm: return MTLPixelFormatRGBA8Unorm;
         case Format::RGBA8Srgb: return MTLPixelFormatRGBA8Unorm_sRGB;
+        case Format::BC1: return MTLPixelFormatBC1_RGBA;
+        case Format::BC1Srgb: return MTLPixelFormatBC1_RGBA_sRGB;
+        case Format::BC3: return MTLPixelFormatBC3_RGBA;
+        case Format::BC3Srgb: return MTLPixelFormatBC3_RGBA_sRGB;
+        case Format::BC5: return MTLPixelFormatBC5_RGUnorm;
         case Format::BGRA8Unorm: return MTLPixelFormatBGRA8Unorm;
         case Format::RGBA16Float: return MTLPixelFormatRGBA16Float;
         case Format::Depth32Float: return MTLPixelFormatDepth32Float;
@@ -789,6 +794,61 @@ TextureId Device::CreateTexture2D(int width, int height, const void* rgba8,
         [blit endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
+    }
+    return TextureId{impl_->AllocTextureSlot(t)};
+}
+
+namespace {
+
+int BlockBytesOf(Format f) {
+    switch (f) {
+        case Format::BC1:
+        case Format::BC1Srgb: return 8;
+        case Format::BC3:
+        case Format::BC3Srgb:
+        case Format::BC5: return 16;
+        default: return 0;
+    }
+}
+
+}  // namespace
+
+TextureId Device::CreateTexture2DCompressed(
+    int width, int height, Format fmt, std::span<const std::uint8_t> data,
+    std::span<const std::size_t> level_offsets) {
+    const int block = BlockBytesOf(fmt);
+    if (width <= 0 || height <= 0 || block == 0 || level_offsets.empty())
+        return {};
+
+    MTLTextureDescriptor* td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:ToMTL(fmt)
+                                     width:NSUInteger(width)
+                                    height:NSUInteger(height)
+                                 mipmapped:(level_offsets.size() > 1 ? YES : NO)];
+    td.mipmapLevelCount = NSUInteger(level_offsets.size());
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> t = [impl_->dev newTextureWithDescriptor:td];
+    if (!t) return {};
+
+    for (std::size_t level = 0; level < level_offsets.size(); ++level) {
+        const int lw = std::max(1, width >> level);
+        const int lh = std::max(1, height >> level);
+        const int bx = (lw + 3) / 4, by = (lh + 3) / 4;
+        const std::size_t bytes = std::size_t(bx) * by * block;
+        const std::size_t off = level_offsets[level];
+        // Every level bounds-checked against the blob. A short buffer here is
+        // not a validation error in Metal -- replaceRegion reads whatever
+        // follows the allocation, and the texture comes out with garbage in its
+        // small mips, which only shows at a distance.
+        if (off + bytes > data.size()) return {};
+        [t replaceRegion:MTLRegionMake2D(0, 0, NSUInteger(lw), NSUInteger(lh))
+             mipmapLevel:level
+               withBytes:data.data() + off
+             // bytesPerRow is per BLOCK ROW for a compressed format, not per
+             // texel row. Passing the texel figure is a four-times overread and
+             // a texture that decodes as diagonal streaks.
+             bytesPerRow:NSUInteger(bx) * NSUInteger(block)];
     }
     return TextureId{impl_->AllocTextureSlot(t)};
 }
