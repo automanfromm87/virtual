@@ -35,3 +35,15 @@ cc_test(
     srcs = ["bvh_test.cc"],
     deps = [":physics"],
 )
+
+# Terrain as a physics body. The point of the test is agreement: the renderer's
+# terrain, the collider and the raycast all have to return the same surface, or
+# a character's feet sink into ground that is visibly solid.
+cc_test(
+    name = "heightfield_test",
+    srcs = ["heightfield_test.cc"],
+    deps = [
+        ":physics",
+        "//engine/geometry",
+    ],
+)

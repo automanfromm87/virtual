@@ -345,6 +345,96 @@ int World::AddJoint(const Joint& j) {
     return int(joints_.size()) - 1;
 }
 
+float HeightfieldData::HeightAt(float x, float z) const {
+    if (!Valid()) return 0.0f;
+    const float fx = (x - origin.x) / spacing;
+    const float fz = (z - origin.z) / spacing;
+    const int ix = int(std::floor(fx));
+    const int iz = int(std::floor(fz));
+    const float tx = fx - float(ix);
+    const float tz = fz - float(iz);
+    const float h00 = At(ix, iz), h10 = At(ix + 1, iz);
+    const float h01 = At(ix, iz + 1), h11 = At(ix + 1, iz + 1);
+    const float top = h00 + (h10 - h00) * tx;
+    const float bottom = h01 + (h11 - h01) * tx;
+    return origin.y + top + (bottom - top) * tz;
+}
+
+Shape Shape::MakeHeightfield(std::shared_ptr<const HeightfieldData> data) {
+    Shape s;
+    s.type = ShapeType::Heightfield;
+    s.heightfield = std::move(data);
+    if (s.heightfield && s.heightfield->Valid()) {
+        const HeightfieldData& h = *s.heightfield;
+        float lo = 1e30f, hi = -1e30f;
+        for (float v : h.heights) {
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+        }
+        const float span = float(h.resolution - 1) * h.spacing;
+        s.half_extents = Vec3{span * 0.5f, (hi - lo) * 0.5f + 0.01f, span * 0.5f};
+        // The bounding sphere of the WHOLE terrain, which is enormous -- and
+        // that is honest rather than a problem: every cheap reject that reads
+        // it will pass, and the exact test below is the one that matters. A
+        // small lie here would cull the ground out from under something.
+        s.bounds_radius = Length(s.half_extents);
+        // Positioned so the body's own position is the terrain's CENTRE, which
+        // is what BodyBounds and the broadphase assume of every other shape.
+        s.bounds_centre = Vec3{h.origin.x + span * 0.5f, h.origin.y + (lo + hi) * 0.5f,
+                               h.origin.z + span * 0.5f};
+    }
+    return s;
+}
+
+namespace {
+
+// The triangles of a height field overlapping a world-space box, as an array of
+// nine floats each (three corners).
+//
+// The diagonal split ALTERNATES with the checker parity, matching
+// Terrain::BuildChunk. If the two disagreed, a character would collide with a
+// surface a few millimetres away from the one on screen -- which shows up as
+// feet sinking into a slope in one direction and floating in the other.
+int GatherHeightfieldTriangles(const HeightfieldData& h, const Aabb& box,
+                               Vec3* out, int max_triangles) {
+    if (!h.Valid() || max_triangles <= 0) return 0;
+    const int last = h.resolution - 1;
+    const int x0 = std::clamp(int(std::floor((box.lo.x - h.origin.x) / h.spacing)), 0, last - 1);
+    const int x1 = std::clamp(int(std::ceil((box.hi.x - h.origin.x) / h.spacing)), 0, last);
+    const int z0 = std::clamp(int(std::floor((box.lo.z - h.origin.z) / h.spacing)), 0, last - 1);
+    const int z1 = std::clamp(int(std::ceil((box.hi.z - h.origin.z) / h.spacing)), 0, last);
+
+    int count = 0;
+    for (int z = z0; z < z1 && count + 1 < max_triangles; ++z)
+        for (int x = x0; x < x1 && count + 1 < max_triangles; ++x) {
+            const float wx = h.origin.x + float(x) * h.spacing;
+            const float wz = h.origin.z + float(z) * h.spacing;
+            const Vec3 a{wx, h.origin.y + h.At(x, z), wz};
+            const Vec3 b{wx + h.spacing, h.origin.y + h.At(x + 1, z), wz};
+            const Vec3 c{wx, h.origin.y + h.At(x, z + 1), wz + h.spacing};
+            const Vec3 d{wx + h.spacing, h.origin.y + h.At(x + 1, z + 1), wz + h.spacing};
+            // Skip a cell entirely below or above the query box: at a hundred
+            // cells a step this is most of them.
+            const float cell_lo = std::min({a.y, b.y, c.y, d.y});
+            const float cell_hi = std::max({a.y, b.y, c.y, d.y});
+            if (cell_hi < box.lo.y || cell_lo > box.hi.y) continue;
+            if (((x + z) & 1) == 0) {
+                out[count * 3 + 0] = a; out[count * 3 + 1] = c; out[count * 3 + 2] = b;
+                ++count;
+                out[count * 3 + 0] = b; out[count * 3 + 1] = c; out[count * 3 + 2] = d;
+                ++count;
+            } else {
+                out[count * 3 + 0] = a; out[count * 3 + 1] = c; out[count * 3 + 2] = d;
+                ++count;
+                out[count * 3 + 0] = a; out[count * 3 + 1] = d; out[count * 3 + 2] = b;
+                ++count;
+            }
+        }
+    return count;
+}
+
+}  // namespace
+
 Aabb BodyBounds(const Body& b, float margin) {
     Aabb box;
     switch (b.shape.type) {
@@ -367,6 +457,21 @@ Aabb BodyBounds(const Body& b, float margin) {
             box.Add(a);
             box.Add(c);
             box.Expand(b.shape.radius);
+            break;
+        }
+        case ShapeType::Heightfield: {
+            // The whole grid, in world space, from the extents cached at
+            // construction -- rescanning a 129x129 field every frame to find
+            // its own height range would be the most expensive thing in the
+            // broadphase.
+            //
+            // A height field does not rotate, so this is exact rather than a
+            // fitted box, and `bounds_centre` is where the grid sits relative
+            // to the body: unlike every other shape, a terrain's geometry is
+            // not centred on its own position.
+            const Vec3 c = b.position + b.shape.bounds_centre;
+            box.lo = c - b.shape.half_extents;
+            box.hi = c + b.shape.half_extents;
             break;
         }
         case ShapeType::Box:
@@ -535,6 +640,14 @@ Vec3 Support(const Body& body, Vec3 dir) {
             return body.position + Rotate(body.orientation, Vec3{0.0f, h, 0.0f}) +
                    unit * body.shape.radius;
         }
+        case ShapeType::Heightfield:
+            // NEVER REACHED, and the case is here so the compiler says so if
+            // that stops being true. A height field is not convex, so it is
+            // never a GJK operand -- CollideHeightfield hands the algorithm one
+            // triangle at a time instead. Falling through to the default would
+            // return the body's position, which GJK would happily treat as a
+            // single-point shape and report no collision with anything.
+            return body.position;
         case ShapeType::Hull: {
             if (body.shape.points.empty()) return body.position;
             const Vec3 local = RotateInverse(body.orientation, dir);
@@ -1105,6 +1218,78 @@ bool RayBox(Vec3 origin, Vec3 dir, const Body& b, float max_t, float* t_out,
 
 }  // namespace
 
+bool CollideAny(const Body& a, const Body& b, Contact* out) {
+    const bool a_field = a.shape.type == ShapeType::Heightfield;
+    const bool b_field = b.shape.type == ShapeType::Heightfield;
+    if (a_field && b_field) return false;  // two terrains have nothing to say
+    if (b_field) return CollideHeightfield(a, b, out);
+    if (a_field) {
+        // Answered for (convex, field), so the normal comes back pointing from
+        // the convex body toward the terrain -- and the caller asked for a to b.
+        if (!CollideHeightfield(b, a, out)) return false;
+        out->normal = out->normal * -1.0f;
+        return true;
+    }
+    return CollideConvex(a, b, out);
+}
+
+// A convex body against a height field.
+//
+// ONE CONTACT, the deepest, rather than one per overlapping triangle. A capsule
+// standing on a slope overlaps four or six triangles at once, and emitting a
+// contact for each gives the solver six impulses pushing the same body out of
+// the same ground -- which resolves to six times the correction and launches it.
+//
+// The alternative, a proper manifold, needs the contacts deduplicated by normal
+// and their impulses shared. That is what the box-box path does, and it is worth
+// it there because a crate resting flat on one contact rocks. A capsule has no
+// flat face to rest on, so one contact holds it still.
+bool CollideHeightfield(const Body& convex, const Body& field, Contact* out) {
+    const HeightfieldData* h = field.shape.heightfield.get();
+    if (!h || !h->Valid() || !out) return false;
+
+    // The query's box, in the FIELD's own space.
+    Aabb box = BodyBounds(convex, 0.02f);
+    box.lo = box.lo - field.position;
+    box.hi = box.hi - field.position;
+
+    constexpr int kMaxTriangles = 256;
+    Vec3 corners[kMaxTriangles * 3];
+    const int count = GatherHeightfieldTriangles(*h, box, corners, kMaxTriangles);
+    if (count == 0) return false;
+
+    Body tri;
+    tri.inverse_mass = 0.0f;
+    tri.position = field.position;
+    bool any = false;
+    Contact best;
+    best.depth = 0.0f;
+    for (int i = 0; i < count; ++i) {
+        // A TRIANGLE AS A THREE-POINT HULL. GJK asks a shape only for its
+        // support point, and the support of a triangle is whichever of three
+        // vertices is furthest along the direction -- so the general convex
+        // path already handles it and no triangle-specific code is needed.
+        //
+        // The vertices go in relative to the body's position, because
+        // Support() adds that back.
+        tri.shape.type = ShapeType::Hull;
+        tri.shape.points = {corners[i * 3 + 0], corners[i * 3 + 1], corners[i * 3 + 2]};
+        float r = 0.0f;
+        for (const Vec3& p : tri.shape.points) r = std::max(r, Length(p));
+        tri.shape.radius = r;
+        tri.shape.bounds_radius = r;
+
+        Contact c;
+        if (!CollideConvex(convex, tri, &c)) continue;
+        if (c.depth <= best.depth) continue;
+        best = c;
+        any = true;
+    }
+    if (!any) return false;
+    *out = best;
+    return true;
+}
+
 bool World::Raycast(Vec3 origin, Vec3 direction, float max_distance, RayHit* out,
                     const QueryFilter& filter) const {
     if (!out) return false;
@@ -1134,8 +1319,12 @@ bool World::Raycast(Vec3 origin, Vec3 direction, float max_distance, RayHit* out
         // work of this one.
         float t = 0.0f;
         Vec3 n{0, 1, 0};
-        if (!RaySphere(origin, direction, b.position, b.shape.bounds_radius,
-                       best_t, &t, &n))
+        // From the shape's CENTRE, which is the body's position for everything
+        // except a height field -- whose grid extends from its own origin, so a
+        // sphere centred on the body would sit half a terrain away and reject
+        // every ray that hits the ground.
+        if (!RaySphere(origin, direction, b.position + b.shape.bounds_centre,
+                       b.shape.bounds_radius, best_t, &t, &n))
             return;
 
         switch (b.shape.type) {
@@ -1144,6 +1333,50 @@ bool World::Raycast(Vec3 origin, Vec3 direction, float max_distance, RayHit* out
             case ShapeType::Box:
                 if (!RayBox(origin, direction, b, best_t, &t, &n)) return;
                 break;
+            case ShapeType::Heightfield: {
+                // A MARCH of the height field, then a bisection -- the same
+                // method eng::Terrain::Raycast uses, and deliberately so: the
+                // two have to agree or a click that the renderer's terrain says
+                // hit the ground would miss in physics.
+                const HeightfieldData* h = b.shape.heightfield.get();
+                if (!h || !h->Valid()) return;
+                const Vec3 local_origin = origin - b.position;
+                const Vec3 unit = direction * (1.0f / len);
+                const float step = h->spacing;
+                float march = 0.0f;
+                bool hit = false;
+                float gap = local_origin.y - h->HeightAt(local_origin.x, local_origin.z);
+                if (gap <= 0.0f) {
+                    t = 0.0f;
+                    hit = true;
+                } else {
+                    while (march < best_t * len) {
+                        const float next = std::min(march + step, best_t * len);
+                        const Vec3 p = local_origin + unit * next;
+                        if (p.y - h->HeightAt(p.x, p.z) <= 0.0f) {
+                            float lo2 = march, hi2 = next;
+                            for (int k = 0; k < 24; ++k) {
+                                const float mid = (lo2 + hi2) * 0.5f;
+                                const Vec3 q = local_origin + unit * mid;
+                                if (q.y - h->HeightAt(q.x, q.z) > 0.0f) lo2 = mid;
+                                else hi2 = mid;
+                            }
+                            t = hi2 / len;
+                            hit = true;
+                            break;
+                        }
+                        march = next;
+                        if (next >= best_t * len) break;
+                    }
+                }
+                if (!hit) return;
+                const Vec3 p = local_origin + unit * (t * len);
+                const float d = h->spacing;
+                n = Normalize(Vec3{h->HeightAt(p.x - d, p.z) - h->HeightAt(p.x + d, p.z),
+                                   2.0f * d,
+                                   h->HeightAt(p.x, p.z - d) - h->HeightAt(p.x, p.z + d)});
+                break;
+            }
             case ShapeType::Capsule:
             case ShapeType::Hull: {
                 // CONSERVATIVE ADVANCEMENT, the same idea the continuous
@@ -1212,15 +1445,21 @@ int World::OverlapShape(const Shape& shape, Vec3 position, Quat orientation,
         const Body& b = bodies_[std::size_t(i)];
         if ((b.layer & filter.mask) == 0u) return;
         if (b.trigger && !filter.hit_triggers) return;
-        // Bounding spheres first, for the same reason as the raycast.
+        // Bounding spheres first, for the same reason as the raycast. Measured
+        // from the shape's CENTRE, which for a height field is not its position
+        // -- the grid extends from its own origin, so a terrain body at (0,0,0)
+        // has its centre half a kilometre away and a test against `position`
+        // rejects the ground under your feet.
+        const Vec3 other_centre = b.position + b.shape.bounds_centre;
         const float reach = probe.shape.bounds_radius + b.shape.bounds_radius;
-        if (Dot(b.position - position, b.position - position) > reach * reach)
+        if (Dot(other_centre - position, other_centre - position) > reach * reach)
             return;
         // The general convex test, not the specialised ones: a query shape can
         // be any of the three against any of the three, and CollideConvex is
-        // the path that needs no case analysis.
+        // the path that needs no case analysis. A height field is the exception
+        // -- it is not convex.
         Contact c;
-        if (!CollideConvex(probe, b, &c)) return;
+        if (!CollideAny(probe, b, &c)) return;
         out->push_back(i);
         ++found;
     });
@@ -1299,6 +1538,32 @@ void World::Collide() {
             ++stats_.pairs_tested;
 
             Contact c;
+            // A HEIGHTFIELD before anything else, because it is the one shape
+            // GJK cannot be run against directly -- it is not convex, and every
+            // branch below assumes both sides are.
+            if (a.shape.type == ShapeType::Heightfield ||
+                b.shape.type == ShapeType::Heightfield) {
+                const bool a_field = a.shape.type == ShapeType::Heightfield;
+                // Two height fields have nothing to say to each other, and both
+                // are static anyway.
+                if (a_field && b.shape.type == ShapeType::Heightfield) continue;
+                const Body& convex = a_field ? b : a;
+                const Body& field = a_field ? a : b;
+                if (CollideHeightfield(convex, field, &c)) {
+                    // Labelled so the normal points from `a` toward `b`, which
+                    // is what the solver assumes. CollideHeightfield answers
+                    // for (convex, field), so a swap flips the normal too.
+                    if (a_field) {
+                        c.a = j;
+                        c.b = i;
+                    } else {
+                        c.a = i;
+                        c.b = j;
+                    }
+                    contacts_.push_back(c);
+                }
+                continue;
+            }
             // A HULL first, before anything else. The sphere branches below
             // hand their second argument to CollideSphereBox, which would
             // silently collide against the hull's bounding box -- a shape that

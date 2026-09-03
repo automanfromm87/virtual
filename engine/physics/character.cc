@@ -73,7 +73,11 @@ int CharacterController::Depenetrate(const World& world) {
         for (int index : hits) {
             const Body& other = world[index];
             Contact c;
-            if (!CollideConvex(probe, other, &c)) continue;
+            // CollideAny, not CollideConvex: a height field is not convex, and
+            // asking GJK about one returns nothing -- so a character on terrain
+            // would find no contact, never be grounded, and walk through the
+            // ground with no error anywhere.
+            if (!CollideAny(probe, other, &c)) continue;
             if (c.depth <= 0.0f) continue;
 
             // The normal comes back pointing from the probe toward the body, so

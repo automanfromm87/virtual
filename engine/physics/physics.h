@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "engine/core/math.h"
@@ -27,7 +28,36 @@
 
 namespace eng::physics {
 
-enum class ShapeType : std::uint8_t { Sphere, Box, Hull, Capsule };
+enum class ShapeType : std::uint8_t { Sphere, Box, Hull, Capsule, Heightfield };
+
+// A terrain collider: a regular grid of heights, tested against by pulling out
+// the triangles under whatever is querying it.
+//
+// NOT A HULL, and not a mesh of hulls. A height field is not convex, so GJK
+// cannot be run against it directly; and turning a 129x129 grid into 32,768
+// triangle hulls would be 32,768 bodies in the broadphase for one piece of
+// ground. Keeping it as a grid means the cells under a query are found by
+// arithmetic instead of by search.
+struct HeightfieldData {
+    int resolution = 0;          // samples per side
+    float spacing = 1.0f;        // world metres between samples
+    Vec3 origin{0.0f, 0.0f, 0.0f};
+    std::vector<float> heights;  // row-major, resolution * resolution
+
+    [[nodiscard]] bool Valid() const {
+        return resolution >= 2 &&
+               heights.size() == std::size_t(resolution) * std::size_t(resolution);
+    }
+    [[nodiscard]] float At(int ix, int iz) const {
+        ix = std::clamp(ix, 0, resolution - 1);
+        iz = std::clamp(iz, 0, resolution - 1);
+        return heights[std::size_t(iz) * std::size_t(resolution) + std::size_t(ix)];
+    }
+    // Bilinear, matching eng::Terrain::HeightAt exactly -- the two have to
+    // agree or a character stands at a different height from the one the
+    // renderer drew.
+    [[nodiscard]] float HeightAt(float x, float z) const;
+};
 
 struct Shape {
     ShapeType type = ShapeType::Sphere;
@@ -43,6 +73,17 @@ struct Shape {
     // different numbers, and which would have had to lie about one of them.
     // Each factory below sets it; a shape built by hand must too.
     float bounds_radius = 0.5f;
+    // Where that sphere is CENTRED, in the body's own frame. Zero for every
+    // shape whose geometry is centred on the body, which is all of them except
+    // a height field: a terrain's grid extends from its own origin, so a
+    // terrain body at (0, 0, 0) has its centre half a kilometre away.
+    //
+    // A separate field rather than reusing centre_offset, which already means
+    // something else -- where a hull's centre of mass was in the vertices as
+    // supplied, with the vertices themselves re-centred on it. Reusing it would
+    // make every hull's bounding sphere sit at its old, uncentred position, and
+    // the raycast reject would then miss hulls that are plainly in the way.
+    Vec3 bounds_centre{0.0f, 0.0f, 0.0f};
     Vec3 half_extents{0.5f, 0.5f, 0.5f};  // Box, in the body's own frame
     // Hull: the vertices, in the body's own frame, already reduced by
     // geom::ConvexHull. Only the vertices are kept -- GJK never asks anything
@@ -58,6 +99,12 @@ struct Shape {
     // Inertia per unit MASS, about the centre of mass, in the body frame.
     // Negative x means "not known", and SetMass falls back to the bounding box.
     Vec3 unit_inertia{-1.0f, -1.0f, -1.0f};
+
+    // Heightfield: the grid. SHARED, because a terrain's grid is megabytes and
+    // there is exactly one body holding it -- but a shared_ptr rather than a
+    // raw pointer, so a caller cannot free the terrain out from under the
+    // world and get a crash three frames later inside the solver.
+    std::shared_ptr<const HeightfieldData> heightfield;
 
     [[nodiscard]] static Shape MakeSphere(float r) {
         Shape s;
@@ -108,6 +155,10 @@ struct Shape {
         s.bounds_radius = half_height + r;
         return s;
     }
+
+    // A terrain collider. Static by definition: a height field has no
+    // meaningful inertia and moving one would invalidate every cached contact.
+    [[nodiscard]] static Shape MakeHeightfield(std::shared_ptr<const HeightfieldData> data);
 
     [[nodiscard]] static Shape MakeHull(std::vector<Vec3> vertices) {
         Shape s;
@@ -502,6 +553,23 @@ class World {
 // exactly that reason: a scene is mostly spheres and boxes, and this is the
 // path for the shapes that are neither.
 [[nodiscard]] bool CollideConvex(const Body& a, const Body& b, Contact* out);
+
+// A convex body against a HEIGHT FIELD, which GJK cannot be run against
+// directly because it is not convex. Pulls out the triangles under the query
+// and takes the deepest contact.
+[[nodiscard]] bool CollideHeightfield(const Body& convex, const Body& field,
+                                      Contact* out);
+
+// ANY pair, dispatching on the shapes.
+//
+// This exists because CollideConvex was the general entry point and stopped
+// being general the moment a non-convex shape existed. Every caller that
+// reached for it -- the character controller's depenetration, the overlap
+// query -- silently got nothing back from a height field: its support function
+// has no meaningful answer, so GJK saw a single point at the body's origin and
+// reported no overlap. The character walked through the ground with no error
+// anywhere.
+[[nodiscard]] bool CollideAny(const Body& a, const Body& b, Contact* out);
 
 // The furthest point of `body` along `dir`, in WORLD space. Exposed because it
 // is the whole interface GJK has to a shape, and a test that can call it
