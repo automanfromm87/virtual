@@ -513,6 +513,18 @@ void Encoder::SetPipeline(PipelineId p) {
     if (obj.dss) [device_->impl_->enc setDepthStencilState:obj.dss];
 }
 
+void Encoder::SetViewport(int x, int y, int width, int height) {
+    const MTLViewport vp{double(x), double(y), double(width), double(height),
+                         0.0, 1.0};
+    [device_->impl_->enc setViewport:vp];
+}
+
+void Encoder::SetScissor(int x, int y, int width, int height) {
+    const MTLScissorRect r{NSUInteger(x), NSUInteger(y), NSUInteger(width),
+                           NSUInteger(height)};
+    [device_->impl_->enc setScissorRect:r];
+}
+
 void Encoder::SetCull(Cull c, Winding w) {
     [device_->impl_->enc setFrontFacingWinding:ToMTL(w)];
     [device_->impl_->enc setCullMode:ToMTL(c)];

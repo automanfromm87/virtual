@@ -1,5 +1,6 @@
 // The lighting gate. Every check here is a property that ONE directional light
 // cannot produce, because that is the whole point of the change.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -59,6 +60,17 @@ int main() {
         eng::RenderGraph graph;
         {
             eng::RenderGraph::Pass p;
+            p.name = "spot shadows";
+            p.depth = renderer->ShadowAtlas();
+            p.clear_depth = 0.0f;
+            p.keep_depth = true;
+            p.execute = [&](eng::rhi::Encoder& e) {
+                renderer->DrawLightShadows(e, scene);
+            };
+            graph.AddPass(std::move(p));
+        }
+        {
+            eng::RenderGraph::Pass p;
             p.name = "shadow";
             p.depth = shadow_map;
             p.clear_depth = 0.0f;
@@ -74,7 +86,7 @@ int main() {
             p.clear_color[0] = 0.018f; p.clear_color[1] = 0.020f;
             p.clear_color[2] = 0.028f; p.clear_color[3] = 1.0f;
             p.clear_depth = 0.0f;
-            p.reads = {shadow_map};
+            p.reads = {shadow_map, renderer->ShadowAtlas()};
             p.execute = [&](eng::rhi::Encoder& e) {
                 renderer->DrawScene(e, scene, kW, kH, shadow_map);
             };
@@ -238,6 +250,110 @@ int main() {
                     lr, lg, lb, rr, rg, rb);
         Check(lb > lr * 1.25, "the left of the room is blue");
         Check(rr > rb * 1.25, "the right of the room is warm");
+    }
+
+    std::printf("spot lights cast shadows into the atlas\n");
+    {
+        Check(Valid(renderer->ShadowAtlas()), "the atlas exists");
+        draw(full);
+        Check(renderer->ShadowedLightCount() == 3,
+              "the three spots each got a tile");
+
+        // On versus off. Every darkened pixel has to be INSIDE a pool: the
+        // directional key light's shadows are unchanged between these two
+        // frames, so anything that moves is the spots' doing.
+        std::vector<std::uint8_t> lit_with;
+        draw(full);
+        lit_with = pixels;
+
+        eng::Scene noshadow = full;
+        for (eng::Light& l : noshadow.lights) l.casts_shadow = false;
+        draw(noshadow);
+        Check(renderer->ShadowedLightCount() == 0, "and none when they ask for none");
+
+        int darkened = 0;
+        for (std::size_t i = 0; i < pixels.size(); i += 4) {
+            const int a = pixels[i] + pixels[i + 1] + pixels[i + 2];
+            const int b = lit_with[i] + lit_with[i + 1] + lit_with[i + 2];
+            if (a - b > 45) ++darkened;
+        }
+        std::printf("    %d pixels darkened by the spot shadows\n", darkened);
+        Check(darkened > 4000, "turning them on darkens a substantial area");
+
+        // The shadow must be UNDER its own plinth, not somewhere else. A
+        // light-space shadow map with the wrong matrix still darkens plenty of
+        // pixels — just not the right ones.
+        int px = 0, py = 0;
+        Project(eng::Vec3{gallery::kPlinthX[2] + 0.15f, 0.02f, 1.05f}, &px, &py);
+        double wr, wg, wb, nr, ng, nb;
+        std::vector<std::uint8_t> off = pixels;
+        pixels = lit_with;
+        Mean(px - 26, py - 14, px + 26, py + 14, &wr, &wg, &wb);
+        pixels = off;
+        Mean(px - 26, py - 14, px + 26, py + 14, &nr, &ng, &nb);
+        std::printf("    just in front of the right plinth: %.0f shadowed, "
+                    "%.0f not\n", wr + wg + wb, nr + ng + nb);
+        Check((wr + wg + wb) < (nr + ng + nb) * 0.75,
+              "the plinth's own shadow falls in its own pool");
+    }
+
+    std::printf("each light reads its OWN tile\n");
+    {
+        // Reversing the light list must not change the picture. The same lights
+        // are present, so each still gets a tile — a different one, holding its
+        // own map. A renderer that pointed every light at tile zero renders the
+        // correct image for a symmetric scene and a different one the moment
+        // the order changes, which is what this catches.
+        //
+        // It only bites because the three plinths are different heights. With
+        // identical ones every tile holds the same silhouette and no test can
+        // tell which was read.
+        draw(full);
+        const std::vector<std::uint8_t> forward = pixels;
+        eng::Scene reversed = full;
+        std::reverse(reversed.lights.begin(), reversed.lights.end());
+        draw(reversed);
+
+        int differ = 0;
+        for (std::size_t i = 0; i < pixels.size(); i += 4)
+            if (std::abs(int(pixels[i]) - int(forward[i])) > 6) ++differ;
+        std::printf("    %d pixels changed when the light order was reversed\n",
+                    differ);
+        Check(differ < 400, "reordering the lights does not change the frame");
+    }
+
+    std::printf("only spots get a tile\n");
+    {
+        eng::Scene points = full;
+        for (eng::Light& l : points.lights) {
+            l.type = eng::LightType::Point;   // a point light cannot use one
+            l.casts_shadow = true;
+        }
+        draw(points);
+        // Six lights all asking, none eligible. Handing a point light a single
+        // tile would shadow one sixth of the directions it lights and leave the
+        // rest wrong, which is worse than leaving it unshadowed.
+        Check(renderer->ShadowedLightCount() == 0,
+              "a point light asking for a shadow is refused, not half-served");
+        Check(stats.draws > 8, "and the frame still renders");
+    }
+
+    std::printf("more tiles than the atlas holds\n");
+    {
+        eng::Scene crowd = full;
+        for (int i = 0; i < 10; ++i) {
+            eng::Light l;
+            l.type = eng::LightType::Spot;
+            l.position = eng::Vec3{float(i) - 4.0f, 3.5f, 1.0f};
+            l.direction = eng::Vec3{0, -1, 0};
+            l.color = eng::Vec3{20, 20, 20};
+            l.casts_shadow = true;
+            crowd.lights.push_back(l);
+        }
+        draw(crowd);
+        Check(renderer->ShadowedLightCount() == eng::Renderer::kMaxShadowedLights,
+              "tiles are handed out until they run out");
+        Check(stats.invalid == 0, "the lights that missed out still light, unshadowed");
     }
 
     std::printf("more lights than the budget are dropped, not wrapped\n");

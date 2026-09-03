@@ -60,6 +60,22 @@ void OrbitController::Apply(Camera& cam) const {
     cam.orthoHeight = distance * 0.45f;  // zoom means the same thing in both modes
 }
 
+Mat4 Light::ViewProj() const {
+    const Vec3 forward = Normalize(direction);
+    // LookAt degenerates when forward is parallel to up, and a lamp aimed
+    // straight down is the single most common case in a room.
+    const Vec3 up = (std::fabs(forward.y) > 0.99f) ? Vec3{0.0f, 0.0f, 1.0f}
+                                                   : Vec3{0.0f, 1.0f, 0.0f};
+    const Mat4 view = Mat4::LookAt(position, position + forward, up);
+    // The full cone, plus a margin: a fragment exactly on the cone boundary
+    // must still land inside the map, or the pool's edge samples nothing and
+    // the rim of every spot goes unshadowed.
+    const float fov = std::min(outer_degrees * 2.2f, 170.0f) * 3.14159265f / 180.0f;
+    // PERSPECTIVE, not orthographic: a spot's rays diverge from a point. The
+    // directional light gets an ortho box for exactly the opposite reason.
+    return Mat4::PerspectiveReverseZ(fov, 1.0f, shadow_near) * view;
+}
+
 Mat4 Scene::LightViewProj() const {
     const Vec3 dir = Normalize(Vec3{lightDir.x, lightDir.y, lightDir.z});
     // lightDir points TOWARD the light, so the virtual camera sits out along it

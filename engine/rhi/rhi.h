@@ -88,6 +88,17 @@ class Encoder {
   public:
     void SetPipeline(PipelineId);
     void SetCull(Cull, Winding);
+
+    // Restricts drawing to a rectangle of the current target, in pixels.
+    //
+    // What this is FOR: a shadow atlas. Several lights each need their own
+    // depth map, and one texture divided into tiles costs one pass and one
+    // texture binding instead of N of each. The viewport remaps clip space onto
+    // the tile; the scissor is what stops a triangle that falls outside it from
+    // scribbling over a neighbour, and Metal will not do the second because you
+    // asked for the first.
+    void SetViewport(int x, int y, int width, int height);
+    void SetScissor(int x, int y, int width, int height);
     void SetVertexBuffer(BufferId, std::size_t offset, int slot);
     void SetFragmentBuffer(BufferId, std::size_t offset, int slot);
     // Binds a render target from an earlier pass as a sampled input.

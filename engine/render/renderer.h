@@ -121,6 +121,27 @@ class Renderer {
 
     // Both record into an already-open pass. width/height set the projection's
     // aspect ratio only.
+    // Depth maps for the scene's local lights, all into one atlas.
+    //
+    // ONE pass, tiled, rather than a pass per light: a shadowed light otherwise
+    // costs a render target, a pass and a texture binding each, and the shader
+    // would need an array of samplers whose length is fixed at compile time.
+    //
+    // Must run before DrawScene, into a pass whose depth target is
+    // ShadowAtlas(). Assigns tiles in scene order and stops when they run out —
+    // a light that gets none is drawn unshadowed rather than dropped.
+    void DrawLightShadows(rhi::Encoder&, const Scene&);
+
+    // The atlas texture, created lazily on the first call. Null before that.
+    [[nodiscard]] rhi::TextureId ShadowAtlas();
+    // Lights that were given a tile by the most recent DrawLightShadows.
+    [[nodiscard]] int ShadowedLightCount() const;
+
+    static constexpr int kShadowAtlasSize = 2048;
+    static constexpr int kShadowTilesPerSide = 2;   // 2x2 tiles of 1024
+    static constexpr int kMaxShadowedLights =
+        kShadowTilesPerSide * kShadowTilesPerSide;
+
     // Depth-only pass from the light's point of view. Must run BEFORE
     // DrawScene, into a pass whose depth target is `shadow_map`.
     //

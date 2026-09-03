@@ -85,6 +85,19 @@ struct Light {
     // smooth edge between. Ignored by a point light.
     float inner_degrees = 22.0f;
     float outer_degrees = 34.0f;
+
+    // Asks for a tile of the shadow atlas. Honoured for SPOTS only, and only
+    // while tiles remain — a point light casts in every direction at once and
+    // needs six faces, which is a different piece of work.
+    //
+    // Not free: every shadowed light adds a pass over the casters.
+    bool casts_shadow = false;
+    // How close to the lamp the shadow map starts. Too small wastes precision
+    // on space nothing occupies; too large clips geometry near the bulb.
+    float shadow_near = 0.20f;
+
+    // World -> this light's clip space. Meaningless for a point light.
+    [[nodiscard]] Mat4 ViewProj() const;
 };
 
 // One drawable placement: which mesh, where, what colour. The scene refers to

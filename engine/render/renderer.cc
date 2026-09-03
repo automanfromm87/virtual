@@ -40,7 +40,7 @@ constexpr char kSsaoSrc[] = {
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
 static_assert(sizeof(FrameUniforms) == 352, "FrameUniforms layout drifted");
-static_assert(sizeof(GpuLight) == 64, "GpuLight must pack to four float4s");
+static_assert(sizeof(GpuLight) == 144, "GpuLight layout drifted");
 static_assert(sizeof(VertexIn) == 64, "VertexIn layout drifted");
 static_assert(offsetof(VertexIn, normal) == 16, "GPU float3 occupies 16 bytes");
 static_assert(offsetof(VertexIn, color) == 32, "GPU float3 occupies 16 bytes");
@@ -128,6 +128,10 @@ struct Renderer::Impl {
     rhi::PipelineId composite;
     rhi::PipelineId shadow;
     rhi::PipelineId shadow_skinned;
+    rhi::TextureId shadow_atlas;
+    // Which scene light each atlas tile holds, in the order tiles were handed
+    // out. Kept so DrawScene can tell the shader where to look.
+    std::vector<int> shadow_tile_of_light;
     rhi::PipelineId ssao;
     rhi::TextureId dummy_shadow;  // bound when shadows are off
     // 1x1 opaque white. Standing in for an absent map keeps the shader
@@ -572,6 +576,96 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
     }
 }
 
+rhi::TextureId Renderer::ShadowAtlas() {
+    if (!Valid(impl_->shadow_atlas))
+        impl_->shadow_atlas = impl_->dev->CreateShadowMap(kShadowAtlasSize);
+    return impl_->shadow_atlas;
+}
+
+int Renderer::ShadowedLightCount() const {
+    int n = 0;
+    for (int t : impl_->shadow_tile_of_light)
+        if (t >= 0) ++n;
+    return n;
+}
+
+void Renderer::DrawLightShadows(rhi::Encoder& enc, const Scene& scene) {
+    impl_->shadow_tile_of_light.assign(scene.lights.size(), -1);
+    if (!Valid(ShadowAtlas())) return;
+
+    constexpr int kTile = kShadowAtlasSize / kShadowTilesPerSide;
+    enc.SetPipeline(impl_->shadow);
+    // Same reasoning as the directional pass: recording the BACK of each caster
+    // keeps a surface from shadowing itself without a peter-panning offset.
+    enc.SetCull(rhi::Cull::Front, rhi::Winding::CounterClockwise);
+    rhi::PipelineId bound = impl_->shadow;
+
+    int tile = 0;
+    for (std::size_t li = 0; li < scene.lights.size(); ++li) {
+        const Light& light = scene.lights[li];
+        // Spots only. A point light casts in every direction, which is six
+        // faces and a cube lookup — a different piece of work, not a bigger
+        // version of this one.
+        if (!light.casts_shadow || light.type != LightType::Spot) continue;
+        if (tile >= kMaxShadowedLights) break;
+
+        const int tx = (tile % kShadowTilesPerSide) * kTile;
+        const int ty = (tile / kShadowTilesPerSide) * kTile;
+        enc.SetViewport(tx, ty, kTile, kTile);
+        // The scissor as well. The viewport only remaps clip space; without
+        // this a triangle that lands outside the tile still rasterises, into
+        // whichever neighbour is there.
+        enc.SetScissor(tx, ty, kTile, kTile);
+
+        const Mat4 light_vp = light.ViewProj();
+        for (const Instance& inst : scene.instances) {
+            if (!Valid(inst.mesh) || inst.mesh.v >= impl_->meshes.size()) continue;
+            if (Valid(inst.material) && inst.material.v < impl_->materials.size() &&
+                impl_->materials[inst.material.v].transparent)
+                continue;
+            const GpuMesh& gm = impl_->meshes[inst.mesh.v];
+            const std::size_t offset = impl_->AllocUniform();
+            if (offset == Impl::kNoSpace) break;
+
+            const bool skinned = IsSkinned(gm, inst, scene);
+            std::size_t palette_offset = Impl::kNoSpace;
+            if (skinned) {
+                palette_offset = impl_->AllocPalette();
+                if (palette_offset == Impl::kNoSpace) continue;
+                std::memcpy(impl_->palette_map + palette_offset,
+                            scene.joint_matrices.data() + inst.palette,
+                            sizeof(Mat4) * std::size_t(gm.joint_count));
+            }
+            const rhi::PipelineId want =
+                skinned ? impl_->shadow_skinned : impl_->shadow;
+            if (want.v != bound.v) {
+                enc.SetPipeline(want);
+                bound = want;
+            }
+
+            FrameUniforms u{};
+            u.lightViewProj = light_vp;
+            u.model = inst.model;
+            u.surface = Vec4{0.0f, 0.0f, 0.0f, scene.clipY};
+            std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
+
+            enc.SetVertexBuffer(gm.vb, 0, kVertexSlot);
+            enc.SetVertexBuffer(impl_->uniforms, offset, kUniformSlot);
+            enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
+            if (skinned) {
+                enc.SetVertexBuffer(gm.skin_vb, 0, kSkinSlot);
+                enc.SetVertexBuffer(impl_->palettes, palette_offset, kPaletteSlot);
+            }
+            enc.DrawIndexedU16(gm.ib, gm.index_count);
+        }
+        impl_->shadow_tile_of_light[li] = tile;
+        ++tile;
+    }
+    // Hand the whole target back, or every later pass inherits this tile.
+    enc.SetViewport(0, 0, kShadowAtlasSize, kShadowAtlasSize);
+    enc.SetScissor(0, 0, kShadowAtlasSize, kShadowAtlasSize);
+}
+
 void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
                          int height, rhi::TextureId shadow_map) {
     impl_->stats = RenderStats{};
@@ -609,6 +703,18 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
             // Guarded: an inner cone wider than the outer one divides by a
             // negative and inverts the falloff.
             g.cone = Vec4{std::max(inner, outer + 1e-3f), outer, 0.0f, 0.0f};
+
+            // Where its depth map sits, if DrawLightShadows gave it one.
+            const int tile = std::size_t(i) < impl_->shadow_tile_of_light.size()
+                                 ? impl_->shadow_tile_of_light[std::size_t(i)]
+                                 : -1;
+            if (tile >= 0) {
+                constexpr float kSpan = 1.0f / float(kShadowTilesPerSide);
+                g.viewProj = l.ViewProj();
+                g.shadow = Vec4{float(tile % kShadowTilesPerSide) * kSpan,
+                                float(tile / kShadowTilesPerSide) * kSpan, kSpan,
+                                1.0f};
+            }
             dst[i] = g;
         }
     }
@@ -755,6 +861,11 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
         enc.SetFragmentTexture(mat.albedo, 0);
         enc.SetFragmentTexture(mat.roughness_map, 1);
         enc.SetFragmentTexture(shadow_tex, 2);
+        // The local lights' atlas. Something has to be bound even when no light
+        // has a tile, so the placeholder stands in — the shader guards on the
+        // per-light flag rather than on the texture.
+        enc.SetFragmentTexture(
+            Valid(impl_->shadow_atlas) ? impl_->shadow_atlas : impl_->dummy_shadow, 3);
         enc.SetFragmentSampler(impl_->sampler, 0);
         if (skinned) {
             enc.SetVertexBuffer(gm.skin_vb, 0, kSkinSlot);

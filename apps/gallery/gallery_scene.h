@@ -28,11 +28,17 @@
 
 namespace gallery {
 
+// Three DIFFERENT heights. Not decoration: identical plinths under identical
+// spots produce identical shadow maps, and a renderer that handed every light
+// the same atlas tile would render exactly the right picture. The gate cannot
+// tell those apart unless the maps differ.
 inline constexpr float kPlinthTop = 0.95f;
 inline constexpr float kPlinthX[3] = {-2.5f, 0.0f, 2.5f};
+inline constexpr float kPlinthH[3] = {1.42f, 0.95f, 0.62f};
 
 struct Assets {
-    eng::MeshHandle sphere, plinth, floor, wall, lamp, flag, pole;
+    eng::MeshHandle sphere, floor, wall, lamp, flag, pole;
+    eng::MeshHandle plinths[3];
     eng::MaterialHandle gold, copper, ceramic, stone, floor_mat, wall_mat,
         lamp_mat, flag_mat, pole_mat;
     demo::Flag flag_rig;
@@ -43,8 +49,9 @@ inline Assets Build(eng::rhi::Device& dev, eng::Renderer& r, std::string& error)
     Assets a;
     a.sphere = r.UploadMesh(eng::MakeUVSphere(0.55f, 48, 96, eng::Vec4{1, 1, 1, 1},
                                               eng::Vec4{1, 1, 1, 1}));
-    a.plinth = r.UploadMesh(
-        eng::MakeBox(eng::Vec3{0.42f, kPlinthTop * 0.5f, 0.42f}, eng::Vec4{1, 1, 1, 1}));
+    for (int i = 0; i < 3; ++i)
+        a.plinths[i] = r.UploadMesh(eng::MakeBox(
+            eng::Vec3{0.42f, kPlinthH[i] * 0.5f, 0.42f}, eng::Vec4{1, 1, 1, 1}));
     a.floor = r.UploadMesh(
         eng::MakeBox(eng::Vec3{9.0f, 0.2f, 7.0f}, eng::Vec4{1, 1, 1, 1}));
     a.wall = r.UploadMesh(
@@ -107,7 +114,8 @@ inline Assets Build(eng::rhi::Device& dev, eng::Renderer& r, std::string& error)
     md.shading = eng::Shading::Flat;
     a.lamp_mat = r.CreateMaterial(md, error);
 
-    a.ok = error.empty() && Valid(a.sphere) && Valid(a.flag) && Valid(a.floor);
+    a.ok = error.empty() && Valid(a.sphere) && Valid(a.flag) && Valid(a.floor) &&
+           Valid(a.plinths[0]) && Valid(a.plinths[2]);
     return a;
 }
 
@@ -147,12 +155,12 @@ inline eng::Scene MakeScene(const Assets& a, float time, float flicker = 1.0f) {
 
     const eng::MaterialHandle tops[3] = {a.gold, a.ceramic, a.copper};
     for (int i = 0; i < 3; ++i) {
-        add(a.plinth, a.stone,
-            eng::Mat4::Translation(eng::Vec3{kPlinthX[i], kPlinthTop * 0.5f, 0}));
+        add(a.plinths[i], a.stone,
+            eng::Mat4::Translation(eng::Vec3{kPlinthX[i], kPlinthH[i] * 0.5f, 0}));
         // A slow turn, so the highlights travel across the metals — a still
         // metal is the one case where a great BRDF looks like flat paint.
         add(a.sphere, tops[i],
-            eng::Mat4::Translation(eng::Vec3{kPlinthX[i], kPlinthTop + 0.55f, 0}) *
+            eng::Mat4::Translation(eng::Vec3{kPlinthX[i], kPlinthH[i] + 0.55f, 0}) *
                 QuatToMat4(eng::QuatFromAxisAngle(eng::Vec3{0, 1, 0},
                                                   time * 0.35f + float(i))));
     }
@@ -189,6 +197,7 @@ inline eng::Scene MakeScene(const Assets& a, float time, float flicker = 1.0f) {
         spot.range = 9.0f;
         spot.inner_degrees = 13.0f;
         spot.outer_degrees = 24.0f;
+        spot.casts_shadow = true;
         s.lights.push_back(spot);
     }
 

@@ -67,6 +67,9 @@ struct FrameUniforms {
 // it is the one that casts the shadow map, and it needs a matrix rather than a
 // position. See the note on Scene::lights.
 struct GpuLight {
+    // World -> this light's clip space. Only meaningful when it has a shadow
+    // tile; a point light would need six of these and does not get one yet.
+    ENG_MAT4 viewProj;
     // .xyz world position, .w the type: 0 point, 1 spot.
     ENG_VEC4 position;
     // .xyz the direction the light SHINES, from the lamp into the scene, which
@@ -78,6 +81,9 @@ struct GpuLight {
     // .x cos(inner cone), .y cos(outer cone). Equal for a point light, where
     // they are ignored.
     ENG_VEC4 cone;
+    // Where this light's depth map sits in the atlas: .xy the tile's origin in
+    // uv, .z the tile's size in uv, .w nonzero if it has one at all.
+    ENG_VEC4 shadow;
 };
 
 // Lights the fragment stage can read in one pass. A forward renderer pays for

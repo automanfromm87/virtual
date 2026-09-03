@@ -205,6 +205,49 @@ static inline float3 Brdf(float3 N, float3 V, float3 L, float3 albedo,
     return diffuse + specular;
 }
 
+// A spot's shadow lookup, into its tile of the atlas.
+//
+// Perspective, unlike the directional light's, so the divide by w is real work
+// rather than a formality — a spot's rays diverge and the depth is not linear
+// in clip space.
+static inline float SpotShadow(float4 clip, float4 tile, depth2d<float> atlas,
+                               sampler smp)
+{
+    if (clip.w <= 0.0f) return 1.0f;   // behind the lamp
+    const float3 ndc = clip.xyz / clip.w;
+    float2 uv = ndc.xy * 0.5f + 0.5f;
+    uv.y = 1.0f - uv.y;
+    // Outside its own frustum: lit. The cone falloff has already darkened
+    // anything out here, so the alternative is a black ring around the pool.
+    if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) return 1.0f;
+    if (ndc.z <= 0.0f) return 1.0f;    // past the far plane
+
+    // Into the tile. Clamped a texel inside it, because a bilinear tap at the
+    // very edge reaches into the neighbouring light's map and puts a stripe of
+    // someone else's shadow along the border.
+    const float texel = 1.0f / float(atlas.get_width());
+    const float2 lo = tile.xy + texel;
+    const float2 hi = tile.xy + tile.z - texel;
+
+    // Reversed-Z: nearer the light is a GREATER depth, so lit means "at least
+    // as near as whatever was recorded".
+    //
+    // The bias scales with depth. A constant one is either useless near the
+    // lamp or lets the far end of the cone shadow itself, because a
+    // perspective map's precision falls off with distance in a way an
+    // orthographic one's does not.
+    const float bias = 2.5e-4f + 4.0e-3f * ndc.z;
+    float lit = 0.0f;
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const float2 at = clamp(uv * tile.z + tile.xy +
+                                        float2(float(dx), float(dy)) * texel,
+                                    lo, hi);
+            lit += (ndc.z >= atlas.sample(smp, at) - bias) ? 1.0f : 0.0f;
+        }
+    return lit * (1.0f / 9.0f);
+}
+
 // Inverse-square falloff, windowed so it actually reaches zero at `range`.
 //
 // Pure 1/d² is the physical answer and never gets to zero, so a light would
@@ -225,6 +268,7 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
                        texture2d<float> albedoMap    [[texture(0)]],
                        texture2d<float> roughnessMap [[texture(1)]],
                        depth2d<float>   shadowMap    [[texture(2)]],
+                       depth2d<float>   shadowAtlas  [[texture(3)]],
                        sampler          smp          [[sampler(0)]])
 {
     // SECTION CUT before anything else: no point shading a fragment that is
@@ -273,6 +317,12 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
         }
         const float ndotl = saturate(dot(N, L));
         if (attenuation * ndotl <= 0.0f) continue;
+
+        if (lt.shadow.w > 0.5f) {
+            attenuation *= SpotShadow(lt.viewProj * float4(in.worldPos, 1.0f),
+                                      lt.shadow, shadowAtlas, smp);
+            if (attenuation <= 0.0f) continue;
+        }
         direct += Brdf(N, V, L, albedo, roughness, metallic) * lt.color.rgb *
                   ndotl * attenuation;
     }

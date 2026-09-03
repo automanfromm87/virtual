@@ -68,6 +68,17 @@ int main() {
         graph.Clear();
         {
             eng::RenderGraph::Pass p;
+            p.name = "spot shadows";
+            p.depth = app->Draw().ShadowAtlas();
+            p.clear_depth = 0.0f;
+            p.keep_depth = true;
+            p.execute = [&](eng::rhi::Encoder& e) {
+                app->Draw().DrawLightShadows(e, scene);
+            };
+            graph.AddPass(std::move(p));
+        }
+        {
+            eng::RenderGraph::Pass p;
             p.name = "shadow";
             p.depth = shadow_map;
             p.clear_depth = 0.0f;
@@ -84,7 +95,7 @@ int main() {
             p.clear_color[2] = 0.028f; p.clear_color[3] = 1.0f;
             p.clear_depth = 0.0f;
             p.keep_depth = ssao_on;
-            p.reads = {shadow_map};
+            p.reads = {shadow_map, app->Draw().ShadowAtlas()};
             p.execute = [&](eng::rhi::Encoder& e) {
                 app->Draw().DrawScene(e, scene, f.width, f.height, shadow_map);
             };
