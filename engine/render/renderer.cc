@@ -70,9 +70,13 @@ constexpr char kSkinningSrc[] = {
 constexpr char kCullSrc[] = {
 #embed "engine/shaders/cull.metal"
     , 0};
+constexpr char kClusterSrc[] = {
+#embed "engine/shaders/cluster.metal"
+    , 0};
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
-static_assert(sizeof(FrameUniforms) == 432, "FrameUniforms layout drifted");
+static_assert(sizeof(FrameUniforms) == 448, "FrameUniforms layout drifted");
+static_assert(sizeof(GpuClusters) == 64, "GpuClusters layout drifted");
 static_assert(sizeof(GpuLight) == 144, "GpuLight layout drifted");
 static_assert(sizeof(GpuCascades) == 288, "GpuCascades layout drifted");
 static_assert(sizeof(GpuInstance) == 96, "GpuInstance layout drifted");
@@ -99,6 +103,9 @@ constexpr int kSkinSlot = 2;     // per-vertex joints and weights
 constexpr int kPaletteSlot = 3;  // this instance's joint matrices
 constexpr int kLightSlot = 2;    // FRAGMENT stage: the scene's local lights
 constexpr int kCascadeSlot = 3;  // FRAGMENT stage: the sun's cascades
+constexpr int kClusterSlot = 5;         // FRAGMENT: the cluster grid's placement
+constexpr int kClusterCountSlot = 6;    // FRAGMENT: lights per cell
+constexpr int kClusterIndexSlot = 7;    // FRAGMENT: the per-cell light indices
 // VERTEX stage: the per-instance model and tint for an instanced draw. 4 and
 // not 2, even though the skin slot is free on this path -- reusing a slot whose
 // name says "skin" is how a future skinned-and-instanced draw gets one of them
@@ -338,6 +345,25 @@ struct Renderer::Impl {
     // shared with passes that may want something else later.
     rhi::SamplerId shadow_sampler;
     int anisotropy = 16;
+
+    // --- clustered lighting ---------------------------------------------------
+    bool clustered = false;
+    // Set by BinLights and cleared by nothing: a frame that shades without
+    // having binned falls back to the whole light buffer, which is correct and
+    // merely slow. Tracked so the bindings are not made from stale bins on the
+    // very first frame, when the buffers hold uninitialised memory -- THAT is
+    // not merely slow, it reads arbitrary light indices.
+    bool bins_valid = false;
+    rhi::ComputePipelineId cluster_bin;
+    rhi::BufferId cluster_counts;
+    rhi::BufferId cluster_indices;
+    rhi::BufferId cluster_lights;
+    rhi::BufferId cluster_candidates;
+    GpuClusters cluster_params{};
+    // Shared by UploadLights (per-draw ring) and BinLights (its own buffer).
+    // One function, because two would drift and the symptom would be the
+    // binning pass culling against ranges the shading pass does not use.
+    void FillLights(const Scene&, GpuLight* dst, int count) const;
 
     // One uniform ring covering every frame slot. Writing slot N is safe only
     // because Device::BeginFrame blocks until the frame that last used slot N
@@ -793,6 +819,134 @@ MaterialHandle Renderer::CreateMaterial(const MaterialDesc& desc,
 
 int Renderer::Samples() const { return impl_->samples; }
 
+void Renderer::SetClusteredLighting(bool on) {
+    if (on == impl_->clustered) return;
+    if (on) {
+        std::string error;
+        if (!Valid(impl_->cluster_bin)) {
+            const std::string src = std::string(kShaderTypesSrc) + "\n" + kClusterSrc;
+            impl_->cluster_bin =
+                impl_->dev->CreateComputePipeline(src, "cs_cluster_lights", error);
+        }
+        if (!Valid(impl_->cluster_counts))
+            impl_->cluster_counts = impl_->dev->CreateStorageBuffer(
+                sizeof(std::uint32_t) * ENG_CLUSTER_COUNT);
+        if (!Valid(impl_->cluster_indices))
+            impl_->cluster_indices = impl_->dev->CreateStorageBuffer(
+                sizeof(std::uint32_t) * ENG_CLUSTER_COUNT * ENG_CLUSTER_CAPACITY);
+        // Any allocation failure leaves clustering OFF rather than half on. A
+        // half-configured clustered path binds a null index buffer, and the
+        // shader's null check then silently falls back -- which is the right
+        // behaviour but hides the failure, so refuse here where it is visible.
+        if (!Valid(impl_->cluster_bin) || !Valid(impl_->cluster_counts) ||
+            !Valid(impl_->cluster_indices))
+            return;
+    }
+    impl_->clustered = on;
+    impl_->bins_valid = false;
+}
+
+bool Renderer::ClusteredLighting() const { return impl_->clustered; }
+
+void Renderer::BinLights(rhi::ComputeEncoder& enc, const Scene& scene, int width,
+                         int height, float far_distance) {
+    if (!impl_->clustered || width <= 0 || height <= 0) return;
+    const int light_count =
+        std::min(int(scene.lights.size()), int(ENG_MAX_LIGHTS));
+
+    const float aspect = float(width) / float(height);
+    const float near_z = std::max(scene.camera.nearZ, 1e-3f);
+    const float far_z = std::max(far_distance, near_z * 2.0f);
+
+    GpuClusters& c = impl_->cluster_params;
+    c.grid = Vec4{float(ENG_CLUSTER_X), float(ENG_CLUSTER_Y), float(ENG_CLUSTER_Z),
+                  float(ENG_CLUSTER_CAPACITY)};
+    c.depth = Vec4{near_z, far_z, std::log(far_z / near_z), float(width)};
+    c.screen = Vec4{float(height), float(width) / float(ENG_CLUSTER_X),
+                    float(height) / float(ENG_CLUSTER_Y), 0.0f};
+    c.slope = Vec4{1.0f / std::tan(scene.camera.fovY * 0.5f), aspect, 0.0f, 0.0f};
+
+    // The lights go in their own buffer for the binning pass. The per-draw
+    // uniform ring cannot serve: this runs in a COMPUTE pass, before any draw
+    // has allocated a slice, and the slice would be recycled by the time the
+    // fragment stage read it.
+    if (!Valid(impl_->cluster_lights))
+        impl_->cluster_lights =
+            impl_->dev->CreateStorageBuffer(sizeof(GpuLight) * ENG_MAX_LIGHTS);
+    if (!Valid(impl_->cluster_candidates))
+        impl_->cluster_candidates =
+            impl_->dev->CreateStorageBuffer(sizeof(std::uint32_t) * ENG_MAX_LIGHTS);
+    if (!Valid(impl_->cluster_lights) || !Valid(impl_->cluster_candidates)) return;
+    if (auto* dst = static_cast<GpuLight*>(impl_->dev->MapBuffer(impl_->cluster_lights)))
+        impl_->FillLights(scene, dst, light_count);
+
+    // FRUSTUM PRE-CULL, on the CPU, before the grid ever sees a light.
+    //
+    // Binning is O(cells x lights) -- 3456 sphere-box tests per light -- and
+    // without this it is O(cells x EVERY light in the scene), so a level with a
+    // thousand lamps pays for all thousand however few are on screen. That
+    // turns the one cost clustering was supposed to remove into a smaller
+    // version of itself.
+    //
+    // On the CPU because there are at most a few hundred lights and each test
+    // is six dot products: a kernel to do it would cost more in dispatch than
+    // in arithmetic, and it would need a compaction pass to produce the list.
+    int candidate_count = 0;
+    if (auto* cand = static_cast<std::uint32_t*>(
+            impl_->dev->MapBuffer(impl_->cluster_candidates))) {
+        const Frustum frustum = Frustum::FromViewProj(
+            scene.camera.ViewProj(aspect));
+        for (int i = 0; i < light_count; ++i) {
+            const Light& l = scene.lights[std::size_t(i)];
+            if (!frustum.IntersectsSphere(l.position, l.range)) continue;
+            cand[candidate_count++] = std::uint32_t(i);
+        }
+    }
+
+    // WORLD -> VIEW. The binning shader works entirely in view space, where a
+    // cell is an axis-aligned box; in world space every cell would be an
+    // arbitrarily oriented one and the sphere test would need eight planes.
+    const Mat4 view = Mat4::LookAt(scene.camera.eye, scene.camera.target,
+                                   scene.camera.up);
+
+    // The candidate count goes in AFTER the cull, which is why this is not set
+    // with the rest of the block above.
+    c.screen.w = float(candidate_count);
+
+    enc.SetPipeline(impl_->cluster_bin);
+    enc.SetBytes(&c, sizeof(c), 0);
+    enc.SetBytes(&view, sizeof(view), 1);
+    enc.SetBuffer(impl_->cluster_lights, 0, 2);
+    enc.SetBuffer(impl_->cluster_counts, 0, 3);
+    enc.SetBuffer(impl_->cluster_indices, 0, 4);
+    enc.SetBuffer(impl_->cluster_candidates, 0, 5);
+    enc.Dispatch3D(ENG_CLUSTER_X, ENG_CLUSTER_Y, ENG_CLUSTER_Z, 4, 3, 4);
+    impl_->bins_valid = true;
+}
+
+Renderer::ClusterStats Renderer::ReadClusterStats() {
+    ClusterStats st;
+    if (!impl_->bins_valid || !Valid(impl_->cluster_counts)) return st;
+    const auto* counts =
+        static_cast<const std::uint32_t*>(impl_->dev->MapBuffer(impl_->cluster_counts));
+    if (!counts) return st;
+    long long total = 0;
+    for (int i = 0; i < ENG_CLUSTER_COUNT; ++i) {
+        const int n = int(counts[i]);
+        if (n <= 0) continue;
+        ++st.occupied_cells;
+        total += n;
+        if (n > st.max_per_cell) {
+            st.max_per_cell = n;
+            st.max_slice = i / (ENG_CLUSTER_X * ENG_CLUSTER_Y);
+        }
+        if (n >= ENG_CLUSTER_CAPACITY) ++st.overflowed_cells;
+    }
+    if (st.occupied_cells > 0)
+        st.mean_per_occupied = double(total) / st.occupied_cells;
+    return st;
+}
+
 void Renderer::SetAnisotropy(int max_anisotropy) {
     const int n = max_anisotropy < 1 ? 1 : (max_anisotropy > 16 ? 16 : max_anisotropy);
     if (n == impl_->anisotropy) return;
@@ -1232,7 +1386,12 @@ void Renderer::DrawGBuffer(rhi::Encoder& enc, const Scene& scene, int width,
 // kind to notice.
 void Renderer::Impl::UploadLights(const Scene& scene, std::size_t light_offset,
                                   int light_count) {
-        auto* dst = reinterpret_cast<GpuLight*>(light_map + light_offset);
+    FillLights(scene, reinterpret_cast<GpuLight*>(light_map + light_offset),
+               light_count);
+}
+
+void Renderer::Impl::FillLights(const Scene& scene, GpuLight* dst,
+                                int light_count) const {
         for (int i = 0; i < light_count; ++i) {
             const Light& l = scene.lights[std::size_t(i)];
             GpuLight g{};
@@ -1447,6 +1606,10 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
                          scene.clipY};
         u.eyePos = Vec4{scene.camera.eye.x, scene.camera.eye.y,
                         scene.camera.eye.z, 1.0f};
+        {
+        const Vec3 vd = Normalize(scene.camera.target - scene.camera.eye);
+        u.viewDir = Vec4{vd.x, vd.y, vd.z, 0.0f};
+    }
         u.invViewProj = inv_view_proj;
         u.lighting = Vec4{float(light_count),
                           float(env.specular_mips), 0.0f, 0.0f};
@@ -1472,6 +1635,15 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
         enc.SetFragmentTexture(mat.emissive_map, 9);
         enc.SetFragmentTexture(mat.occlusion_map, 10);
         enc.SetFragmentSampler(shadow_sampler, 2);
+        // CLUSTERS, or nothing. Binding stale bins is worse than binding none:
+        // the shader's null check falls back to the full buffer, while a stale
+        // index list points at lights that may no longer exist.
+        if (bins_valid) {
+            enc.SetFragmentBytes(&cluster_params, sizeof(GpuClusters),
+                                 kClusterSlot);
+            enc.SetFragmentBuffer(cluster_counts, 0, kClusterCountSlot);
+            enc.SetFragmentBuffer(cluster_indices, 0, kClusterIndexSlot);
+        }
         enc.SetFragmentTexture(shadow_tex, 2);
         // The local lights' atlas. Something has to be bound even when no light
         // has a tile, so the placeholder stands in — the shader guards on the
@@ -1676,6 +1848,10 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
     u.surface = Vec4{1.0f, 0.0f, shadows ? 1.0f : 0.0f, 1e30f};
     u.eyePos = Vec4{scene.camera.eye.x, scene.camera.eye.y, scene.camera.eye.z,
                     1.0f};
+    {
+        const Vec3 vd = Normalize(scene.camera.target - scene.camera.eye);
+        u.viewDir = Vec4{vd.x, vd.y, vd.z, 0.0f};
+    }
     u.lighting = Vec4{float(light_count),
                       float(impl_->env.specular_mips), 0.0f, 0.0f};
     u.ambientSky = Vec4{scene.ambientSky.x, scene.ambientSky.y,
@@ -1707,6 +1883,15 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
     // slot 2 with a sampler of its own.
     enc.SetFragmentSampler(impl_->clamp_sampler, 0);
     enc.SetFragmentSampler(impl_->shadow_sampler, 2);
+    // CLUSTERS, or nothing. Binding stale bins is worse than binding
+    // none: the shader's null check falls back to the full buffer, while a
+    // stale index list points at lights that may no longer exist.
+    if (impl_->bins_valid) {
+        enc.SetFragmentBytes(&impl_->cluster_params, sizeof(GpuClusters),
+                             kClusterSlot);
+        enc.SetFragmentBuffer(impl_->cluster_counts, 0, kClusterCountSlot);
+        enc.SetFragmentBuffer(impl_->cluster_indices, 0, kClusterIndexSlot);
+    }
     // The environment probe. All three may be null handles, which binds
     // nothing -- and nothing is exactly what the shader's is_null_texture
     // check is looking for.
@@ -1972,6 +2157,10 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
                          scene.clipY};
         u.eyePos = Vec4{scene.camera.eye.x, scene.camera.eye.y, scene.camera.eye.z,
                         1.0f};
+        {
+        const Vec3 vd = Normalize(scene.camera.target - scene.camera.eye);
+        u.viewDir = Vec4{vd.x, vd.y, vd.z, 0.0f};
+    }
         u.lighting = Vec4{float(light_count),
                           float(impl_->env.specular_mips), 0.0f, 0.0f};
         u.ambientSky = Vec4{scene.ambientSky.x, scene.ambientSky.y,
@@ -1995,6 +2184,15 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
         enc.SetFragmentTexture(mat.emissive_map, 9);
         enc.SetFragmentTexture(mat.occlusion_map, 10);
         enc.SetFragmentSampler(impl_->shadow_sampler, 2);
+        // CLUSTERS, or nothing. Binding stale bins is worse than binding
+        // none: the shader's null check falls back to the full buffer, while a
+        // stale index list points at lights that may no longer exist.
+        if (impl_->bins_valid) {
+            enc.SetFragmentBytes(&impl_->cluster_params, sizeof(GpuClusters),
+                                 kClusterSlot);
+            enc.SetFragmentBuffer(impl_->cluster_counts, 0, kClusterCountSlot);
+            enc.SetFragmentBuffer(impl_->cluster_indices, 0, kClusterIndexSlot);
+        }
         enc.SetFragmentTexture(shadow_tex, 2);
         enc.SetFragmentTexture(
             Valid(impl_->shadow_atlas) ? impl_->shadow_atlas : impl_->dummy_shadow, 3);

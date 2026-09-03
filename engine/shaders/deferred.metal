@@ -87,7 +87,10 @@ fragment float4 fs_deferred(FullscreenOut in [[stage_in]],
                             texture2d<float>   brdfLut       [[texture(7)]],
                             sampler          smp         [[sampler(0)]],
                             sampler          envSmp      [[sampler(1)]],
-                            sampler          shadowSmp   [[sampler(2)]])
+                            sampler          shadowSmp   [[sampler(2)]],
+                            constant GpuClusters* clusters       [[buffer(5)]],
+                            device const uint*    clusterCounts  [[buffer(6)]],
+                            device const uint*    clusterIndices [[buffer(7)]])
 {
     const float depth = sceneDepth.sample(smp, in.uv);
     // Reversed-Z: 0 is the far plane, and it is what an untouched pixel holds.
@@ -120,6 +123,12 @@ fragment float4 fs_deferred(FullscreenOut in [[stage_in]],
         ShadeSurface(worldPos, nm.xyz, ar.rgb, ar.a, nm.a,
                      u.lightViewProj * float4(worldPos, 1.0f), u, lights,
                      cascades, shadowMap, shadowAtlas, shadowSmp,
-                     irradianceMap, specularMap, brdfLut, envSmp);
+                     irradianceMap, specularMap, brdfLut, envSmp,
+                     // No baked occlusion in the deferred path: the G-buffer
+                     // has no channel left for it, and packing it into an
+                     // alpha that already holds roughness would cost both.
+                     1.0f, clusters, clusterCounts, clusterIndices,
+                     in.position.xy,
+                     dot(worldPos - u.eyePos.xyz, u.viewDir.xyz));
     return float4(lit, 1.0f);
 }

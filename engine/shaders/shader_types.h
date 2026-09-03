@@ -52,6 +52,12 @@ struct FrameUniforms {
     // anything with a specular lobe does, because the highlight depends on
     // where you are standing.
     ENG_VEC4 eyePos;
+    // Unit vector the camera looks ALONG. Clustered lighting needs it to turn
+    // a world position into a distance along the view axis, which is the axis
+    // the depth slices are cut on -- using the straight-line distance from the
+    // eye instead would make the fragment's idea of a cell spherical while the
+    // binning pass's is planar, and the two disagree most at the screen edges.
+    ENG_VEC4 viewDir;
     // Depth reconstruction for the SSAO pass: .x nearZ, .y 1/tan(fovY/2),
     // .z aspect, .w sample radius in world metres.
     ENG_VEC4 ssao;
@@ -117,10 +123,53 @@ struct GpuCascades {
     ENG_VEC4 info;
 };
 
-// Lights the fragment stage can read in one pass. A forward renderer pays for
-// every light on every fragment, so this is a budget rather than a limit of the
-// format — past a few dozen the answer is to cluster them, not to raise this.
-#define ENG_MAX_LIGHTS 32
+// Lights the fragment stage can read in one pass.
+//
+// This is the size of the light BUFFER, not the number a fragment loops over.
+// With clustering on, a fragment reads only the handful its cluster overlaps,
+// so this is just how many lights a scene may contain at once.
+#define ENG_MAX_LIGHTS 256
+
+// CLUSTERED LIGHTING. The view frustum is cut into a 3D grid; a compute pass
+// works out which lights touch which cell; a fragment reads only its own cell's
+// list.
+//
+// Why the frustum and not the screen: a tile in screen space is an infinitely
+// long wedge, and every light anywhere along it counts as overlapping. Slicing
+// by depth as well turns that wedge into a box a few metres across, and the
+// number of lights a fragment actually evaluates stops depending on how deep
+// the scene is.
+//
+// 16 x 9 x 24 = 3456 cells. The x/y split matches a 16:9 frame so cells are
+// roughly square; the depth split is EXPONENTIAL, because a linear one puts
+// almost every cell beyond the distance where lights matter.
+#define ENG_CLUSTER_X 16
+#define ENG_CLUSTER_Y 9
+#define ENG_CLUSTER_Z 24
+#define ENG_CLUSTER_COUNT (ENG_CLUSTER_X * ENG_CLUSTER_Y * ENG_CLUSTER_Z)
+// Per cell. 64 x 3456 x 4 bytes is 884 KB, which is nothing, and overflowing a
+// cell drops lights rather than corrupting anything -- the binning pass stops
+// writing when it is full.
+#define ENG_CLUSTER_CAPACITY 64
+
+// The grid's placement in the view frustum, bound once per pass.
+//
+// Its own block rather than more fields on FrameUniforms: FrameUniforms is
+// written PER DRAW, and this is identical for every draw in a frame -- adding
+// it there would copy 32 bytes per object for a value that never changes.
+struct GpuClusters {
+    // x tiles across, y tiles down, z depth slices, w the per-cell capacity.
+    ENG_VEC4 grid;
+    // x near plane, y the far distance the slices reach, z log(far/near)
+    // precomputed, w screen width in pixels.
+    ENG_VEC4 depth;
+    // x screen height, y tile width in pixels, z tile height in pixels, w
+    // how many lights the buffer holds.
+    ENG_VEC4 screen;
+    // x = 1/tan(fovY/2), y = aspect. The projection's two scale factors, which
+    // are what turn a cell's NDC rectangle into view-space metres.
+    ENG_VEC4 slope;
+};
 
 // Skinning attributes, in their OWN buffer rather than inside VertexIn. A
 // static mesh vastly outnumbers a skinned one in most scenes, and adding this

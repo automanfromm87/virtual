@@ -561,6 +561,11 @@ class Device {
     friend class Encoder;
     friend class ComputeEncoder;
     Device();
+    // Attaches the frame's completion handler. MUST run after the last pass is
+    // encoded and before the command buffer is committed: it captures the list
+    // of timed passes, and that list does not exist until the passes have been
+    // encoded.
+    void InstallFrameCompletion();
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

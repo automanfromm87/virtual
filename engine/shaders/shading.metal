@@ -295,7 +295,21 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
                                   // multiplying direct light by a static map
                                   // is how baked AO stops reading as shadow and
                                   // starts reading as dirt.
-                                  float ao = 1.0f)
+                                  float ao = 1.0f,
+                                  // CLUSTERED light lists. Both null when
+                                  // clustering is off, and the loop below falls
+                                  // back to walking the whole buffer.
+                                  constant GpuClusters* clusters = nullptr,
+                                  device const uint* cluster_counts = nullptr,
+                                  device const uint* cluster_indices = nullptr,
+                                  // The fragment's pixel coordinate and its
+                                  // distance along the view axis, which is what
+                                  // picks the cell. Passed in rather than read
+                                  // from [[position]] because the deferred pass
+                                  // reconstructs both and the forward pass has
+                                  // them already.
+                                  float2 pixel = float2(0.0f),
+                                  float view_depth = 0.0f)
 {
     // Renormalize per fragment: interpolating unit vectors across a triangle
     // does not preserve length, and the error is worst mid-face.
@@ -333,8 +347,43 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
                     u.lightColor.rgb * saturate(dot(N, Lsun)) * shadow;
 
     // --- local lights --------------------------------------------------------
-    const uint light_count = min(uint(u.lighting.x), uint(ENG_MAX_LIGHTS));
-    for (uint i = 0; i < light_count; ++i) {
+    //
+    // Two ways in, and the loop body is shared. Without clustering the fragment
+    // walks the whole buffer; with it, the fragment finds its cell and walks
+    // that cell's list. Sharing the body is not tidiness -- two copies of a
+    // BRDF evaluation is exactly how a clustered path ends up subtly different
+    // from the brute-force one it is supposed to be an optimisation of.
+    const uint total = min(uint(u.lighting.x), uint(ENG_MAX_LIGHTS));
+    bool clustered = false;
+    uint cell_base = 0, count = total;
+    if (clusters != nullptr && cluster_counts != nullptr &&
+        cluster_indices != nullptr) {
+        const uint nx = uint(clusters->grid.x);
+        const uint ny = uint(clusters->grid.y);
+        const uint nz = uint(clusters->grid.z);
+        const uint capacity = uint(clusters->grid.w);
+        const float nearZ = clusters->depth.x;
+        const float log_ratio = clusters->depth.z;
+
+        const uint tx = min(uint(pixel.x / clusters->screen.y), nx - 1);
+        const uint ty = min(uint(pixel.y / clusters->screen.z), ny - 1);
+        // The inverse of the exponential slicing in cluster.metal. Clamped at
+        // both ends: a fragment nearer than the near plane cannot exist, and
+        // one beyond the grid's far distance goes in the last slice rather
+        // than off the end -- it will be over-lit rather than unlit, which is
+        // the failure worth choosing.
+        const float slice_f =
+            log(max(view_depth, nearZ) / nearZ) / log_ratio * float(nz);
+        const uint tz = min(uint(max(slice_f, 0.0f)), nz - 1);
+
+        const uint cell = (tz * ny + ty) * nx + tx;
+        cell_base = cell * capacity;
+        count = min(cluster_counts[cell], capacity);
+        clustered = true;
+    }
+
+    for (uint k = 0; k < count; ++k) {
+        const uint i = clustered ? cluster_indices[cell_base + k] : k;
         const GpuLight lt = lights[i];
         const float3 to_light = lt.position.xyz - worldPos;
         const float dist = length(to_light);

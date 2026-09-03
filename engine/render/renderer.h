@@ -502,6 +502,45 @@ class Renderer {
     void DrawSsao(rhi::Encoder&, const Camera&, int width, int height,
                   rhi::TextureId depth, float radius = 1.1f);
 
+    // CLUSTERED LIGHTING. Cuts the view frustum into a 16x9x24 grid, works out
+    // on the GPU which lights touch which cell, and lets each fragment read
+    // only its own cell's list.
+    //
+    // Off by default, and that is not timidity: below a few dozen lights the
+    // binning pass costs more than the loop it saves, because a fragment
+    // already rejects an out-of-range light with one distance test. It earns
+    // its place when the light count climbs past the point where that test
+    // itself is the cost.
+    //
+    // Must be followed by BinLights() inside a compute pass each frame, before
+    // any pass that shades. Draws silently fall back to the whole light buffer
+    // if the bins were never built -- wrong, but only in being slow.
+    void SetClusteredLighting(bool on);
+    [[nodiscard]] bool ClusteredLighting() const;
+    // `far_distance` is how deep the grid reaches. Beyond it, fragments use the
+    // last slice, so they see the lights of a cell that may be much larger than
+    // they are -- over-lit rather than unlit, which is the failure to prefer.
+    void BinLights(rhi::ComputeEncoder&, const Scene&, int width, int height,
+                   float far_distance = 200.0f);
+    // How many lights the busiest cell holds, and how many cells overflowed,
+    // after the most recent BinLights. A readback, so it costs a stall -- for
+    // a HUD or a test, not for a frame.
+    struct ClusterStats {
+        int max_per_cell = 0;
+        int occupied_cells = 0;
+        int overflowed_cells = 0;
+        double mean_per_occupied = 0.0;
+        // Which depth slice the busiest cell is in. Almost always the LAST one,
+        // and that is by design rather than by accident: fragments past the
+        // grid's far distance are clamped into the final slice, so it stands in
+        // for everything from there to the horizon and collects the lights of a
+        // volume with no end. Worth reporting, because "the busiest cell is
+        // slice 23 of 24" and "the busiest cell is slice 4" mean completely
+        // different things about how the grid is configured.
+        int max_slice = -1;
+    };
+    [[nodiscard]] ClusterStats ReadClusterStats();
+
     // Anisotropic filtering for MATERIAL textures, 1 to 16. Rebuilds the
     // sampler, so it is a settings change and not a per-frame one.
     //

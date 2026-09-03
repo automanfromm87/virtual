@@ -177,7 +177,12 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
                        texture2d<float> occlusionMap [[texture(10)]],
                        sampler          smp          [[sampler(0)]],
                        sampler          envSmp       [[sampler(1)]],
-                       sampler          shadowSmp    [[sampler(2)]])
+                       sampler          shadowSmp    [[sampler(2)]],
+                       // CLUSTERS. All three may be unbound, and the shading
+                       // function falls back to the whole light buffer.
+                       constant GpuClusters* clusters       [[buffer(5)]],
+                       device const uint*    clusterCounts  [[buffer(6)]],
+                       device const uint*    clusterIndices [[buffer(7)]])
 {
     // SECTION CUT before anything else: no point shading a fragment that is
     // about to be thrown away. This is what lets you look inside a building
@@ -203,11 +208,19 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
     // surface to one before anything downstream sees it, so a lamp and a sheet
     // of white paper arrive at the bloom pass identical and it glows off the
     // paper. Brightness has to survive to the end of the frame to be usable.
-    const float3 lit = ShadeSurface(in.worldPos, N, albedo, roughness,
+    const float3 worldPos = in.worldPos;
+    const float3 lit = ShadeSurface(worldPos, N, albedo, roughness,
                                     metallic, in.lightClip, u, lights, cascades,
                                     shadowMap, shadowAtlas, shadowSmp,
                                     irradianceMap, specularMap, brdfLut, envSmp,
-                                    ao);
+                                    ao, clusters, clusterCounts, clusterIndices,
+                                    in.position.xy,
+                                    // Distance ALONG the view axis, which is
+                                    // what the exponential slicing is in terms
+                                    // of -- not distance from the eye, which
+                                    // would make the cell boundaries spherical
+                                    // and disagree with the binning pass.
+                                    dot(worldPos - u.eyePos.xyz, u.viewDir.xyz));
     // EMISSION last and unlit. It is radiance the surface produces, so nothing
     // shadows it, no light affects it and ambient occlusion does not dim it --
     // a glowing sign in a dark alcove is exactly as bright as one in the open.

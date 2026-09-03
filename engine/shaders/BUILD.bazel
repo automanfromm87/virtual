@@ -14,6 +14,7 @@ cc_library(
     textual_hdrs = [
         "bloom.metal",
         "composite.metal",
+        "cluster.metal",
         "cull.metal",
         "decal.metal",
         "deferred.metal",

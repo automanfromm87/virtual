@@ -990,6 +990,21 @@ void Device::BeginFrame() { @autoreleasepool {
     impl_->timed_this_frame = 0;
     impl_->timing_labels.clear();
 
+}}
+
+// Attached at COMMIT, not at BeginFrame.
+//
+// It used to be attached at BeginFrame, three lines after timing_labels was
+// cleared, so the block captured an EMPTY label list and `timed` was always
+// zero. The resolve below never ran and LastFrameTimings always returned
+// nothing -- the whole GPU timing feature reported silence. Nothing in the
+// engine consumed it, so nothing noticed until a test asked for a number.
+//
+// The labels do genuinely have to be copied: the vector is cleared at the top
+// of the next BeginFrame and this block runs on a driver thread at an
+// unpredictable time, so capturing the member would be a data race whose
+// symptom is a garbage label, or a crash if it reallocated.
+void Device::InstallFrameCompletion() { @autoreleasepool {
     dispatch_semaphore_t sem = impl_->frame_sem;
     std::atomic<int>* counter = &impl_->in_flight;
     Impl* impl = impl_.get();
@@ -1143,11 +1158,13 @@ void Device::Present(Swapchain& sc) {
 }
 
 void Device::Commit() {
+    InstallFrameCompletion();
     [impl_->cb commit];
     impl_->cb = nil;
 }
 
 bool Device::CommitAndWait(std::string& error) {
+    InstallFrameCompletion();
     [impl_->cb commit];
     [impl_->cb waitUntilCompleted];  // MUST sync before reading pixels back
     const bool ok = (impl_->cb.error == nil);
