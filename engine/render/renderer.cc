@@ -73,6 +73,9 @@ constexpr char kCullSrc[] = {
 constexpr char kClusterSrc[] = {
 #embed "engine/shaders/cluster.metal"
     , 0};
+constexpr char kOitSrc[] = {
+#embed "engine/shaders/oit.metal"
+    , 0};
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
 static_assert(sizeof(FrameUniforms) == 544, "FrameUniforms layout drifted");
@@ -204,6 +207,8 @@ struct GpuMaterial {
     rhi::TextureId metallic_map;
     rhi::TextureId emissive_map;
     rhi::TextureId occlusion_map;
+    rhi::PipelineId oit_pipeline;
+    rhi::PipelineId oit_skinned_pipeline;
     rhi::TextureId normal_map;
     Vec3 emissive{0.0f, 0.0f, 0.0f};
     float normal_strength = 1.0f;
@@ -348,6 +353,7 @@ struct Renderer::Impl {
 
     // --- clustered lighting ---------------------------------------------------
     bool clustered = false;
+    bool oit_enabled = false;
     // Set by BinLights and cleared by nothing: a frame that shades without
     // having binned falls back to the whole light buffer, which is correct and
     // merely slow. Tracked so the bindings are not made from stale bins on the
@@ -451,8 +457,11 @@ struct Renderer::Impl {
         return off;
     }
 
+    // Which of the three geometry passes is running. A bool was enough for
+    // two; a third makes every call site read `false, true` and mean nothing.
+    enum class GeometryPass { Forward, GBuffer, Oit };
     void DrawGeometry(rhi::Encoder&, const Scene&, int width, int height,
-                      rhi::TextureId shadow_map, bool gbuffer);
+                      rhi::TextureId shadow_map, GeometryPass pass);
     void UploadLights(const Scene&, std::size_t light_offset, int light_count);
     void UploadCascades(const Scene&, std::size_t cascade_offset, float aspect);
     [[nodiscard]] rhi::Format FormatFor(Shading) const;
@@ -506,6 +515,15 @@ rhi::Format Renderer::Impl::FormatFor(Shading shading) const {
         case Shading::GBuffer:
         case Shading::DeferredLight:
         case Shading::LitInstanced:
+        // The OIT accumulation buffer sums weighted premultiplied colour, and
+        // the weights reach a few thousand -- an 8-bit target saturates on the
+        // first surface and the average that comes out of the resolve is white.
+        case Shading::OitAccumulate:
+            return Renderer::kSceneFormat;
+        // The resolve writes premultiplied colour to be blended over the HDR
+        // scene, so it is half-float too. It is the composite, later, that
+        // brings the whole thing down to a display.
+        case Shading::OitResolve:
             return Renderer::kSceneFormat;
         // The composite is the pass that brings it down to a display.
         default:
@@ -554,6 +572,19 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
         desc.vertex_fn = skinned ? "vs_skinned" : "vs_lit";
         desc.fragment_fn = "fs_gbuffer";
         desc.extra_colors = {kSceneFormat};  // attachment 1: normal + metallic
+    } else if (shading == Shading::OitAccumulate) {
+        // The LIT vertex stage and a fragment stage that writes the two
+        // commutative buffers instead of a colour. Same ShadeSurface, so a
+        // transparent surface is lit exactly like an opaque one -- two copies
+        // of the BRDF is how the two paths start disagreeing.
+        desc.source = ShadingSource(std::string(kLitSrc).append(kOitSrc).c_str());
+        desc.vertex_fn = skinned ? "vs_skinned" : "vs_lit";
+        desc.fragment_fn = "fs_oit";
+        desc.extra_colors = {rhi::Format::RGBA16Float};  // attachment 1: revealage
+    } else if (shading == Shading::OitResolve) {
+        desc.source = ShadingSource(std::string(kLitSrc).append(kOitSrc).c_str());
+        desc.vertex_fn = "vs_oit_resolve";
+        desc.fragment_fn = "fs_oit_resolve";
     } else if (shading == Shading::RayShadow) {
         desc.source = ShaderSource(kRaytraceSrc);
         desc.vertex_fn = "vs_rt_shadow";
@@ -591,10 +622,16 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
     desc.color = fmt;
     desc.samples = msaa;
     desc.depth = depth_test;
-    desc.blend = blend ? rhi::Blend::Alpha : rhi::Blend::None;
+    if (shading == Shading::OitAccumulate)
+        desc.blend = rhi::Blend::OitAccumulate;
+    else
+        desc.blend = blend ? rhi::Blend::Alpha : rhi::Blend::None;
     // A blended surface must not write depth, or the transparent objects behind
-    // it get rejected before they are ever shaded.
-    desc.depth_write = !blend;
+    // it get rejected before they are ever shaded. The OIT accumulation pass is
+    // blended by definition and must not write depth either -- it TESTS against
+    // the opaque depth so that glass behind a wall is rejected, and writes
+    // nothing so that two panes both contribute.
+    desc.depth_write = !blend && shading != Shading::OitAccumulate;
     // Reversed-Z: near maps to 1 and far to 0, so "closer" means GREATER. Pair
     // with clear_depth = 0 or nothing draws at all.
     desc.depth_compare = rhi::Compare::Greater;
@@ -796,6 +833,18 @@ MaterialHandle Renderer::CreateMaterial(const MaterialDesc& desc,
                 Shading::GBuffer, desc.depth_test, false, error, /*skinned=*/true);
             if (!Valid(m.gbuffer_skinned_pipeline)) return {};
         }
+        // The OIT form, built for every TRANSPARENT material whether or not
+        // order-independent transparency is currently on. Building it lazily
+        // when the mode is switched would mean switching it on mid-frame
+        // silently drops every material created before the switch.
+        if (desc.transparent) {
+            m.oit_pipeline = impl_->GetOrCreatePipeline(Shading::OitAccumulate,
+                                                        desc.depth_test, true, error);
+            if (!Valid(m.oit_pipeline)) return {};
+            m.oit_skinned_pipeline = impl_->GetOrCreatePipeline(
+                Shading::OitAccumulate, desc.depth_test, true, error, /*skinned=*/true);
+            if (!Valid(m.oit_skinned_pipeline)) return {};
+        }
     }
     m.cull = desc.cull;
     m.depth_test = desc.depth_test;
@@ -825,6 +874,29 @@ MaterialHandle Renderer::CreateMaterial(const MaterialDesc& desc,
 }
 
 int Renderer::Samples() const { return impl_->samples; }
+
+void Renderer::SetOrderIndependentTransparency(bool on) { impl_->oit_enabled = on; }
+bool Renderer::OrderIndependentTransparency() const { return impl_->oit_enabled; }
+
+void Renderer::DrawTransparentOit(rhi::Encoder& enc, const Scene& scene, int width,
+                                  int height, rhi::TextureId shadow_map) {
+    impl_->DrawGeometry(enc, scene, width, height, shadow_map,
+                        Impl::GeometryPass::Oit);
+}
+
+void Renderer::DrawOitResolve(rhi::Encoder& enc, rhi::TextureId accum,
+                              rhi::TextureId revealage) {
+    std::string error;
+    const rhi::PipelineId pipe = impl_->GetOrCreatePipeline(
+        Shading::OitResolve, /*depth_test=*/false, /*blend=*/false, error);
+    if (!Valid(pipe)) return;
+    enc.SetPipeline(pipe);
+    enc.SetCull(rhi::Cull::None, rhi::Winding::CounterClockwise);
+    enc.SetFragmentTexture(accum, 0);
+    enc.SetFragmentTexture(revealage, 1);
+    enc.SetFragmentSampler(impl_->clamp_sampler, 0);
+    enc.Draw(3);
+}
 
 bool Renderer::SetIrradianceVolume(const IrradianceVolume& v, std::string& error) {
     if (v.Empty()) {
@@ -1430,14 +1502,15 @@ void Renderer::DrawSceneDepth(rhi::Encoder& enc, const Scene& scene, int width,
 
 void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
                          int height, rhi::TextureId shadow_map) {
-    impl_->DrawGeometry(enc, scene, width, height, shadow_map, /*gbuffer=*/false);
+    impl_->DrawGeometry(enc, scene, width, height, shadow_map,
+                        Impl::GeometryPass::Forward);
 }
 
 void Renderer::DrawGBuffer(rhi::Encoder& enc, const Scene& scene, int width,
                            int height) {
     // No shadow map: the G-buffer pass does not light anything, so it has no
     // use for one. Shadows are sampled by the lighting pass that follows.
-    impl_->DrawGeometry(enc, scene, width, height, {}, /*gbuffer=*/true);
+    impl_->DrawGeometry(enc, scene, width, height, {}, Impl::GeometryPass::GBuffer);
 }
 
 // The light list and the cascade block, uploaded once per pass.
@@ -1506,7 +1579,9 @@ void Renderer::Impl::UploadCascades(const Scene& scene,
 
 void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
                                   int width, int height,
-                                  rhi::TextureId shadow_map, bool gbuffer) {
+                                  rhi::TextureId shadow_map, GeometryPass pass) {
+    const bool gbuffer = pass == GeometryPass::GBuffer;
+    const bool oit = pass == GeometryPass::Oit;
     stats = RenderStats{};
     stats.submitted = int(scene.instances.size());
     draw_order.clear();
@@ -1637,9 +1712,15 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
         // SKIPPED, not drawn forward: it is transparent, and drawing it here
         // would write its surface into the buffer as if it were opaque and
         // erase whatever is behind it.
+        // The OIT pass draws ONLY transparent surfaces, and the forward pass
+        // skips them when OIT is on -- otherwise every pane of glass is drawn
+        // twice, once sorted and once accumulated, and the two are added.
+        if (oit && !mat.transparent) continue;
+        if (!oit && !gbuffer && oit_enabled && mat.transparent) continue;
         const rhi::PipelineId want =
-            gbuffer ? (skinned ? mat.gbuffer_skinned_pipeline : mat.gbuffer_pipeline)
-                    : (skinned ? mat.skinned_pipeline : mat.pipeline);
+            oit ? (skinned ? mat.oit_skinned_pipeline : mat.oit_pipeline)
+            : gbuffer ? (skinned ? mat.gbuffer_skinned_pipeline : mat.gbuffer_pipeline)
+                      : (skinned ? mat.skinned_pipeline : mat.pipeline);
         if (!Valid(want)) {
             if (gbuffer) ++stats.incompatible;
             else ++stats.invalid;

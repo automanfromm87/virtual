@@ -103,7 +103,21 @@ inline bool Valid(SamplerId h) { return h.v != 0; }
 inline bool Valid(AccelId h) { return h.v != 0; }
 inline bool Valid(ComputePipelineId h) { return h.v != 0; }
 
-enum class Blend : std::uint8_t { None, Alpha, Additive };
+enum class Blend : std::uint8_t {
+    None,
+    Alpha,
+    Additive,
+    // WEIGHTED-BLENDED ORDER-INDEPENDENT TRANSPARENCY, the accumulation half.
+    //
+    // Two attachments with different blend functions: attachment 0 sums
+    // weighted premultiplied colour (src + dst), attachment 1 multiplies down
+    // the remaining visibility (dst * (1 - src)). Both operations commute, so
+    // the result does not depend on the order the surfaces were drawn -- which
+    // is the whole point, because sorting by object breaks the moment two
+    // transparent objects intersect and there is no order that is right for
+    // every pixel of them.
+    OitAccumulate,
+};
 
 struct PipelineDesc {
     // Shader source in the backend's own language. The RHI compiles it but
@@ -136,6 +150,9 @@ struct PipelineDesc {
     //             which is why a particle system that can use it should:
     //             ten thousand sparks need no sort at all.
     Blend blend = Blend::None;
+    // Per-attachment blending for OitAccumulate: attachment 0 adds and
+    // attachment 1 multiplies. Metal takes a blend state per attachment, so
+    // this is a property of the pipeline rather than of the encoder.
     // Multisample count. Must match the attachments the pipeline will be used
     // with — a pipeline built for one sample cannot draw into a four-sample
     // target, and Metal rejects that outright rather than silently aliasing.

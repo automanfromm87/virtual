@@ -1000,7 +1000,32 @@ PipelineId Device::CreatePipeline(const PipelineDesc& desc, std::string& error) 
     // Has to match the attachments exactly. Metal rejects a mismatch here,
     // which is the one class of format error it does NOT let through silently.
     pd.rasterSampleCount = NSUInteger(desc.samples > 0 ? desc.samples : 1);
-    if (desc.blend != Blend::None && !desc.depth_only) {
+    if (desc.blend == Blend::OitAccumulate && !desc.depth_only) {
+        // TWO attachments with DIFFERENT blend functions, which is the whole
+        // trick. Accumulation sums weighted premultiplied colour; revealage
+        // multiplies down what visibility is left. Both operations commute, so
+        // the result is the same whatever order the surfaces arrive in.
+        MTLRenderPipelineColorAttachmentDescriptor* acc = pd.colorAttachments[0];
+        acc.blendingEnabled = YES;
+        acc.rgbBlendOperation = MTLBlendOperationAdd;
+        acc.alphaBlendOperation = MTLBlendOperationAdd;
+        acc.sourceRGBBlendFactor = MTLBlendFactorOne;
+        acc.sourceAlphaBlendFactor = MTLBlendFactorOne;
+        acc.destinationRGBBlendFactor = MTLBlendFactorOne;
+        acc.destinationAlphaBlendFactor = MTLBlendFactorOne;
+
+        MTLRenderPipelineColorAttachmentDescriptor* rev = pd.colorAttachments[1];
+        rev.blendingEnabled = YES;
+        rev.rgbBlendOperation = MTLBlendOperationAdd;
+        rev.alphaBlendOperation = MTLBlendOperationAdd;
+        // dst * (1 - src). MTLBlendFactorZero on the source and
+        // OneMinusSourceColor on the destination is a MULTIPLY, expressed in
+        // the only vocabulary a fixed-function blender has.
+        rev.sourceRGBBlendFactor = MTLBlendFactorZero;
+        rev.sourceAlphaBlendFactor = MTLBlendFactorZero;
+        rev.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceColor;
+        rev.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    } else if (desc.blend != Blend::None && !desc.depth_only) {
         MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
         ca.blendingEnabled = YES;
         ca.rgbBlendOperation = MTLBlendOperationAdd;

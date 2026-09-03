@@ -55,6 +55,11 @@ enum class Shading : std::uint8_t {
     // Ray-traced shadows: fullscreen, traces one ray per pixel at the sun and
     // writes visibility. Needs hardware ray tracing and a built scene BVH.
     RayShadow,
+    // ORDER-INDEPENDENT TRANSPARENCY. OitAccumulate writes the two commutative
+    // buffers; OitResolve is the fullscreen pass that turns them into one
+    // premultiplied colour to blend over the opaque frame.
+    OitAccumulate,
+    OitResolve,
 };
 
 // What a surface looks like and how it is rasterised.
@@ -115,6 +120,11 @@ struct MaterialDesc {
     // Alpha blended, drawn after every opaque object, back to front, and NOT
     // writing depth. Glass needs all four of those or it stops looking like
     // glass — or worse, stops the room behind it from drawing at all.
+    //
+    // The back-to-front sort is by OBJECT, and that is exactly as far as it
+    // goes: two transparent objects that intersect have no single correct
+    // order, so one pops in front of the other along the intersection line.
+    // Renderer::SetOrderIndependentTransparency replaces the sort entirely.
     bool transparent = false;
 };
 
@@ -502,6 +512,27 @@ class Renderer {
     // written by an earlier pass with the SAME camera.
     void DrawSsao(rhi::Encoder&, const Camera&, int width, int height,
                   rhi::TextureId depth, float radius = 1.1f);
+
+    // ORDER-INDEPENDENT TRANSPARENCY for every transparent material.
+    //
+    // Off by default. It is an approximation and it shows where alphas are
+    // high -- a stack of nearly opaque sheets comes out too uniform, because
+    // the depth weight cannot fully express "the front one hides the rest".
+    // A scene whose transparency is a few well-separated panes is better served
+    // by the sort; a scene with intersecting glass, foliage or smoke is not
+    // served by the sort at all.
+    void SetOrderIndependentTransparency(bool on);
+    [[nodiscard]] bool OrderIndependentTransparency() const;
+    // Draws only the TRANSPARENT instances, into the two accumulation targets.
+    // Both must be cleared first: accumulation to (0,0,0,0) and revealage to
+    // (1,1,1,1), because revealage is a running product and starting it at zero
+    // makes every pixel fully covered before anything is drawn.
+    void DrawTransparentOit(rhi::Encoder&, const Scene&, int width, int height,
+                            rhi::TextureId shadow_map = {});
+    // Resolves them into one premultiplied colour. Blend it over the opaque
+    // frame with (ONE, ONE_MINUS_SRC_ALPHA).
+    void DrawOitResolve(rhi::Encoder&, rhi::TextureId accum,
+                        rhi::TextureId revealage);
 
     // A BAKED IRRADIANCE VOLUME, replacing the hemisphere-ambient guess with
     // measured indirect light. Uploads three 3D textures; pass an empty volume

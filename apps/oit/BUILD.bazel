@@ -1,0 +1,17 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Order-independent transparency, checked for the one property its name claims.
+# "Looks like glass" is not the test -- a back-to-front sort also looks like
+# glass, and it is what this replaces.
+cc_test(
+    name = "oit_test",
+    srcs = ["main.cpp"],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+    ],
+)
