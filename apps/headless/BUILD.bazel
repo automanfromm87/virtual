@@ -1,0 +1,17 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Renders offscreen and verifies its own pixels — no window, no GPU debugger.
+# This is the target you keep green while everything else is on fire.
+cc_binary(
+    name = "headless",
+    srcs = ["main.cpp"],
+    deps = ["//engine/render"],
+)
+
+cc_test(
+    name = "headless_test",
+    srcs = ["main.cpp"],
+    deps = ["//engine/render"],
+)

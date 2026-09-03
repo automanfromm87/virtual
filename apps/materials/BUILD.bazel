@@ -1,0 +1,31 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# PBR material grid. The only target that checks the BRDF's physics rather than
+# just "something got drawn".
+cc_binary(
+    name = "materials",
+    srcs = ["main.cpp"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+        "//engine/texture",
+    ],
+)
+
+cc_test(
+    name = "materials_test",
+    srcs = ["main.cpp"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+        "//engine/texture",
+    ],
+)

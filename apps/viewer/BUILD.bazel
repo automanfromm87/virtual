@@ -1,0 +1,57 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Interactive PBR material inspector. Orbit, relight, toggle shadows and AO.
+#
+# Interaction is not decoration here: a metallic/roughness surface is defined by
+# where its highlight sits, and that depends on the viewer and the light. A
+# still frame shows one slice and hides the rest.
+cc_library(
+    name = "materials_scene",
+    hdrs = ["materials_scene.h"],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+        "//engine/texture",
+    ],
+)
+
+cc_binary(
+    name = "viewer",
+    srcs = ["main.cpp"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":materials_scene",
+        "//engine/platform",
+        "//engine/render",
+        "//engine/rhi",
+    ],
+)
+
+# Offscreen counterpart: renders the same five spheres and checks that the
+# materials are actually distinguishable, so the demo has a regression gate and
+# not just a window someone has to squint at.
+cc_binary(
+    name = "offscreen",
+    srcs = ["offscreen.cpp"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":materials_scene",
+        "//engine/render",
+        "//engine/rhi",
+    ],
+)
+
+cc_test(
+    name = "materials_demo_test",
+    srcs = ["offscreen.cpp"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":materials_scene",
+        "//engine/render",
+        "//engine/rhi",
+    ],
+)

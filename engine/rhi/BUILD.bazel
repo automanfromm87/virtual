@@ -1,0 +1,23 @@
+load("@rules_cc//cc:defs.bzl", "objc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# The Render Hardware Interface. The only package that links Metal, and the
+# only one whose sources may be .mm.
+#
+# Deliberately depends on NOTHING inside the engine — not core, not scene. An
+# RHI that reaches upward is not an RHI.
+objc_library(
+    name = "rhi",
+    srcs = ["rhi_metal.mm"],
+    hdrs = ["rhi.h"],
+    linkopts = [
+        "-framework",
+        "Metal",
+        "-framework",
+        "Foundation",
+        "-framework",
+        "QuartzCore",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+)

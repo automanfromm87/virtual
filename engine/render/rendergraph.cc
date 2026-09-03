@@ -1,0 +1,140 @@
+#include "engine/render/rendergraph.h"
+
+#include <unordered_map>
+
+namespace eng {
+
+void RenderGraph::Clear() {
+    passes_.clear();
+    order_.clear();
+    order_names_.clear();
+}
+
+bool RenderGraph::Compile(std::string& error) {
+    order_.clear();
+    order_names_.clear();
+    const int n = int(passes_.size());
+    if (n == 0) return true;
+
+    // Who produces each texture.
+    //
+    // SINGLE WRITER, enforced. Two passes writing one texture is genuinely
+    // ambiguous here: passes are declared in arbitrary order (that is the whole
+    // point of deriving the order from dependencies), so nothing says which
+    // write should land first. A real frame graph resolves this by VERSIONING —
+    // every write produces a new virtual resource and a reader names the
+    // version it wants. Until that exists, silently picking one order would
+    // hand you a frame that renders differently depending on declaration order.
+    // Rejecting is the honest behaviour.
+    std::unordered_map<std::uint32_t, int> producer;
+    for (int i = 0; i < n; ++i) {
+        // A pass must write SOMEWHERE. Colour is the usual answer; a
+        // depth-only shadow pass writes depth instead.
+        if (!Valid(passes_[i].color)) {
+            if (!Valid(passes_[i].depth)) {
+                error = "pass '" + passes_[i].name +
+                        "' writes neither colour nor depth";
+                return false;
+            }
+            continue;  // depth-only: nothing to enter in the colour producer map
+        }
+        auto [it, inserted] = producer.emplace(passes_[i].color.v, i);
+        if (!inserted) {
+            error = "passes '" + passes_[it->second].name + "' and '" +
+                    passes_[i].name +
+                    "' both write the same colour target; resource versioning is "
+                    "not implemented, so their order would be undefined";
+            return false;
+        }
+    }
+
+    // Same rule for depth. Two passes sharing a depth buffer are ordered only
+    // by their colour dependencies, which is not enough to make the depth
+    // contents deterministic.
+    std::unordered_map<std::uint32_t, int> depth_writer;
+    for (int i = 0; i < n; ++i) {
+        if (!Valid(passes_[i].depth)) continue;
+        auto [it, inserted] = depth_writer.emplace(passes_[i].depth.v, i);
+        if (!inserted) {
+            error = "passes '" + passes_[it->second].name + "' and '" +
+                    passes_[i].name + "' share a depth target; ordering would be "
+                    "undefined";
+            return false;
+        }
+    }
+
+    // A written depth target counts as a producer too, so a pass that SAMPLES
+    // a shadow map is ordered after the pass that rendered it.
+    for (const auto& [tex, pass_index] : depth_writer)
+        producer.emplace(tex, pass_index);
+
+    // Edge producer -> consumer for every read.
+    std::vector<std::vector<int>> out(n);
+    std::vector<int> indegree(n, 0);
+    for (int i = 0; i < n; ++i) {
+        for (rhi::TextureId r : passes_[i].reads) {
+            auto it = producer.find(r.v);
+            if (it == producer.end()) {
+                error = "pass '" + passes_[i].name +
+                        "' reads a texture no pass in this graph writes";
+                return false;
+            }
+            if (it->second == i) {
+                // Sampling the texture you are simultaneously rendering into is
+                // undefined in every graphics API. The fix is a ping-pong pair
+                // of targets, which needs resource versioning — so refuse
+                // rather than produce a frame that works by luck.
+                error = "pass '" + passes_[i].name +
+                        "' samples the same texture it renders into";
+                return false;
+            }
+            out[it->second].push_back(i);
+            ++indegree[i];
+        }
+    }
+
+    // Kahn. Ties break on insertion order so the result is deterministic —
+    // a graph that shuffles equivalent passes run to run is untestable.
+    std::vector<int> ready;
+    for (int i = 0; i < n; ++i)
+        if (indegree[i] == 0) ready.push_back(i);
+
+    while (!ready.empty()) {
+        int best = 0;
+        for (int k = 1; k < int(ready.size()); ++k)
+            if (ready[k] < ready[best]) best = k;
+        const int i = ready[best];
+        ready.erase(ready.begin() + best);
+
+        order_.push_back(i);
+        order_names_.push_back(passes_[i].name);
+        for (int j : out[i])
+            if (--indegree[j] == 0) ready.push_back(j);
+    }
+
+    if (int(order_.size()) != n) {
+        error = "render graph has a dependency cycle";
+        order_.clear();
+        order_names_.clear();
+        return false;
+    }
+    return true;
+}
+
+void RenderGraph::Execute(rhi::Device& dev) {
+    for (int i : order_) {
+        const Pass& p = passes_[i];
+        rhi::PassDesc desc;
+        desc.color = p.color;
+        desc.depth = p.depth;
+        for (int c = 0; c < 4; ++c) desc.clear_color[c] = p.clear_color[c];
+        desc.clear_depth = p.clear_depth;
+        desc.keep_depth = p.keep_depth;
+
+        rhi::Encoder enc = dev.BeginPass(desc);
+        if (p.execute) p.execute(enc);
+        dev.EndPass();
+    }
+}
+
+}  // namespace eng

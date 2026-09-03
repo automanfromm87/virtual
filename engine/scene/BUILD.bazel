@@ -1,0 +1,15 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Pure C++20 scene description: cameras, transforms, colours. Knows nothing
+# about Metal or buffers, so it stays testable without a GPU.
+cc_library(
+    name = "scene",
+    srcs = ["scene.cc"],
+    hdrs = ["scene.h"],
+    deps = [
+        "//engine/core",
+        "//engine/resource",
+    ],
+)

@@ -1,0 +1,66 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# The wiring: glTF in, ECS in the middle, physics driving it, a Scene out.
+# Shared so the windowed demo and the offscreen gate simulate the same world.
+cc_library(
+    name = "world_scene",
+    hdrs = ["world_scene.h"],
+    deps = [
+        "//engine/asset",
+        "//engine/ecs",
+        "//engine/geometry",
+        "//engine/physics",
+        "//engine/render",
+        "//engine/scene",
+        "//engine/serialize",
+    ],
+)
+
+# The default arrangement. In textual_hdrs so that it is an input to whatever
+# #embed's it — which is what makes `bazel build` notice when the scene changes.
+cc_library(
+    name = "default_scene",
+    textual_hdrs = ["world.scene.json"],
+)
+
+cc_binary(
+    name = "viewer",
+    srcs = ["viewer.cpp"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":default_scene",
+        ":world_scene",
+        "//engine/asset:testdata",
+        "//engine/platform",
+        "//engine/render",
+        "//engine/rhi",
+    ],
+)
+
+cc_binary(
+    name = "offscreen",
+    srcs = ["offscreen.cpp"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":default_scene",
+        ":world_scene",
+        "//engine/asset:testdata",
+        "//engine/render",
+        "//engine/rhi",
+    ],
+)
+
+cc_test(
+    name = "world_test",
+    srcs = ["offscreen.cpp"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":default_scene",
+        ":world_scene",
+        "//engine/asset:testdata",
+        "//engine/render",
+        "//engine/rhi",
+    ],
+)

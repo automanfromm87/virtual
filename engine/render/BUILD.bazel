@@ -1,0 +1,31 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# cc_library, NOT objc_library — and that is the whole point of the RHI split.
+# This layer decides what to draw and links no Apple framework at all. If a
+# Metal type ever leaks up from engine/rhi, this rule stops compiling.
+cc_library(
+    name = "render",
+    srcs = [
+        "rendergraph.cc",
+        "renderer.cc",
+    ],
+    hdrs = [
+        "rendergraph.h",
+        "renderer.h",
+    ],
+    copts = [
+        # #embed is a C23 feature; clang accepts it in C++ mode but warns.
+        "-Wno-c23-extensions",
+    ],
+    deps = [
+        "//engine/core",
+        "//engine/geometry",
+        "//engine/rhi",
+        "//engine/resource",
+        "//engine/scene",
+        "//engine/shaders",
+        "//engine/texture",
+    ],
+)

@@ -1,0 +1,74 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Asset import. Pure C++20 and no third-party code, which is why the JSON
+# reader lives here too — glTF needs one and the engine takes no dependencies.
+# JSON on its own: the scene serialiser wants a reader and a writer, and has no
+# business pulling in a glTF importer to get them.
+cc_library(
+    name = "json",
+    srcs = ["json.cc"],
+    hdrs = ["json.h"],
+)
+
+# PNG, with the DEFLATE decompressor it needs. Separate from the glTF reader:
+# an importer wants both, but a texture loader wants only this.
+cc_library(
+    name = "png",
+    srcs = ["png.cc"],
+    hdrs = ["png.h"],
+    deps = ["//engine/texture"],
+)
+
+cc_library(
+    name = "asset",
+    srcs = ["gltf.cc"],
+    hdrs = ["gltf.h"],
+    deps = [
+        ":json",
+        ":png",
+        "//engine/core",
+        "//engine/geometry",
+    ],
+)
+
+# The fixture, exposed so demos can import a real glTF document without
+# shipping a file the binary has to find at runtime.
+cc_library(
+    name = "testdata",
+    textual_hdrs = [
+        "testdata_quad_gltf.inc",
+        "testdata_textured_gltf.inc",
+    ],
+)
+
+cc_test(
+    name = "json_test",
+    srcs = ["json_test.cc"],
+    deps = [":json"],
+)
+
+cc_test(
+    name = "png_test",
+    srcs = [
+        "png_test.cc",
+        # Real PNG files, generated once by an independent encoder and checked
+        # in. In srcs, not data: they are #include'd as C arrays.
+        "testdata_png.inc",
+    ],
+    deps = [":png"],
+)
+
+cc_test(
+    name = "gltf_test",
+    srcs = [
+        "gltf_test.cc",
+        # A real glTF 2.0 document with an embedded base64 buffer, generated
+        # once and checked in — beats depending on an exporter being installed.
+        # In srcs, not data: it is #include'd, so it is a compile-time input.
+        "testdata_quad_gltf.inc",
+        "testdata_textured_gltf.inc",
+    ],
+    deps = [":asset"],
+)

@@ -1,0 +1,11 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Header-only handle types. Depends on nothing, on purpose: it exists so that
+# engine/scene and engine/render can refer to the same resources without either
+# one depending on the other.
+cc_library(
+    name = "resource",
+    hdrs = ["handles.h"],
+)

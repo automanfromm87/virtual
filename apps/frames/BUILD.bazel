@@ -1,0 +1,29 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Frames-in-flight / uniform-ring check. The only target that submits without
+# waiting, which is the only way ring-slot reuse ever happens.
+cc_binary(
+    name = "frames",
+    srcs = ["main.cpp"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/core",
+        "//engine/scene",
+    ],
+)
+
+cc_test(
+    name = "frames_test",
+    srcs = ["main.cpp"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/core",
+        "//engine/scene",
+    ],
+)

@@ -1,0 +1,66 @@
+// The CPU/GPU layout contract. Included as a real header by C++, and textually
+// prepended to every shader before runtime compilation.
+//
+// RULE: every type used below must be byte-identical on both sides. When in
+// doubt, use float4 and pad by hand. Never put a bare 3-float struct here —
+// MSL's float3 occupies 16 bytes, not 12.
+#ifndef ENGINE_SHADER_TYPES_H
+#define ENGINE_SHADER_TYPES_H
+
+#ifdef __METAL_VERSION__
+#  include <metal_stdlib>
+using namespace metal;
+#  define ENG_MAT4 float4x4
+#  define ENG_VEC4 float4
+#  define ENG_VEC3 float3  // 16 bytes
+#else
+#  include "engine/core/math.h"
+#  define ENG_MAT4 ::eng::Mat4
+#  define ENG_VEC4 ::eng::Vec4
+#  define ENG_VEC3 ::eng::Vec4  // deliberately Vec4: matches MSL float3's 16 bytes
+#endif
+
+struct FrameUniforms {
+    ENG_MAT4 viewProj;
+    ENG_MAT4 model;  // object -> world. Normals use this too (rotation only).
+    // World -> the light's clip space. Orthographic, because a directional
+    // light's rays are parallel and have no vanishing point.
+    ENG_MAT4 lightViewProj;
+    ENG_VEC4 tint;   // per-instance colour multiplier
+    // Unit vector pointing FROM the surface TOWARD the light, in world space.
+    // Named for where the light IS, not where its photons go — the other
+    // convention costs you a sign error every single time.
+    ENG_VEC4 lightDir;
+    ENG_VEC4 lightColor;  // rgb = radiance, .w unused
+
+    // --- material ------------------------------------------------------------
+    ENG_VEC4 baseColor;  // multiplied by the albedo map and by tint
+    // .x roughness, .y metallic, .z shadows-on (0 or 1), .w SECTION CUT height
+    // in world Y — fragments above it are discarded. Roughness
+    // and metallic are multiplied by the corresponding map, which defaults to
+    // 1x1 white — so an untextured material needs no branch in the shader.
+    ENG_VEC4 surface;
+    // World-space camera position. Diffuse-only shading never needed it;
+    // anything with a specular lobe does, because the highlight depends on
+    // where you are standing.
+    ENG_VEC4 eyePos;
+    // Depth reconstruction for the SSAO pass: .x nearZ, .y 1/tan(fovY/2),
+    // .z aspect, .w sample radius in world metres.
+    ENG_VEC4 ssao;
+};
+
+struct VertexIn {
+    ENG_VEC3 position;  // .w unused on the C++ side
+    ENG_VEC3 normal;    // object space, unit length; .w unused
+    ENG_VEC4 color;
+    // .xy = texture coordinates, origin top-left to match Metal's texture
+    // convention. .zw reserved (tangent sign / a second uv set later).
+    //
+    // A bare float2 would be tempting, but MSL would align the struct to 16
+    // anyway and the padding lands somewhere less useful. The unused .w lanes
+    // of position and normal cannot be used instead: they are float3 on the
+    // MSL side, which occupies 16 bytes but exposes only .xyz.
+    ENG_VEC4 uv;
+};
+
+#endif  // ENGINE_SHADER_TYPES_H

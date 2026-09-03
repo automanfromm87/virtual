@@ -1,0 +1,27 @@
+module(
+    name = "virtual_engine",
+    version = "0.1.0",
+)
+
+# The engine has zero third-party CODE dependencies — only the C++20 standard
+# library and Apple's system frameworks.
+#
+# rules_cc is not engine code: since Bazel 9 the cc_* rules are no longer
+# built in, so every BUILD file must load() them from here. Along with
+# platforms and apple_support (which supplies the macOS C++ toolchain) this is
+# build infrastructure. Fetched once, then cached forever.
+bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "apple_support", version = "1.24.2", repo_name = "build_bazel_apple_support")
+
+# apple_support registers this toolchain itself, but so does rules_cc's
+# autoconfigured local_config_cc — and that one cannot compile Objective-C.
+# Registering from the ROOT module puts the Apple toolchain first in
+# resolution order, which is what makes //engine/gpu (objc_library) build.
+apple_cc_configure = use_extension(
+    "@build_bazel_apple_support//crosstool:setup.bzl",
+    "apple_cc_configure_extension",
+)
+use_repo(apple_cc_configure, "local_config_apple_cc_toolchains")
+
+register_toolchains("@local_config_apple_cc_toolchains//:all")

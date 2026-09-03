@@ -1,0 +1,18 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Rigid body dynamics. Pure C++20 and no GPU, so every property below is
+# checkable exactly rather than by looking at a picture.
+cc_library(
+    name = "physics",
+    srcs = ["physics.cc"],
+    hdrs = ["physics.h"],
+    deps = ["//engine/core"],
+)
+
+cc_test(
+    name = "physics_test",
+    srcs = ["physics_test.cc"],
+    deps = [":physics"],
+)

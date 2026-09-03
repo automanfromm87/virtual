@@ -1,0 +1,21 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Entities, components, and the transform hierarchy. Pure C++20 — no GPU, no
+# physics, no renderer, so it can be tested exactly.
+cc_library(
+    name = "ecs",
+    srcs = ["ecs.cc"],
+    hdrs = ["ecs.h"],
+    deps = [
+        "//engine/core",
+        "//engine/resource",
+    ],
+)
+
+cc_test(
+    name = "ecs_test",
+    srcs = ["ecs_test.cc"],
+    deps = [":ecs"],
+)

@@ -1,0 +1,18 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Pure C++20 pixel buffers. Procedural only — there is no asset pipeline yet,
+# so nothing here reads a file, and none of it needs a GPU to test.
+cc_library(
+    name = "texture",
+    srcs = ["texture.cc"],
+    hdrs = ["texture.h"],
+    deps = ["//engine/core"],
+)
+
+cc_test(
+    name = "texture_test",
+    srcs = ["texture_test.cc"],
+    deps = [":texture"],
+)

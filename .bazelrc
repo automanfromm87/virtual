@@ -1,0 +1,41 @@
+# C++20 for every target, host and target platform alike.
+build --cxxopt=-std=c++20
+build --host_cxxopt=-std=c++20
+
+build --copt=-Wall
+build --verbose_failures
+test --test_output=errors
+
+# CORRECTNESS, not a performance knob. Without this, editing a header — or
+# engine/shaders/triangle.metal — leaves the target "up-to-date" and you keep
+# running a stale binary. In graphics that is indistinguishable from a shader
+# bug, so it costs hours before you suspect the build.
+#
+# Root cause is a path collision, not a Bazel bug:
+#   1. apple_support's toolchain declares four whole-tree prefixes as builtin
+#      include dirs — /Applications/, /Library/, $HOME/Applications/ and
+#      $HOME/Library/ (crosstool/osx_cc_configure.bzl, _get_escaped_xcode_cxx_
+#      inc_directories).
+#   2. Bazel 9's default macOS output base is $HOME/Library/Caches/bazel/...,
+#      so the exec root lives INSIDE one of those prefixes.
+#   3. Bazel absolutizes every .d entry against the exec root, then skips any
+#      path under a builtin include dir as a system header. Every one of our
+#      own headers matches, so the discovered-input set comes out EMPTY and all
+#      headers get pruned out of the action key.
+# objc_library forces the apple_support toolchain, and Bazel resolves one CC
+# toolchain per configuration, so this hits every C++ target here — not just
+# the .mm file. rules_cc's local_config_cc declares precise SDK dirs instead,
+# which is why the same edit rebuilds correctly under it.
+#
+# no_dotd_file is checked language-independently by rules_cc's
+# dotd_files_enabled(), so this ONE feature covers CppCompile and ObjcCompile
+# both; the --nocc_dotd_files flag covers only the former and silently leaves
+# shader edits stale. Cost: compiles keep their full declared header set, so
+# rebuilds are coarser. At four targets that is free.
+#
+# The alternative is to break the path containment instead, which keeps precise
+# pruning:  startup --output_user_root=/var/tmp/bazel_virtual
+# Verified working, but it is machine config rather than code, forces a server
+# restart plus one clean refetch, and .bazelrc does not expand $USER. Preferred
+# once apple_support stops claiming all of $HOME/Library as system includes.
+build --features=no_dotd_file

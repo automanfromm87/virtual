@@ -1,0 +1,24 @@
+load("@rules_cc//cc:defs.bzl", "objc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Windows, events, main loop. The only package that links AppKit — a headless
+# CI machine never pulls this in, which is what keeps apps/headless provably
+# window-server-free.
+#
+# Note it does NOT depend on //engine/rhi: it receives the native layer as an
+# opaque void*, so the platform layer and the graphics API stay independent.
+objc_library(
+    name = "platform",
+    srcs = ["window.mm"],
+    hdrs = ["window.h"],
+    linkopts = [
+        "-framework",
+        "AppKit",
+        "-framework",
+        "QuartzCore",
+        "-framework",
+        "Foundation",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+)

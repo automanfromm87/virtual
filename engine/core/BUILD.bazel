@@ -1,0 +1,16 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Pure C++20. No platform code, no Metal, no Objective-C.
+# Everything else in the engine may depend on this; it depends on nothing.
+cc_library(
+    name = "core",
+    hdrs = ["math.h"],
+)
+
+cc_test(
+    name = "math_test",
+    srcs = ["math_test.cc"],
+    deps = [":core"],
+)

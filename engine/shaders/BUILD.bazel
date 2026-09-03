@@ -1,0 +1,22 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# shader_types.h is compiled twice: once as a normal C++ header, and once by
+# Metal's runtime compiler after being prepended to a .metal file.
+#
+# triangle.metal is never compiled by Bazel. It is listed in textual_hdrs so
+# that it becomes an input to any action that #embed's it — that is what makes
+# `bazel build` correctly rebuild the renderer when you edit a shader.
+cc_library(
+    name = "shaders",
+    hdrs = ["shader_types.h"],
+    textual_hdrs = [
+        "composite.metal",
+        "shadow.metal",
+        "ssao.metal",
+        "lit.metal",
+        "triangle.metal",
+    ],
+    deps = ["//engine/core"],
+)

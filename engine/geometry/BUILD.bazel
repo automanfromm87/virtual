@@ -1,0 +1,33 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Pure C++20 mesh generation. Produces plain vertex/index arrays plus a bounding
+# sphere — no Metal, no platform code — so it is testable without a GPU.
+cc_library(
+    name = "geometry",
+    srcs = [
+        "floorplan.cc",
+        "mesh.cc",
+    ],
+    hdrs = [
+        "floorplan.h",
+        "mesh.h",
+    ],
+    deps = [
+        "//engine/core",
+        "//engine/shaders",
+    ],
+)
+
+cc_test(
+    name = "mesh_test",
+    srcs = ["mesh_test.cc"],
+    deps = [":geometry"],
+)
+
+cc_test(
+    name = "floorplan_test",
+    srcs = ["floorplan_test.cc"],
+    deps = [":geometry"],
+)

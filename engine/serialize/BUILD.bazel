@@ -1,0 +1,23 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Scene files. Pure C++20 — it stores the arrangement of a world, not its
+# assets, so it needs the ECS and physics but nothing that touches a GPU.
+cc_library(
+    name = "serialize",
+    srcs = ["scene_io.cc"],
+    hdrs = ["scene_io.h"],
+    deps = [
+        "//engine/asset:json",
+        "//engine/ecs",
+        "//engine/physics",
+        "//engine/resource",
+    ],
+)
+
+cc_test(
+    name = "scene_io_test",
+    srcs = ["scene_io_test.cc"],
+    deps = [":serialize"],
+)
