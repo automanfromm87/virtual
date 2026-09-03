@@ -26,6 +26,7 @@ cc_library(
         "ibl.metal",
         "lit.metal",
         "particles.metal",
+        "post.metal",
         "triangle.metal",
         "ui.metal",
     ],

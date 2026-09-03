@@ -48,6 +48,9 @@ class RenderGraph {
         rhi::TextureId depth;                 // written; null = no depth
         std::vector<rhi::TextureId> reads;    // sampled inputs
         float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        // Keep the colour attachment's existing contents. Required for any pass
+        // that blends over an earlier one -- see rhi::PassDesc::load.
+        bool load = false;
         float clear_depth = 0.0f;             // reversed-Z far value
         bool keep_depth = false;              // true for a shadow map
         // Resources this pass writes that are NOT attachments. A compute pass

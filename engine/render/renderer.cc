@@ -16,6 +16,19 @@
 namespace eng {
 namespace {
 
+// Mirrors composite.metal's GradeParams. Checked rather than trusted: a drift
+// here silently shifts every colour in the frame, which reads as an art
+// decision rather than as a layout bug.
+struct GradeParams {
+    Vec4 tone;
+    Vec4 lift;
+    Vec4 gamma;
+    Vec4 gain;
+    Vec4 look;
+};
+static_assert(sizeof(GradeParams) == 80, "GradeParams layout drifted");
+
+
 // Shader source is baked into the binary at compile time by #embed (a clang C23
 // extension that also works in C++20). No genrule, no xxd, no runfiles, no
 // filesystem access at runtime.
@@ -174,6 +187,12 @@ struct DrawItem {
 };
 
 struct Renderer::Impl {
+    ColorGrade grade;
+    rhi::BufferId exposure;
+    // A one-float buffer holding 1.0, bound when the caller supplied no
+    // exposure. Cheaper than a shader branch and impossible to get out of step
+    // with what was actually bound.
+    rhi::BufferId unit_exposure;
     // The environment probe, or an all-null set when there is none. Binding a
     // null texture is legal and is what the shader's is_null_texture check
     // reads, so there is no separate "enabled" flag to fall out of step.
@@ -635,6 +654,8 @@ std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
     const std::uint8_t kBlackPixel[4] = {0, 0, 0, 255};
     r->impl_->white = dev.CreateTexture2D(1, 1, kWhitePixel);
     r->impl_->black = dev.CreateTexture2D(1, 1, kBlackPixel);
+    const float kUnitExposure = 1.0f;
+    r->impl_->unit_exposure = dev.CreateBuffer(&kUnitExposure, sizeof(float));
     r->impl_->sampler = dev.CreateSampler(rhi::Filter::Linear, rhi::Wrap::Repeat);
     if (!Valid(r->impl_->white) || !Valid(r->impl_->black) ||
         !Valid(r->impl_->sampler)) {
@@ -1320,6 +1341,10 @@ void Renderer::DrawTriangle(rhi::Encoder& enc, int width, int height) {
     enc.Draw(3);
 }
 
+void Renderer::SetGrade(const ColorGrade& g) { impl_->grade = g; }
+const ColorGrade& Renderer::Grade() const { return impl_->grade; }
+void Renderer::SetExposureBuffer(rhi::BufferId b) { impl_->exposure = b; }
+
 void Renderer::DrawComposite(rhi::Encoder& enc, rhi::TextureId src,
                              rhi::TextureId ao, rhi::TextureId bloom,
                              float bloom_strength, float vignette) {
@@ -1329,9 +1354,23 @@ void Renderer::DrawComposite(rhi::Encoder& enc, rhi::TextureId src,
     if (offset == Impl::kNoSpace) return;
     std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
 
+    const ColorGrade& g = impl_->grade;
+    GradeParams gp{};
+    gp.tone = Vec4{g.lift_all, g.gamma_all, g.gain_all, g.contrast_pivot};
+    gp.lift = Vec4{g.lift.x, g.lift.y, g.lift.z, 0.0f};
+    gp.gamma = Vec4{g.gamma.x, g.gamma.y, g.gamma.z, 0.0f};
+    gp.gain = Vec4{g.gain.x, g.gain.y, g.gain.z, 0.0f};
+    gp.look = Vec4{g.contrast, g.saturation, g.temperature, g.tint};
+
     enc.SetPipeline(impl_->composite);
     enc.SetCull(rhi::Cull::None, rhi::Winding::CounterClockwise);
     enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
+    enc.SetFragmentBytes(&gp, sizeof(gp), 2);
+    // A FIXED exposure of one when no buffer is bound. The shader reads a
+    // buffer either way, so there is one code path rather than a branch on a
+    // flag that could disagree with what was bound.
+    enc.SetFragmentBuffer(Valid(impl_->exposure) ? impl_->exposure : impl_->unit_exposure,
+                          0, 3);
     enc.SetFragmentTexture(src, 0);
     enc.SetFragmentTexture(Valid(ao) ? ao : impl_->white, 1);
     // The bloom slot needs SOMETHING bound. Black, not white: an absent bloom

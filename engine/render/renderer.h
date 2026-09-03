@@ -98,6 +98,37 @@ struct RenderStats {
 // per colour format: a pipeline state is only valid for the format it was
 // compiled against, and a drawable (BGRA) differs from an offscreen target
 // (RGBA).
+// A colourist's controls, applied after the tone map.
+//
+// The defaults are a NO-OP: unit gain, unit gamma, no lift, contrast and
+// saturation at one. That matters more than it sounds -- a grade whose defaults
+// change the picture makes every existing test's expected colour wrong, and
+// makes "is this the grade or the lighting" unanswerable.
+struct ColorGrade {
+    // Per-channel three-way control. Lift moves the blacks, gain the whites,
+    // gamma the middle without moving either end.
+    Vec3 lift{0.0f, 0.0f, 0.0f};
+    Vec3 gamma{1.0f, 1.0f, 1.0f};
+    Vec3 gain{1.0f, 1.0f, 1.0f};
+    // The same three applied to every channel at once, for the common case of
+    // "a bit brighter" without touching the balance.
+    float lift_all = 0.0f;
+    float gamma_all = 1.0f;
+    float gain_all = 1.0f;
+
+    float contrast = 1.0f;
+    // The value contrast pivots about, in display-referred terms. 0.435 is 18%
+    // grey after the ACES curve; pivoting about zero would make raising the
+    // contrast darken the whole image.
+    float contrast_pivot = 0.435f;
+    float saturation = 1.0f;
+    // Warm above zero, cool below. Not a colour temperature in kelvin: this is
+    // a relative shift, and a kelvin value would imply a white point the rest
+    // of the pipeline does not track.
+    float temperature = 0.0f;
+    float tint = 0.0f;  // green against magenta
+};
+
 class Renderer {
   public:
     // The environment probe every lit pass will sample. Set once after baking;
@@ -351,6 +382,20 @@ class Renderer {
     void DrawComposite(rhi::Encoder&, rhi::TextureId src, rhi::TextureId ao = {},
                        rhi::TextureId bloom = {}, float bloom_strength = 0.0f,
                        float vignette = 1.0f);
+
+    // The colour grade the composite applies, and where its exposure comes
+    // from. Set once, or animated; the composite reads whatever is here.
+    //
+    // Held on the renderer rather than passed to DrawComposite because a grade
+    // is a property of the LOOK, not of one call -- and threading eight more
+    // parameters through a function that already takes five would make the
+    // common call unreadable to configure something that changes once a scene.
+    void SetGrade(const ColorGrade&);
+    [[nodiscard]] const ColorGrade& Grade() const;
+    // A buffer holding one float, the linear exposure multiplier. Null means a
+    // fixed exposure of 1. PostStack::ExposureBuffer() is what usually goes
+    // here, so an automatic exposure never round-trips through the CPU.
+    void SetExposureBuffer(rhi::BufferId);
 
     // BLOOM, in three stages the caller sequences through the render graph.
     //

@@ -28,7 +28,23 @@ struct Camera {
     float orthoHeight = 8.0f;
     float orthoFar = 200.0f;
 
+    // SUB-PIXEL JITTER, in NDC units (so a whole pixel is 2/width). Added to
+    // the projection's translation, which shifts every sample by a fraction of
+    // a pixel without changing anything else about the view.
+    //
+    // This is the input to temporal antialiasing and it is useless without it:
+    // jitter alone just makes the image shimmer. TAA is what turns a different
+    // sample position each frame into a higher effective resolution, by
+    // accumulating them. Zero disables it, which is the right default -- a
+    // renderer that jitters with nothing to resolve the jitter looks broken.
+    Vec2 jitter{0.0f, 0.0f};
+
+    // With and without the jitter. The unjittered one is what a REPROJECTION
+    // must use: velocity is where a surface moved between frames, and a
+    // sub-pixel wobble applied to only one of the two matrices would show up in
+    // the answer as motion that did not happen.
     [[nodiscard]] Mat4 ViewProj(float aspect) const;
+    [[nodiscard]] Mat4 ViewProjNoJitter(float aspect) const;
 };
 
 // First-person walkthrough. An orbit camera cannot show you a room from the

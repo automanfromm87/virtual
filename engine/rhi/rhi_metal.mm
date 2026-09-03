@@ -1042,7 +1042,8 @@ Encoder Device::BeginPass(const PassDesc& desc) { @autoreleasepool {
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     if (Valid(desc.color)) {
         rp.colorAttachments[0].texture = impl_->textures[desc.color.v];
-        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].loadAction =
+            desc.load ? MTLLoadActionLoad : MTLLoadActionClear;
         // RESOLVE rather than store, when the caller supplied somewhere to
         // resolve into. Storing the samples themselves would write four times
         // the data and nothing can read it anyway.
@@ -1060,7 +1061,8 @@ Encoder Device::BeginPass(const PassDesc& desc) { @autoreleasepool {
         if (!Valid(desc.extra_colors[i])) continue;
         const NSUInteger at = i + 1;
         rp.colorAttachments[at].texture = impl_->textures[desc.extra_colors[i].v];
-        rp.colorAttachments[at].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[at].loadAction =
+            desc.load ? MTLLoadActionLoad : MTLLoadActionClear;
         rp.colorAttachments[at].storeAction = MTLStoreActionStore;
         rp.colorAttachments[at].clearColor =
             MTLClearColorMake(desc.clear_color[0], desc.clear_color[1],

@@ -5,7 +5,7 @@
 
 namespace eng {
 
-Mat4 Camera::ViewProj(float aspect) const {
+Mat4 Camera::ViewProjNoJitter(float aspect) const {
     const Mat4 view = Mat4::LookAt(eye, target, up);
     if (projection == Projection::Orthographic) {
         // Same reversed-Z convention as the perspective path, so the depth
@@ -15,6 +15,29 @@ Mat4 Camera::ViewProj(float aspect) const {
                view;
     }
     return Mat4::PerspectiveReverseZ(fovY, aspect, nearZ) * view;
+}
+
+Mat4 Camera::ViewProj(float aspect) const {
+    Mat4 vp = ViewProjNoJitter(aspect);
+    if (jitter.x == 0.0f && jitter.y == 0.0f) return vp;
+    // ROW 0 += jitter.x * ROW 3, and likewise for y.
+    //
+    // What that does is clip.xy += jitter * clip.w, which is a constant shift
+    // in NDC AFTER the perspective divide -- so every fragment moves by the
+    // same fraction of a pixel whatever its depth. That is the property TAA
+    // needs: a jitter that varied with distance would be a shear, and
+    // accumulating sheared frames converges on a blur rather than on detail.
+    //
+    // Under an orthographic projection w is 1 and this reduces to adding the
+    // offset to the last column, which is the same shift by a different route.
+    // Perturbing the projection's SCALE instead -- the tempting one-liner --
+    // would change the field of view by a fraction of a pixel each frame, which
+    // is a zoom wobble, not a sample offset.
+    for (int i = 0; i < 4; ++i) {
+        vp.col[i].x += jitter.x * vp.col[i].w;
+        vp.col[i].y += jitter.y * vp.col[i].w;
+    }
+    return vp;
 }
 
 void WalkController::Look(float dx, float dy) {

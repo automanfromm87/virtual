@@ -196,6 +196,7 @@ void RenderGraph::Execute(rhi::Device& dev) {
         desc.depth = p.depth;
         for (int c = 0; c < 4; ++c) desc.clear_color[c] = p.clear_color[c];
         desc.clear_depth = p.clear_depth;
+        desc.load = p.load;
         desc.keep_depth = p.keep_depth;
 
         rhi::Encoder enc = dev.BeginPass(desc);

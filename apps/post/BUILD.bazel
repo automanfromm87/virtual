@@ -1,0 +1,16 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# The post stack, reduced to numbers with known directions. Every effect here
+# changes the whole image, so any of them can hide any other being wrong.
+cc_test(
+    name = "post_test",
+    srcs = ["offscreen.cpp"],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+    ],
+)

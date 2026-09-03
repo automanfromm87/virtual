@@ -156,6 +156,20 @@ struct PassDesc {
     // pay four times the bandwidth to write out data nothing can read.
     TextureId resolve;
     float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    // KEEP what is already in the colour attachment instead of clearing it.
+    //
+    // For a pass that BLENDS over the previous one -- fog, decals, a UI layer,
+    // anything with Blend::Alpha -- and it is not optional there: a pass that
+    // clears first has nothing to blend over, so the result is the effect alone
+    // on black. That failure looks plausible, which is the problem. Fog drawn
+    // over a cleared target is a screen of flat fog, and "the fog is too
+    // strong" is the wrong diagnosis.
+    //
+    // Off by default because clearing is free on a tile-based GPU and loading
+    // is not: a load pulls the previous contents from memory into tile memory
+    // at the start of every tile, which is bandwidth a pass that overwrites
+    // everything has no reason to spend.
+    bool load = false;
     TextureId depth;             // null handle = no depth attachment
     float clear_depth = 0.0f;    // reversed-Z: 0 is the FAR plane
     // Keep the depth results after the pass. Off by default because a depth
