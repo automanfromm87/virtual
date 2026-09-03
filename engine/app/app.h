@@ -28,6 +28,11 @@ struct Config {
     int height = 760;
     rhi::Format color = rhi::Format::BGRA8Unorm;
     float max_dt = 0.1f;
+    // Multisample count for the scene passes. 4 is the usual choice: it costs
+    // almost nothing on a tile-based GPU because the samples never leave tile
+    // memory, and it removes the single most obvious "this was drawn by a
+    // computer" tell there is.
+    int samples = 4;
 };
 
 // What BeginFrame established about this frame.

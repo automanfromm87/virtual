@@ -91,8 +91,12 @@ int main(int argc, char** argv) {
             app->Time().SetPaused(!app->Time().Paused());
         if (app->Actions().Pressed("reset")) demo::Reset(world);
 
+        // Drawn MULTISAMPLED and resolved into `color`, which is what the
+        // composite reads. A pipeline is compiled against a sample count, so
+        // the scene target has to match what App was configured with.
+        const eng::rhi::TextureId ms_color = app->Targets().Msaa("scene");
+        const eng::rhi::TextureId ms_depth = app->Targets().MsaaDepth("scene");
         const eng::rhi::TextureId color = app->Targets().Hdr("scene");
-        const eng::rhi::TextureId depth = app->Targets().Depth("scene");
 
         // dt is zero while paused, so the simulation stops without this demo
         // carrying a flag of its own.
@@ -113,8 +117,9 @@ int main(int argc, char** argv) {
         {
             eng::RenderGraph::Pass p;
             p.name = "scene";
-            p.color = color;
-            p.depth = depth;
+            p.color = ms_color;
+            p.resolve = color;
+            p.depth = ms_depth;
             for (int i = 0; i < 4; ++i) p.clear_color[i] = eng::kClearColor[i];
             p.clear_depth = 0.0f;
             p.reads = {shadow_map};

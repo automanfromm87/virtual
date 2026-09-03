@@ -187,7 +187,7 @@ std::size_t Device::UniformAlignment() const {
 }
 
 TextureId Device::CreateRenderTarget(int width, int height, Format format,
-                                     bool cpu_readable) {
+                                     bool cpu_readable, int samples) {
     if (width <= 0 || height <= 0) return {};
     MTLTextureDescriptor* td =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:ToMTL(format)
@@ -195,6 +195,23 @@ TextureId Device::CreateRenderTarget(int width, int height, Format format,
                                                           height:NSUInteger(height)
                                                        mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    if (samples > 1) {
+        td.textureType = MTLTextureType2DMultisample;
+        td.sampleCount = NSUInteger(samples);
+        // A multisample target is written and resolved, never sampled. Saying
+        // so lets the driver keep it in tile memory on a TBDR part, which is
+        // the difference between 4x MSAA being nearly free and costing four
+        // times the bandwidth of the whole frame.
+        td.usage = MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+        if (@available(macOS 11.0, *)) {
+            if ([impl_->dev supportsFamily:MTLGPUFamilyApple1])
+                td.storageMode = MTLStorageModeMemoryless;
+        }
+        id<MTLTexture> ms = [impl_->dev newTextureWithDescriptor:td];
+        if (!ms) return {};
+        return TextureId{impl_->AllocTextureSlot(ms)};
+    }
     // Shared only when the CPU will actually look at it. Forcing Shared on
     // every target — including ones that only feed the next pass — gives up
     // layouts the driver would otherwise be free to choose.
@@ -204,7 +221,8 @@ TextureId Device::CreateRenderTarget(int width, int height, Format format,
     return TextureId{impl_->AllocTextureSlot(t)};
 }
 
-TextureId Device::CreateDepthTarget(int width, int height, bool sampleable) {
+TextureId Device::CreateDepthTarget(int width, int height, bool sampleable,
+                                    int samples) {
     if (width <= 0 || height <= 0) return {};
     MTLTextureDescriptor* td = [MTLTextureDescriptor
         texture2DDescriptorWithPixelFormat:ToMTL(Format::Depth32Float)
@@ -213,6 +231,10 @@ TextureId Device::CreateDepthTarget(int width, int height, bool sampleable) {
                                  mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget |
                (sampleable ? MTLTextureUsageShaderRead : MTLTextureUsage(0));
+    if (samples > 1) {
+        td.textureType = MTLTextureType2DMultisample;
+        td.sampleCount = NSUInteger(samples);
+    }
     // Depth here is normally transient: the RHI exposes no way to sample or read
     // back a depth target, and every pass uses storeAction DontCare. On a TBDR
     // Apple GPU that means it can live entirely in tile memory and never touch
@@ -327,6 +349,9 @@ PipelineId Device::CreatePipeline(const PipelineDesc& desc, std::string& error) 
         desc.depth_only ? MTLPixelFormatInvalid : ToMTL(desc.color);
     // Without this the depth attachment is silently ignored at draw time.
     if (desc.depth) pd.depthAttachmentPixelFormat = ToMTL(Format::Depth32Float);
+    // Has to match the attachments exactly. Metal rejects a mismatch here,
+    // which is the one class of format error it does NOT let through silently.
+    pd.rasterSampleCount = NSUInteger(desc.samples > 0 ? desc.samples : 1);
     if (desc.blend && !desc.depth_only) {
         MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
         ca.blendingEnabled = YES;
@@ -435,7 +460,15 @@ Encoder Device::BeginPass(const PassDesc& desc) { @autoreleasepool {
     if (Valid(desc.color)) {
         rp.colorAttachments[0].texture = impl_->textures[desc.color.v];
         rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        // RESOLVE rather than store, when the caller supplied somewhere to
+        // resolve into. Storing the samples themselves would write four times
+        // the data and nothing can read it anyway.
+        if (Valid(desc.resolve)) {
+            rp.colorAttachments[0].resolveTexture = impl_->textures[desc.resolve.v];
+            rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+        } else {
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        }
         rp.colorAttachments[0].clearColor =
             MTLClearColorMake(desc.clear_color[0], desc.clear_color[1],
                               desc.clear_color[2], desc.clear_color[3]);

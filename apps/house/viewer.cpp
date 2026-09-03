@@ -73,6 +73,12 @@ int main() {
             orbit.distance = 19.0f;
         }
 
+        // Multisampled, resolved into scene_color. The depth below stays
+        // single-sampled and is filled by its own prepass: averaging depths
+        // across a silhouette produces a value describing no surface, so a
+        // multisample depth buffer cannot be resolved into one SSAO can use.
+        const eng::rhi::TextureId ms_color = app->Targets().Msaa("scene");
+        const eng::rhi::TextureId ms_depth = app->Targets().MsaaDepth("scene");
         const eng::rhi::TextureId scene_color = app->Targets().Hdr("scene");
         // Sampleable: SSAO reads it back. That costs memoryless storage, which
         // an ordinary depth buffer would keep.
@@ -101,6 +107,17 @@ int main() {
         }
         if (ssao_on) {
             eng::RenderGraph::Pass p;
+            p.name = "depth";
+            p.depth = scene_depth;
+            p.clear_depth = 0.0f;
+            p.keep_depth = true;
+            p.execute = [&](eng::rhi::Encoder& e) {
+                app->Draw().DrawSceneDepth(e, scene, f.width, f.height);
+            };
+            graph.AddPass(std::move(p));
+        }
+        if (ssao_on) {
+            eng::RenderGraph::Pass p;
             p.name = "ssao";
             p.color = ao_target;
             p.reads = {scene_depth};
@@ -113,11 +130,11 @@ int main() {
         {
             eng::RenderGraph::Pass p;
             p.name = "scene";
-            p.color = scene_color;
-            p.depth = scene_depth;
+            p.color = ms_color;
+            p.resolve = scene_color;
+            p.depth = ms_depth;
             for (int i = 0; i < 4; ++i) p.clear_color[i] = eng::kClearColor[i];
             p.clear_depth = 0.0f;
-            p.keep_depth = ssao_on;  // SSAO has to be able to read it back
             p.reads = {shadow_map};
             p.execute = [&](eng::rhi::Encoder& e) {
                 app->Draw().DrawScene(e, scene, f.width, f.height, shadow_map);

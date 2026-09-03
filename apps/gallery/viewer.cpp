@@ -58,6 +58,11 @@ int main() {
         if (app->Actions().Pressed("lights")) locals_on = !locals_on;
         if (app->Actions().Pressed("bloom")) bloom_on = !bloom_on;
 
+        // The scene is drawn MULTISAMPLED and resolved into `color`, which is
+        // what everything downstream reads. SSAO needs a single-sampled depth
+        // to read back, so it gets its own single-sampled pass below.
+        const eng::rhi::TextureId ms_color = app->Targets().Msaa("scene");
+        const eng::rhi::TextureId ms_depth = app->Targets().MsaaDepth("scene");
         const eng::rhi::TextureId color = app->Targets().Hdr("scene");
         const eng::rhi::TextureId depth =
             app->Targets().Depth("scene", /*sampleable=*/true);
@@ -91,15 +96,30 @@ int main() {
         {
             eng::RenderGraph::Pass p;
             p.name = "scene";
-            p.color = color;
-            p.depth = depth;
+            p.color = ms_color;
+            p.resolve = color;
+            p.depth = ms_depth;
             p.clear_color[0] = 0.018f; p.clear_color[1] = 0.020f;
             p.clear_color[2] = 0.028f; p.clear_color[3] = 1.0f;
             p.clear_depth = 0.0f;
-            p.keep_depth = ssao_on;
             p.reads = {shadow_map, app->Draw().ShadowAtlas()};
             p.execute = [&](eng::rhi::Encoder& e) {
                 app->Draw().DrawScene(e, scene, f.width, f.height, shadow_map);
+            };
+            graph.AddPass(std::move(p));
+        }
+        // A single-sampled depth-only pass, purely so SSAO has something it can
+        // read. Resolving a multisample DEPTH buffer is not the same operation
+        // as resolving colour — averaging depths across an edge produces a
+        // value that describes no surface at all.
+        if (ssao_on) {
+            eng::RenderGraph::Pass p;
+            p.name = "depth";
+            p.depth = depth;
+            p.clear_depth = 0.0f;
+            p.keep_depth = true;
+            p.execute = [&](eng::rhi::Encoder& e) {
+                app->Draw().DrawSceneDepth(e, scene, f.width, f.height);
             };
             graph.AddPass(std::move(p));
         }

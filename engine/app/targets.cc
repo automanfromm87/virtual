@@ -5,8 +5,9 @@
 
 namespace eng::app {
 
-FrameTargets::FrameTargets(rhi::Device& device, rhi::Format color)
-    : device_(device), color_(color) {}
+FrameTargets::FrameTargets(rhi::Device& device, rhi::Format color, int samples)
+    : device_(device), color_(color),
+      samples_((samples == 2 || samples == 4 || samples == 8) ? samples : 1) {}
 
 FrameTargets::~FrameTargets() { DestroyAll(); }
 
@@ -28,7 +29,7 @@ void FrameTargets::Resize(int width, int height) {
 
 FrameTargets::Target& FrameTargets::Lookup(std::string_view name, bool is_depth,
                                            bool sampleable, rhi::Format format,
-                                           int divisor) {
+                                           int divisor, int samples) {
     // The kind is part of the key. Without it Color("scene") and Depth("scene")
     // collide and the second call hands back the first one's texture — a colour
     // target bound as a depth buffer, which is not a subtle failure but is a
@@ -53,8 +54,9 @@ FrameTargets::Target& FrameTargets::Lookup(std::string_view name, bool is_depth,
     const int w = std::max(width_ / std::max(divisor, 1), 1);
     const int h = std::max(height_ / std::max(divisor, 1), 1);
     if (width_ > 0 && height_ > 0) {
-        t.id = is_depth ? device_.CreateDepthTarget(w, h, sampleable)
-                        : device_.CreateRenderTarget(w, h, format);
+        t.id = is_depth
+                   ? device_.CreateDepthTarget(w, h, sampleable, samples)
+                   : device_.CreateRenderTarget(w, h, format, false, samples);
         if (Valid(t.id)) ++allocations_;
     }
     return targets_[key] = t;
@@ -74,6 +76,22 @@ rhi::TextureId FrameTargets::Hdr(std::string_view name, int divisor) {
     return Lookup(key, /*is_depth=*/false, /*sampleable=*/false,
                   rhi::Format::RGBA16Float, divisor)
         .id;
+}
+
+rhi::TextureId FrameTargets::Msaa(std::string_view name) {
+    // The sample count is part of the key: a caller asking for the same name at
+    // one sample and at four wants two different textures, and handing over
+    // whichever was made first is a pipeline/attachment mismatch waiting to
+    // happen.
+    std::string key(name);
+    key += samples_ > 1 ? "@ms" : "@1s";
+    return Lookup(key, false, false, rhi::Format::RGBA16Float, 1, samples_).id;
+}
+
+rhi::TextureId FrameTargets::MsaaDepth(std::string_view name) {
+    std::string key(name);
+    key += samples_ > 1 ? "@ms" : "@1s";
+    return Lookup(key, true, false, color_, 1, samples_).id;
 }
 
 rhi::TextureId FrameTargets::Depth(std::string_view name, bool sampleable) {

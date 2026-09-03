@@ -30,6 +30,11 @@ class RenderGraph {
         // A depth-only pass (a shadow map) legitimately has no colour target,
         // so `color` may be null when `depth` is not.
         rhi::TextureId color;                 // written by this pass
+        // Where a multisample `color` is averaged down to at end of pass. For
+        // dependency purposes this counts as WRITTEN by the pass — a later pass
+        // reading the resolve target depends on this one, and the graph would
+        // otherwise reject it as reading a texture nobody writes.
+        rhi::TextureId resolve;
         rhi::TextureId depth;                 // written; null = no depth
         std::vector<rhi::TextureId> reads;    // sampled inputs
         float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};

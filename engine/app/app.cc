@@ -47,9 +47,10 @@ std::unique_ptr<App> App::Create(const Config& config, std::string& error) {
     s.window->HostLayer(s.swapchain->NativeLayer());
     s.swapchain->Resize(s.window->FramebufferWidth(), s.window->FramebufferHeight());
 
-    s.renderer = Renderer::Create(*s.device, config.color, error);
+    s.renderer = Renderer::Create(*s.device, config.color, error, config.samples);
     if (!s.renderer) return nullptr;
-    s.targets = std::make_unique<FrameTargets>(*s.device, config.color);
+    s.targets = std::make_unique<FrameTargets>(*s.device, config.color,
+                                               config.samples);
     s.clock.max_dt = config.max_dt;
     return app;
 }

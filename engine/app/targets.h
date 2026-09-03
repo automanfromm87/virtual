@@ -23,7 +23,10 @@ namespace eng::app {
 
 class FrameTargets {
   public:
-    FrameTargets(rhi::Device& device, rhi::Format color);
+    // `samples` makes Msaa() and MsaaDepth() produce multisample targets. The
+    // ordinary Color/Hdr/Depth accessors are always single-sampled: they are
+    // for the passes that run after the resolve.
+    FrameTargets(rhi::Device& device, rhi::Format color, int samples = 1);
     ~FrameTargets();
 
     FrameTargets(const FrameTargets&) = delete;
@@ -42,6 +45,13 @@ class FrameTargets {
     // the composite. `divisor` shrinks it: bloom works at half or quarter
     // resolution, which is both cheaper and a wider blur for the same kernel.
     [[nodiscard]] rhi::TextureId Hdr(std::string_view name, int divisor = 1);
+    // A MULTISAMPLE half-float colour target, and the depth to pair with it.
+    // Both are memoryless where the hardware allows: the samples live in tile
+    // memory and only the resolve ever reaches DRAM, which is what makes 4x
+    // nearly free on an Apple GPU rather than four times the bandwidth.
+    [[nodiscard]] rhi::TextureId Msaa(std::string_view name);
+    [[nodiscard]] rhi::TextureId MsaaDepth(std::string_view name);
+    [[nodiscard]] int Samples() const { return samples_; }
     // `sampleable` costs real memory: an ordinary depth target is memoryless
     // and cannot be read by a later pass, which is what SSAO needs.
     [[nodiscard]] rhi::TextureId Depth(std::string_view name,
@@ -61,11 +71,12 @@ class FrameTargets {
         bool sampleable = false;
     };
     Target& Lookup(std::string_view name, bool is_depth, bool sampleable,
-                   rhi::Format format, int divisor);
+                   rhi::Format format, int divisor, int samples = 1);
     void DestroyAll();
 
     rhi::Device& device_;
     rhi::Format color_;
+    int samples_ = 1;
     int width_ = 0, height_ = 0;
     int allocations_ = 0;
     std::unordered_map<std::string, Target> targets_;

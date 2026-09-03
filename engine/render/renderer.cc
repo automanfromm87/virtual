@@ -118,6 +118,9 @@ struct Renderer::Impl {
     // The format of whatever the LAST pass writes into: a drawable, or an
     // offscreen target a test reads back.
     rhi::Format color = rhi::Format::BGRA8Unorm;
+    // Multisample count for the scene passes. The fullscreen ones stay at 1:
+    // they run after the resolve.
+    int samples = 1;
 
     // Index 0 is the null handle in both tables, so handles are 1-based and
     // match the kMesh* / kMaterial* constants in engine/resource/handles.h.
@@ -224,6 +227,20 @@ struct Renderer::Impl {
     }
 
     [[nodiscard]] rhi::Format FormatFor(Shading) const;
+    // Fullscreen passes read a resolved texture and write a single-sampled one.
+    [[nodiscard]] int SamplesFor(Shading shading) const {
+        switch (shading) {
+            case Shading::Lit:
+            case Shading::Flat:
+                return samples;
+            // A shadow map is never multisampled: it stores a distance, and
+            // averaging two distances across a silhouette gives a value that
+            // describes no surface. Single-sampling it also lets the same
+            // pipeline serve the camera-space depth prepass.
+            default:
+                return 1;
+        }
+    }
     [[nodiscard]] rhi::PipelineId GetOrCreatePipeline(Shading shading,
                                                       bool depth_test,
                                                       bool blend,
@@ -264,13 +281,15 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
                                                     std::string& error,
                                                     bool skinned) {
     const rhi::Format fmt = FormatFor(shading);
+    const int msaa = SamplesFor(shading);
     // Blend and depth-write ARE pipeline state, unlike cull mode, so they have
     // to be in the key. Leaving them out would hand a transparent material the
     // opaque pipeline and quietly turn glass solid.
     // Skinning is in the KEY because it is a different vertex stage, not a
     // different uniform. Leaving it out would hand a skinned mesh the static
     // pipeline, which reads no palette and draws the bind pose forever.
-    const std::uint64_t key = (std::uint64_t(skinned) << 16) |
+    const std::uint64_t key = (std::uint64_t(msaa) << 20) |
+                              (std::uint64_t(skinned) << 16) |
                               (std::uint64_t(shading) << 12) |
                               (std::uint64_t(blend) << 8) |
                               (std::uint64_t(depth_test) << 4) |
@@ -310,6 +329,7 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
         desc.fragment_fn = "fs_main";
     }
     desc.color = fmt;
+    desc.samples = msaa;
     desc.depth = depth_test;
     desc.blend = blend;
     // A blended surface must not write depth, or the transparent objects behind
@@ -427,11 +447,16 @@ MaterialHandle Renderer::CreateMaterial(const MaterialDesc& desc,
     return MaterialHandle{std::uint32_t(impl_->materials.size() - 1)};
 }
 
+int Renderer::Samples() const { return impl_->samples; }
+
 std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
-                                           std::string& error) {
+                                           std::string& error, int samples) {
     auto r = std::unique_ptr<Renderer>(new Renderer());
     r->impl_->dev = &dev;
     r->impl_->color = color;
+    // 1, 2, 4 or 8. Anything else is silently a typo, and a pipeline built for
+    // a sample count no attachment can have fails at draw time rather than here.
+    r->impl_->samples = (samples == 2 || samples == 4 || samples == 8) ? samples : 1;
 
     // Defaults first: CreateMaterial substitutes these for absent maps, so they
     // have to exist before any material does.
@@ -720,6 +745,58 @@ void Renderer::DrawLightShadows(rhi::Encoder& enc, const Scene& scene) {
     // Hand the whole target back, or every later pass inherits this tile.
     enc.SetViewport(0, 0, kShadowAtlasSize, kShadowAtlasSize);
     enc.SetScissor(0, 0, kShadowAtlasSize, kShadowAtlasSize);
+}
+
+void Renderer::DrawSceneDepth(rhi::Encoder& enc, const Scene& scene, int width,
+                              int height) {
+    if (width <= 0 || height <= 0) return;
+    // The shadow vertex stage with the CAMERA's matrix instead of a light's.
+    // Depth from the eye is the same operation as depth from a lamp, and the
+    // pipeline is single-sampled, which is what makes this readable by SSAO
+    // when the colour pass is running multisampled.
+    const Mat4 viewProj = scene.camera.ViewProj(float(width) / float(height));
+
+    rhi::PipelineId bound;
+    enc.SetCull(rhi::Cull::Back, rhi::Winding::CounterClockwise);
+    for (const Instance& inst : scene.instances) {
+        if (!Valid(inst.mesh) || inst.mesh.v >= impl_->meshes.size()) continue;
+        if (Valid(inst.material) && inst.material.v < impl_->materials.size() &&
+            impl_->materials[inst.material.v].transparent)
+            continue;
+        const GpuMesh& gm = impl_->meshes[inst.mesh.v];
+        const std::size_t offset = impl_->AllocUniform();
+        if (offset == Impl::kNoSpace) break;
+
+        const bool skinned = IsSkinned(gm, inst, scene);
+        std::size_t palette_offset = Impl::kNoSpace;
+        if (skinned) {
+            palette_offset = impl_->AllocPalette();
+            if (palette_offset == Impl::kNoSpace) continue;
+            std::memcpy(impl_->palette_map + palette_offset,
+                        scene.joint_matrices.data() + inst.palette,
+                        sizeof(Mat4) * std::size_t(gm.joint_count));
+        }
+        const rhi::PipelineId want = skinned ? impl_->shadow_skinned : impl_->shadow;
+        if (want.v != bound.v) {
+            enc.SetPipeline(want);
+            bound = want;
+        }
+
+        FrameUniforms u{};
+        u.lightViewProj = viewProj;
+        u.model = inst.model;
+        u.surface = Vec4{0.0f, 0.0f, 0.0f, scene.clipY};
+        std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
+
+        enc.SetVertexBuffer(gm.vb, 0, kVertexSlot);
+        enc.SetVertexBuffer(impl_->uniforms, offset, kUniformSlot);
+        enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
+        if (skinned) {
+            enc.SetVertexBuffer(gm.skin_vb, 0, kSkinSlot);
+            enc.SetVertexBuffer(impl_->palettes, palette_offset, kPaletteSlot);
+        }
+        enc.DrawIndexedU16(gm.ib, gm.index_count);
+    }
 }
 
 void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,

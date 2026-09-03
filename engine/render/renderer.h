@@ -88,9 +88,19 @@ struct RenderStats {
 // (RGBA).
 class Renderer {
   public:
+    // `samples` is the multisample count the SCENE passes will run at. It has
+    // to be known here rather than per-pass: a pipeline is compiled against a
+    // sample count and Metal rejects a mismatch, so the renderer builds its
+    // lit and shadow pipelines for one value and keeps to it.
+    //
+    // The fullscreen passes are always single-sampled — they run after the
+    // resolve, on an ordinary texture.
     [[nodiscard]] static std::unique_ptr<Renderer> Create(rhi::Device&,
                                                           rhi::Format color,
-                                                          std::string& error);
+                                                          std::string& error,
+                                                          int samples = 1);
+    // What Create was given. Apps need it to size their scene targets to match.
+    [[nodiscard]] int Samples() const;
     ~Renderer();
 
     Renderer(const Renderer&) = delete;
@@ -160,6 +170,13 @@ class Renderer {
     // a shadow into it, so culling here with the camera's frustum would make
     // shadows pop as you turn around.
     void DrawShadow(rhi::Encoder&, const Scene&);
+
+    // Depth only, from the CAMERA. A depth prepass, and the reason it exists
+    // here: SSAO reads depth back, and a multisample depth buffer cannot be
+    // resolved into one that means anything — averaging two distances across a
+    // silhouette gives a value describing no surface. So when the colour pass
+    // runs multisampled, the occlusion pass gets its own single-sampled depth.
+    void DrawSceneDepth(rhi::Encoder&, const Scene&, int width, int height);
 
     // `shadow_map` is the depth target DrawShadow wrote, or a null handle for
     // no shadows.

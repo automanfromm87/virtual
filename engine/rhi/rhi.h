@@ -71,12 +71,23 @@ struct PipelineDesc {
     // Straight alpha blending, and normally paired with depth_write = false:
     // a transparent surface must not stop what is behind it from drawing.
     bool blend = false;
+    // Multisample count. Must match the attachments the pipeline will be used
+    // with — a pipeline built for one sample cannot draw into a four-sample
+    // target, and Metal rejects that outright rather than silently aliasing.
+    int samples = 1;
     Compare depth_compare = Compare::Greater;  // reversed-Z default
     bool depth_write = true;
 };
 
 struct PassDesc {
     TextureId color;
+    // Where a multisample colour attachment is averaged down to. Ignored when
+    // `color` has one sample.
+    //
+    // Resolving is part of ENDING the pass, not a separate step: the samples
+    // only exist inside tile memory, and a pass that stores them instead would
+    // pay four times the bandwidth to write out data nothing can read.
+    TextureId resolve;
     float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     TextureId depth;             // null handle = no depth attachment
     float clear_depth = 0.0f;    // reversed-Z: 0 is the FAR plane
@@ -167,12 +178,17 @@ class Device {
     // cpu_readable picks Shared storage so ReadPixels works. Leave it false for
     // targets that only ever feed another pass — Private lets the driver keep
     // them in whatever memory suits the GPU.
+    // `samples` above 1 makes a MULTISAMPLE target. It cannot be sampled or
+    // read back — it exists to be resolved into an ordinary one at end of pass.
     [[nodiscard]] TextureId CreateRenderTarget(int width, int height, Format,
-                                               bool cpu_readable = false);
+                                               bool cpu_readable = false,
+                                               int samples = 1);
     // `sampleable` gives up memoryless storage in exchange for being readable
     // by a later pass — which SSAO needs and an ordinary depth buffer does not.
+    // `samples` must match the colour attachment it is paired with.
     [[nodiscard]] TextureId CreateDepthTarget(int width, int height,
-                                              bool sampleable = false);
+                                              bool sampleable = false,
+                                              int samples = 1);
     // Like CreateDepthTarget, but SAMPLEABLE and backed by real memory. The
     // ordinary one is memoryless: perfect for a depth buffer you throw away at
     // end of pass, useless for one another pass has to read.

@@ -31,7 +31,8 @@ int main() {
     auto dev = eng::rhi::Device::Create(error);
     if (!dev) { std::fprintf(stderr, "FAIL: %s\n", error.c_str()); return 1; }
     const auto kFmt = eng::rhi::Format::RGBA8Unorm;
-    auto renderer = eng::Renderer::Create(*dev, kFmt, error);
+    constexpr int kSamples = 4;
+    auto renderer = eng::Renderer::Create(*dev, kFmt, error, kSamples);
     if (!renderer) { std::fprintf(stderr, "FAIL: %s\n", error.c_str()); return 1; }
 
     const gallery::Assets assets = gallery::Build(*dev, *renderer, error);
@@ -41,10 +42,17 @@ int main() {
     }
 
     const eng::rhi::TextureId shadow_map = dev->CreateShadowMap(2048);
-    const eng::rhi::TextureId color = dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
+    // The scene is drawn MULTISAMPLED and resolved into `color`.
+    const eng::rhi::TextureId ms_color = dev->CreateRenderTarget(
+        kW, kH, eng::Renderer::kSceneFormat, false, kSamples);
+    const eng::rhi::TextureId ms_depth =
+        dev->CreateDepthTarget(kW, kH, false, kSamples);
+    const eng::rhi::TextureId color =
+        dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
     const eng::rhi::TextureId depth = dev->CreateDepthTarget(kW, kH);
     const eng::rhi::TextureId out = dev->CreateRenderTarget(kW, kH, kFmt, true);
-    if (!Valid(shadow_map) || !Valid(color) || !Valid(depth) || !Valid(out)) {
+    if (!Valid(shadow_map) || !Valid(color) || !Valid(depth) || !Valid(out) ||
+        !Valid(ms_color) || !Valid(ms_depth)) {
         std::fprintf(stderr, "FAIL: targets\n");
         return 1;
     }
@@ -55,6 +63,7 @@ int main() {
     targets.Resize(kW, kH);
     bool bloom_on = true;
     float bloom_strength = 0.34f;
+    bool msaa_on = true;
 
     std::vector<std::uint8_t> pixels;
     eng::RenderStats stats;
@@ -90,8 +99,9 @@ int main() {
         {
             eng::RenderGraph::Pass p;
             p.name = "scene";
-            p.color = color;
-            p.depth = depth;
+            p.color = msaa_on ? ms_color : color;
+            if (msaa_on) p.resolve = color;
+            p.depth = msaa_on ? ms_depth : depth;
             p.clear_color[0] = 0.018f; p.clear_color[1] = 0.020f;
             p.clear_color[2] = 0.028f; p.clear_color[3] = 1.0f;
             p.clear_depth = 0.0f;
@@ -335,6 +345,92 @@ int main() {
                     lr, lg, lb, rr, rg, rb);
         Check(lb > lr * 1.25, "the left of the room is blue");
         Check(rr > rb * 1.25, "the right of the room is warm");
+    }
+
+    std::printf("multisampling\n");
+    {
+        // A second renderer at ONE sample, with its own assets: mesh and
+        // material handles are indices into a particular renderer's tables and
+        // do not transfer. Expensive, and the only way to get a true A/B —
+        // pipelines are compiled against a sample count, so one renderer cannot
+        // draw both ways.
+        std::string e1;
+        auto plain = eng::Renderer::Create(*dev, kFmt, e1, 1);
+        const gallery::Assets plain_assets =
+            plain ? gallery::Build(*dev, *plain, e1) : gallery::Assets{};
+        Check(plain && plain_assets.ok, "a single-sampled renderer builds too");
+
+        // Count SILHOUETTE pixels: ones sitting partway between their
+        // neighbours across a high-contrast edge. Aliasing is the absence of
+        // exactly those — a hard step from one surface to the next.
+        auto intermediate = [&](const std::vector<std::uint8_t>& img, int minc) {
+            int n = 0;
+            for (int y = 1; y < kH - 1; ++y)
+                for (int x = 1; x < kW - 1; ++x) {
+                    const std::size_t c = (std::size_t(y) * kW + x) * 4;
+                    const std::size_t l = c - 4, r = c + 4;
+                    const int lv = img[l] + img[l + 1] + img[l + 2];
+                    const int cv = img[c] + img[c + 1] + img[c + 2];
+                    const int rv = img[r] + img[r + 1] + img[r + 2];
+                    const int lo = std::min(lv, rv), hi = std::max(lv, rv);
+                    if (hi - lo < minc) continue;       // no edge here
+                    if (cv > lo + 12 && cv < hi - 12) ++n;  // strictly between
+                }
+            return n;
+        };
+
+        const eng::Scene s4 = gallery::MakeScene(assets, 0.7f, 0.0f);
+        draw(s4);
+        const std::vector<std::uint8_t> aa_px = pixels;
+
+        // The same frame through the single-sampled renderer.
+        {
+            eng::Scene s1 = gallery::MakeScene(plain_assets, 0.7f, 0.0f);
+            s1.camera.eye = kEye;
+            s1.camera.target = kTarget;
+            eng::RenderGraph g;
+            {
+                eng::RenderGraph::Pass p;
+                p.name = "scene";
+                p.color = color;
+                p.depth = depth;
+                p.clear_color[0] = 0.018f; p.clear_color[1] = 0.020f;
+                p.clear_color[2] = 0.028f; p.clear_color[3] = 1.0f;
+                p.clear_depth = 0.0f;
+                p.execute = [&](eng::rhi::Encoder& en) {
+                    plain->DrawScene(en, s1, kW, kH);
+                };
+                g.AddPass(std::move(p));
+            }
+            {
+                eng::RenderGraph::Pass p;
+                p.name = "composite";
+                p.color = out;
+                p.reads = {color};
+                p.execute = [&](eng::rhi::Encoder& en) {
+                    plain->DrawComposite(en, color, {}, {}, 0.0f, 1.0f);
+                };
+                g.AddPass(std::move(p));
+            }
+            std::string ge;
+            if (g.Compile(ge)) {
+                dev->BeginFrame();
+                g.Execute(*dev);
+                std::string w;
+                (void)dev->CommitAndWait(w);
+                pixels.assign(std::size_t(kW) * kH * 4, 0);
+                (void)dev->ReadPixels(out, kW, kH, pixels);
+            }
+        }
+        // A high contrast bar, so only real silhouettes count. At a low one
+        // the scene's own soft gradients — light pools, shadow edges — swamp
+        // the measurement and the two renderers look nearly alike.
+        const int aa = intermediate(aa_px, 320);
+        const int no_aa = intermediate(pixels, 320);
+        std::printf("    silhouette gradient pixels: 4x MSAA %d, single-sampled %d\n",
+                    aa, no_aa);
+        Check(aa > no_aa * 2, "multisampling puts real gradients on the silhouettes");
+        draw(full);
     }
 
     std::printf("bloom\n");

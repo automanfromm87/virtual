@@ -46,6 +46,18 @@ bool RenderGraph::Compile(std::string& error) {
                     "not implemented, so their order would be undefined";
             return false;
         }
+        // A resolve target is written by this pass too, and is the one a later
+        // pass will actually read — the multisample attachment itself cannot
+        // be sampled. Leaving it out means the graph rejects every consumer of
+        // an anti-aliased scene as reading a texture nobody writes.
+        if (Valid(passes_[i].resolve)) {
+            auto [rit, rok] = producer.emplace(passes_[i].resolve.v, i);
+            if (!rok) {
+                error = "passes '" + passes_[rit->second].name + "' and '" +
+                        passes_[i].name + "' both write the same resolve target";
+                return false;
+            }
+        }
     }
 
     // Same rule for depth. Two passes sharing a depth buffer are ordered only
@@ -126,6 +138,7 @@ void RenderGraph::Execute(rhi::Device& dev) {
         const Pass& p = passes_[i];
         rhi::PassDesc desc;
         desc.color = p.color;
+        desc.resolve = p.resolve;
         desc.depth = p.depth;
         for (int c = 0; c < 4; ++c) desc.clear_color[c] = p.clear_color[c];
         desc.clear_depth = p.clear_depth;
