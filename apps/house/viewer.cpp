@@ -73,7 +73,7 @@ int main() {
             orbit.distance = 19.0f;
         }
 
-        const eng::rhi::TextureId scene_color = app->Targets().Color("scene");
+        const eng::rhi::TextureId scene_color = app->Targets().Hdr("scene");
         // Sampleable: SSAO reads it back. That costs memoryless storage, which
         // an ordinary depth buffer would keep.
         const eng::rhi::TextureId scene_depth =

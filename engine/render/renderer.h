@@ -26,7 +26,11 @@ struct Image {
     std::vector<std::uint8_t> rgba;  // width * height * 4
 };
 
-inline constexpr float kClearColor[4] = {0.1f, 0.1f, 0.12f, 1.0f};
+// LINEAR, not display-referred. Surface shading writes linear HDR and the
+// composite gamma-corrects at the end, so a value that used to land straight in
+// the framebuffer as a dark grey now gets brightened on the way out. 0.1 became
+// an 8-bit 92 rather than the 26 it had always been.
+inline constexpr float kClearColor[4] = {0.014f, 0.014f, 0.018f, 1.0f};
 
 enum class Shading : std::uint8_t {
     Lit,        // Lambert + ambient, needs normals
@@ -34,6 +38,8 @@ enum class Shading : std::uint8_t {
     Composite,   // fullscreen, samples a previous pass's colour target
     ShadowDepth, // depth only, from the light's point of view
     Ssao,        // fullscreen, depth in and an occlusion factor out
+    BloomBright, // fullscreen, keeps what is above a threshold
+    BloomBlur,   // fullscreen, one axis of a separable gaussian
 };
 
 // What a surface looks like and how it is rasterised.
@@ -137,6 +143,11 @@ class Renderer {
     // Lights that were given a tile by the most recent DrawLightShadows.
     [[nodiscard]] int ShadowedLightCount() const;
 
+    // What a scene target must be. HDR, because the tone map now happens in
+    // the composite rather than in every surface shader — which is what lets
+    // the passes in between see how bright a pixel really was.
+    static constexpr rhi::Format kSceneFormat = rhi::Format::RGBA16Float;
+
     static constexpr int kShadowAtlasSize = 2048;
     static constexpr int kShadowTilesPerSide = 2;   // 2x2 tiles of 1024
     static constexpr int kMaxShadowedLights =
@@ -161,7 +172,29 @@ class Renderer {
     // generated from the vertex id.
     // `ao` may be null, in which case a 1x1 white texture is bound and the
     // multiply is a no-op.
-    void DrawComposite(rhi::Encoder&, rhi::TextureId src, rhi::TextureId ao = {});
+    // Tone maps, and optionally adds ambient occlusion, bloom and a vignette.
+    //
+    // The tone map is not optional and is the reason this pass exists: surface
+    // shading now writes linear HDR, so SOMETHING has to bring it down to a
+    // display. `vignette` is: it is a look, and a measurement path wants the
+    // image the renderer produced rather than a stylised one.
+    void DrawComposite(rhi::Encoder&, rhi::TextureId src, rhi::TextureId ao = {},
+                       rhi::TextureId bloom = {}, float bloom_strength = 0.0f,
+                       float vignette = 1.0f);
+
+    // BLOOM, in three stages the caller sequences through the render graph.
+    //
+    // `threshold` and `knee` are in LINEAR radiance, which is why the scene
+    // target has to be half-float: on an eight-bit one every bright thing has
+    // already been clamped to one and a threshold above that selects nothing.
+    void DrawBloomBright(rhi::Encoder&, rhi::TextureId src, float threshold,
+                         float knee);
+    // One axis. `texel` is the step between taps in uv — (1/width, 0) for the
+    // horizontal pass, (0, 1/height) for the vertical. Two one-dimensional
+    // passes, because a separable kernel costs 2n taps where the flat one costs
+    // n squared.
+    void DrawBloomBlur(rhi::Encoder&, rhi::TextureId src, float texel_x,
+                       float texel_y);
 
     // Fullscreen occlusion pass. `depth` must be a sampleable depth target
     // written by an earlier pass with the SAME camera.

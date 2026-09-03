@@ -21,6 +21,7 @@ MTLPixelFormat ToMTL(Format f) {
     switch (f) {
         case Format::RGBA8Unorm: return MTLPixelFormatRGBA8Unorm;
         case Format::BGRA8Unorm: return MTLPixelFormatBGRA8Unorm;
+        case Format::RGBA16Float: return MTLPixelFormatRGBA16Float;
         case Format::Depth32Float: return MTLPixelFormatDepth32Float;
     }
     return MTLPixelFormatInvalid;
@@ -495,6 +496,12 @@ bool Device::ReadPixels(TextureId tex, int width, int height,
     // A Private texture has no CPU-visible contents; getBytes on one is a
     // Metal validation error rather than a silent zero fill.
     if (impl_->textures[tex.v].storageMode != MTLStorageModeShared) return false;
+    // Four bytes per pixel is baked into the stride below, so a half-float
+    // target would be read at half its width and the caller would get a
+    // plausible, wrong image rather than an error.
+    const MTLPixelFormat pf = impl_->textures[tex.v].pixelFormat;
+    if (pf != MTLPixelFormatRGBA8Unorm && pf != MTLPixelFormatBGRA8Unorm)
+        return false;
     const std::size_t need = std::size_t(width) * std::size_t(height) * 4;
     if (out.size() < need) return false;
     [impl_->textures[tex.v]

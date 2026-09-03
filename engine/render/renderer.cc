@@ -37,6 +37,9 @@ constexpr char kShadowSrc[] = {
 constexpr char kSsaoSrc[] = {
 #embed "engine/shaders/ssao.metal"
     , 0};
+constexpr char kBloomSrc[] = {
+#embed "engine/shaders/bloom.metal"
+    , 0};
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
 static_assert(sizeof(FrameUniforms) == 352, "FrameUniforms layout drifted");
@@ -112,6 +115,8 @@ struct DrawItem {
 
 struct Renderer::Impl {
     rhi::Device* dev = nullptr;
+    // The format of whatever the LAST pass writes into: a drawable, or an
+    // offscreen target a test reads back.
     rhi::Format color = rhi::Format::BGRA8Unorm;
 
     // Index 0 is the null handle in both tables, so handles are 1-based and
@@ -137,6 +142,11 @@ struct Renderer::Impl {
     // 1x1 opaque white. Standing in for an absent map keeps the shader
     // branch-free: every material multiplies, some just multiply by one.
     rhi::TextureId white;
+    // 1x1 opaque BLACK, for slots that are ADDED rather than multiplied. White
+    // would make an absent bloom brighten the whole frame.
+    rhi::TextureId black;
+    rhi::PipelineId bloom_bright;
+    rhi::PipelineId bloom_blur;
     rhi::SamplerId sampler;
 
     // One uniform ring covering every frame slot. Writing slot N is safe only
@@ -213,6 +223,7 @@ struct Renderer::Impl {
         return off;
     }
 
+    [[nodiscard]] rhi::Format FormatFor(Shading) const;
     [[nodiscard]] rhi::PipelineId GetOrCreatePipeline(Shading shading,
                                                       bool depth_test,
                                                       bool blend,
@@ -220,11 +231,39 @@ struct Renderer::Impl {
                                                       bool skinned = false);
 };
 
+// Which target a given shading writes into, and therefore which format its
+// pipeline has to be compiled against.
+//
+// A pipeline is only valid for the format it was built against, and getting it
+// wrong does NOT produce an error here — the draw lands in the attachment and
+// what comes back out is undefined. It cost a long hunt: the bloom pipelines
+// were compiled for the eight-bit output format while rendering into half-float
+// targets, and every pixel of every bloom buffer sampled back as NaN. A NaN
+// multiplied by a bloom strength of zero is still a NaN, so it survived to the
+// framebuffer and zeroed one colour channel of the entire image.
+//
+// The rule is simply: does this shading write into an HDR target?
+rhi::Format Renderer::Impl::FormatFor(Shading shading) const {
+    switch (shading) {
+        // The scene, and the bloom chain that reads it. All half-float, so the
+        // passes downstream can tell a lamp from a sheet of white paper.
+        case Shading::Lit:
+        case Shading::Flat:
+        case Shading::BloomBright:
+        case Shading::BloomBlur:
+            return Renderer::kSceneFormat;
+        // The composite is the pass that brings it down to a display.
+        default:
+            return color;
+    }
+}
+
 rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
                                                     bool depth_test,
                                                     bool blend,
                                                     std::string& error,
                                                     bool skinned) {
+    const rhi::Format fmt = FormatFor(shading);
     // Blend and depth-write ARE pipeline state, unlike cull mode, so they have
     // to be in the key. Leaving them out would hand a transparent material the
     // opaque pipeline and quietly turn glass solid.
@@ -235,7 +274,7 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
                               (std::uint64_t(shading) << 12) |
                               (std::uint64_t(blend) << 8) |
                               (std::uint64_t(depth_test) << 4) |
-                              std::uint64_t(color);
+                              std::uint64_t(fmt);
     if (auto it = pipeline_cache.find(key); it != pipeline_cache.end())
         return it->second;
 
@@ -248,6 +287,14 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
         desc.source = ShaderSource(kCompositeSrc);
         desc.vertex_fn = "vs_composite";
         desc.fragment_fn = "fs_composite";
+    } else if (shading == Shading::BloomBright) {
+        desc.source = ShaderSource(kBloomSrc);
+        desc.vertex_fn = "vs_bloom";
+        desc.fragment_fn = "fs_bloom_bright";
+    } else if (shading == Shading::BloomBlur) {
+        desc.source = ShaderSource(kBloomSrc);
+        desc.vertex_fn = "vs_bloom";
+        desc.fragment_fn = "fs_bloom_blur";
     } else if (shading == Shading::Ssao) {
         desc.source = ShaderSource(kSsaoSrc);
         desc.vertex_fn = "vs_ssao";
@@ -262,7 +309,7 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
         desc.vertex_fn = "vs_main";
         desc.fragment_fn = "fs_main";
     }
-    desc.color = color;
+    desc.color = fmt;
     desc.depth = depth_test;
     desc.blend = blend;
     // A blended surface must not write depth, or the transparent objects behind
@@ -389,9 +436,12 @@ std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
     // Defaults first: CreateMaterial substitutes these for absent maps, so they
     // have to exist before any material does.
     const std::uint8_t kWhitePixel[4] = {255, 255, 255, 255};
+    const std::uint8_t kBlackPixel[4] = {0, 0, 0, 255};
     r->impl_->white = dev.CreateTexture2D(1, 1, kWhitePixel);
+    r->impl_->black = dev.CreateTexture2D(1, 1, kBlackPixel);
     r->impl_->sampler = dev.CreateSampler(rhi::Filter::Linear, rhi::Wrap::Repeat);
-    if (!Valid(r->impl_->white) || !Valid(r->impl_->sampler)) {
+    if (!Valid(r->impl_->white) || !Valid(r->impl_->black) ||
+        !Valid(r->impl_->sampler)) {
         error = "failed to create the default texture or sampler";
         return nullptr;
     }
@@ -450,6 +500,12 @@ std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
 
     r->impl_->ssao = r->impl_->GetOrCreatePipeline(Shading::Ssao, false, false, error);
     if (!Valid(r->impl_->ssao)) return nullptr;
+    r->impl_->bloom_bright = r->impl_->GetOrCreatePipeline(
+        Shading::BloomBright, false, false, error);
+    if (!Valid(r->impl_->bloom_bright)) return nullptr;
+    r->impl_->bloom_blur = r->impl_->GetOrCreatePipeline(
+        Shading::BloomBlur, false, false, error);
+    if (!Valid(r->impl_->bloom_blur)) return nullptr;
     r->impl_->shadow_skinned = r->impl_->GetOrCreatePipeline(
         Shading::ShadowDepth, true, false, error, /*skinned=*/true);
     if (!Valid(r->impl_->shadow_skinned)) return nullptr;
@@ -905,13 +961,58 @@ void Renderer::DrawTriangle(rhi::Encoder& enc, int width, int height) {
 }
 
 void Renderer::DrawComposite(rhi::Encoder& enc, rhi::TextureId src,
-                             rhi::TextureId ao) {
+                             rhi::TextureId ao, rhi::TextureId bloom,
+                             float bloom_strength, float vignette) {
+    FrameUniforms u{};
+    u.lighting = Vec4{0.0f, Valid(bloom) ? bloom_strength : 0.0f, vignette, 0.0f};
+    const std::size_t offset = impl_->AllocUniform();
+    if (offset == Impl::kNoSpace) return;
+    std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
+
     enc.SetPipeline(impl_->composite);
     enc.SetCull(rhi::Cull::None, rhi::Winding::CounterClockwise);
+    enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
     enc.SetFragmentTexture(src, 0);
     enc.SetFragmentTexture(Valid(ao) ? ao : impl_->white, 1);
+    // The bloom slot needs SOMETHING bound. Black, not white: an absent bloom
+    // has to add nothing, and the strength above is already zero.
+    enc.SetFragmentTexture(Valid(bloom) ? bloom : impl_->black, 2);
     enc.SetFragmentSampler(impl_->sampler, 0);
     enc.Draw(3);  // one oversized triangle, generated from the vertex id
+}
+
+void Renderer::DrawBloomBright(rhi::Encoder& enc, rhi::TextureId src,
+                               float threshold, float knee) {
+    if (!Valid(src)) return;
+    FrameUniforms u{};
+    u.ssao = Vec4{threshold, knee, 0.0f, 0.0f};
+    const std::size_t offset = impl_->AllocUniform();
+    if (offset == Impl::kNoSpace) return;
+    std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
+
+    enc.SetPipeline(impl_->bloom_bright);
+    enc.SetCull(rhi::Cull::None, rhi::Winding::CounterClockwise);
+    enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
+    enc.SetFragmentTexture(src, 0);
+    enc.SetFragmentSampler(impl_->sampler, 0);
+    enc.Draw(3);
+}
+
+void Renderer::DrawBloomBlur(rhi::Encoder& enc, rhi::TextureId src,
+                             float texel_x, float texel_y) {
+    if (!Valid(src)) return;
+    FrameUniforms u{};
+    u.ssao = Vec4{0.0f, 0.0f, texel_x, texel_y};
+    const std::size_t offset = impl_->AllocUniform();
+    if (offset == Impl::kNoSpace) return;
+    std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
+
+    enc.SetPipeline(impl_->bloom_blur);
+    enc.SetCull(rhi::Cull::None, rhi::Winding::CounterClockwise);
+    enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
+    enc.SetFragmentTexture(src, 0);
+    enc.SetFragmentSampler(impl_->sampler, 0);
+    enc.Draw(3);
 }
 
 void Renderer::DrawSsao(rhi::Encoder& enc, const Camera& cam, int width,
@@ -955,10 +1056,17 @@ Image RenderOffscreen(int width, int height, bool want_depth, std::string& error
     auto renderer = Renderer::Create(*dev, rhi::Format::RGBA8Unorm, error);
     if (!renderer) return {};
 
+    // TWO passes, because the tone map now lives in the composite. The scene
+    // goes into a half-float target and is mapped down on the way out — the
+    // same shape as every windowed app, rather than a shortcut that would need
+    // its own version of the shading.
     rhi::PassDesc pass;
-    pass.color = dev->CreateRenderTarget(width, height, rhi::Format::RGBA8Unorm, /*cpu_readable=*/true);
+    pass.color = dev->CreateRenderTarget(width, height, Renderer::kSceneFormat);
     if (want_depth) pass.depth = dev->CreateDepthTarget(width, height);
-    if (!Valid(pass.color) || (want_depth && !Valid(pass.depth))) {
+    const rhi::TextureId readable = dev->CreateRenderTarget(
+        width, height, rhi::Format::RGBA8Unorm, /*cpu_readable=*/true);
+    if (!Valid(pass.color) || !Valid(readable) ||
+        (want_depth && !Valid(pass.depth))) {
         error = "failed to create offscreen render targets";
         return {};
     }
@@ -966,16 +1074,27 @@ Image RenderOffscreen(int width, int height, bool want_depth, std::string& error
     pass.clear_depth = 0.0f;  // reversed-Z: 0 is the far plane
 
     dev->BeginFrame();
-    rhi::Encoder enc = dev->BeginPass(pass);
-    draw(*renderer, enc);
-    dev->EndPass();
+    {
+        rhi::Encoder enc = dev->BeginPass(pass);
+        draw(*renderer, enc);
+        dev->EndPass();
+    }
+    {
+        rhi::PassDesc resolve;
+        resolve.color = readable;
+        rhi::Encoder enc = dev->BeginPass(resolve);
+        // No vignette. This path exists to measure what the renderer drew, and
+        // darkened corners are a look rather than a result.
+        renderer->DrawComposite(enc, pass.color, {}, {}, 0.0f, /*vignette=*/0.0f);
+        dev->EndPass();
+    }
     if (!dev->CommitAndWait(error)) return {};
 
     Image img;
     img.width = width;
     img.height = height;
     img.rgba.resize(std::size_t(width) * std::size_t(height) * 4);
-    if (!dev->ReadPixels(pass.color, width, height, img.rgba)) {
+    if (!dev->ReadPixels(readable, width, height, img.rgba)) {
         error = "pixel readback failed";
         return {};
     }

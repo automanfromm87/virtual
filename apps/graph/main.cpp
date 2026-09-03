@@ -41,12 +41,20 @@ int main() {
 
     // scene_color is written by one pass and sampled by the other; final is
     // what we read back.
+    // HALF-FLOAT: surface shading writes linear HDR now, and the composite
+    // tone maps. An eight-bit target here would clamp every highlight to one
+    // before the pass that is supposed to map it ever saw it.
     const eng::rhi::TextureId scene_color =
-        dev->CreateRenderTarget(kW, kH, eng::rhi::Format::RGBA8Unorm, true);
+        dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
     const eng::rhi::TextureId scene_depth = dev->CreateDepthTarget(kW, kH);
     const eng::rhi::TextureId final_color =
         dev->CreateRenderTarget(kW, kH, eng::rhi::Format::RGBA8Unorm, true);
-    if (!Valid(scene_color) || !Valid(scene_depth) || !Valid(final_color)) {
+    // The scene tone mapped, with none of the composite's cosmetics. The
+    // half-float scene target cannot be read back directly.
+    const eng::rhi::TextureId raw_color =
+        dev->CreateRenderTarget(kW, kH, eng::rhi::Format::RGBA8Unorm, true);
+    if (!Valid(scene_color) || !Valid(scene_depth) || !Valid(final_color) ||
+        !Valid(raw_color)) {
         std::fprintf(stderr, "FAIL: targets\n");
         return 1;
     }
@@ -63,6 +71,18 @@ int main() {
         renderer->DrawComposite(e, scene_color);
     };
     graph.AddPass(std::move(composite));
+
+    // The same scene, tone mapped and nothing else. The checks below want the
+    // image without the vignette, and the half-float scene target cannot be
+    // read back.
+    eng::RenderGraph::Pass raw;
+    raw.name = "raw";
+    raw.color = raw_color;
+    raw.reads = {scene_color};
+    raw.execute = [&](eng::rhi::Encoder& e) {
+        renderer->DrawComposite(e, scene_color, {}, {}, 0.0f, /*vignette=*/0.0f);
+    };
+    graph.AddPass(std::move(raw));
 
     // Added SECOND, must run FIRST.
     eng::RenderGraph::Pass scene_pass;
@@ -124,7 +144,7 @@ int main() {
     // the shading range it is not, and the check would fail on a perfectly
     // correct image.
     std::vector<std::uint8_t> scene_px(std::size_t(kW) * kH * 4);
-    if (!dev->ReadPixels(scene_color, kW, kH, scene_px)) {
+    if (!dev->ReadPixels(raw_color, kW, kH, scene_px)) {
         std::fprintf(stderr, "FAIL: scene readback\n");
         return 1;
     }
@@ -151,8 +171,10 @@ int main() {
     std::printf("\n  corner=%.1f mid=%.1f  lit=%.1f dark=%.1f  colours=%zu\n",
                 corner, mid, lit, dark, distinct.size());
 
-    Check(order.size() == 2 && order[0] == "scene" && order[1] == "composite",
-          "graph reordered: scene runs before composite");
+    // Three passes: the scene, and two consumers of it. Both were added BEFORE
+    // the pass that fills what they read, which is the point being made.
+    Check(order.size() == 3 && order[0] == "scene",
+          "graph reordered: scene runs before everything that reads it");
     Check(distinct.size() > 200, "the scene actually made it through both passes");
     Check(corner < mid * 0.8, "vignette applied, so the composite pass really ran");
     Check(lit > dark * 1.3, "orientation survived the fullscreen flip");

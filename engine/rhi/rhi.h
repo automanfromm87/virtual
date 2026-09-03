@@ -18,7 +18,16 @@
 
 namespace eng::rhi {
 
-enum class Format : std::uint8_t { RGBA8Unorm, BGRA8Unorm, Depth32Float };
+enum class Format : std::uint8_t {
+    RGBA8Unorm,
+    BGRA8Unorm,
+    // Half-float HDR. What a scene target has to be if anything downstream
+    // wants to know how bright a pixel REALLY was: an 8-bit target clamps at
+    // one, so a lamp and a sheet of white paper arrive at the next pass
+    // indistinguishable, and a bloom built on that glows off the paper.
+    RGBA16Float,
+    Depth32Float,
+};
 enum class Cull : std::uint8_t { None, Back, Front };
 enum class Winding : std::uint8_t { Clockwise, CounterClockwise };
 enum class Compare : std::uint8_t { Never, Less, Greater, Always };

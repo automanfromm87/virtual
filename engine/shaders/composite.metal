@@ -25,9 +25,11 @@ vertex CompositeOut vs_composite(uint vid [[vertex_id]])
 }
 
 fragment float4 fs_composite(CompositeOut in [[stage_in]],
-                             texture2d<float> src [[texture(0)]],
-                             texture2d<float> ao  [[texture(1)]],
-                             sampler          smp [[sampler(0)]])
+                             constant FrameUniforms& u [[buffer(1)]],
+                             texture2d<float> src   [[texture(0)]],
+                             texture2d<float> ao    [[texture(1)]],
+                             texture2d<float> bloom [[texture(2)]],
+                             sampler          smp   [[sampler(0)]])
 {
     // A real sampler object now, bound by the renderer. This used to be a
     // constexpr sampler declared inline — a workaround for the RHI not having
@@ -42,11 +44,28 @@ fragment float4 fs_composite(CompositeOut in [[stage_in]],
     // SSAO pass is not in the graph.
     color *= ao.sample(smp, in.uv).r;
 
+    // BLOOM, added while everything is still linear. Adding it after the tone
+    // map would put a haze over the highlights instead of light around them —
+    // the curve has already flattened that range, so the sum lands in the same
+    // few codes. u.lighting.y is the strength; a null texture reads black and
+    // the term vanishes.
+    color += bloom.sample(smp, in.uv).rgb * u.lighting.y;
+
     // A vignette, on purpose: it is a visible, measurable effect, so a test can
     // prove the composite pass actually ran rather than assuming it did.
     const float2 centred = in.uv * 2.0f - 1.0f;
     const float r = length(centred);
-    color *= mix(1.0f, 0.62f, smoothstep(0.65f, 1.35f, r));
+    color *= mix(1.0f, mix(1.0f, 0.62f, u.lighting.z),
+                 smoothstep(0.65f, 1.35f, r));
+
+    // TONE MAP AND GAMMA, once, at the end of the frame.
+    //
+    // This used to live in the surface shader, which meant every pass after it
+    // was working on display-referred colour that had already been clamped to
+    // one. Doing it here is what makes an HDR scene target worth having.
+    const float a1 = 2.51f, b1 = 0.03f, c1 = 2.43f, d1 = 0.59f, e1 = 0.14f;
+    color = saturate((color * (a1 * color + b1)) / (color * (c1 * color + d1) + e1));
+    color = pow(color, 1.0f / 2.2f);
 
     return float4(color, 1.0f);
 }

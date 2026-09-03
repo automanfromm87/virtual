@@ -95,7 +95,7 @@ int main() {
         if (spin) spin_angle += dt * 0.35f;
 
         const int w = f.width, h = f.height;
-        const eng::rhi::TextureId scene_color = app->Targets().Color("scene");
+        const eng::rhi::TextureId scene_color = app->Targets().Hdr("scene");
         const eng::rhi::TextureId scene_depth =
             app->Targets().Depth("scene", /*sampleable=*/true);
         const eng::rhi::TextureId ao_target = app->Targets().Color("ao");

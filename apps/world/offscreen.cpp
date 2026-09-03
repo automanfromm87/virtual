@@ -229,7 +229,7 @@ int main(int argc, char** argv) {
     // ---------------------------------------------------------------- render
     std::printf("render\n");
     const eng::rhi::TextureId shadow_map = dev->CreateShadowMap(2048);
-    const eng::rhi::TextureId color = dev->CreateRenderTarget(kW, kH, kFmt, true);
+    const eng::rhi::TextureId color = dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
     const eng::rhi::TextureId depth = dev->CreateDepthTarget(kW, kH);
     const eng::rhi::TextureId out = dev->CreateRenderTarget(kW, kH, kFmt, true);
     if (!Valid(shadow_map) || !Valid(color) || !Valid(depth) || !Valid(out)) {

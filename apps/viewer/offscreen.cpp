@@ -43,7 +43,8 @@ int main() {
 
     const auto kFmt = eng::rhi::Format::RGBA8Unorm;
     const eng::rhi::TextureId shadow_map = dev->CreateShadowMap(2048);
-    const eng::rhi::TextureId scene_color = dev->CreateRenderTarget(kW, kH, kFmt, true);
+    const eng::rhi::TextureId scene_color =
+        dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
     const eng::rhi::TextureId scene_depth = dev->CreateDepthTarget(kW, kH, true);
     const eng::rhi::TextureId ao_target = dev->CreateRenderTarget(kW, kH, kFmt, true);
     const eng::rhi::TextureId final_color = dev->CreateRenderTarget(kW, kH, kFmt, true);

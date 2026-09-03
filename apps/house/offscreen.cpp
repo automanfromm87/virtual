@@ -55,10 +55,14 @@ int main(int argc, char** argv) {
 
     const eng::rhi::TextureId shadow_map = dev->CreateShadowMap(2048);
     const auto kFmt = eng::rhi::Format::RGBA8Unorm;
-    const eng::rhi::TextureId scene_color = dev->CreateRenderTarget(kW, kH, kFmt, true);
+    const eng::rhi::TextureId scene_color =
+        dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
     const eng::rhi::TextureId scene_depth = dev->CreateDepthTarget(kW, kH, true);
     const eng::rhi::TextureId ao_target = dev->CreateRenderTarget(kW, kH, kFmt, true);
     const eng::rhi::TextureId final_color = dev->CreateRenderTarget(kW, kH, kFmt, true);
+    // The scene tone mapped but otherwise untouched: no occlusion, no vignette.
+    // The scene target itself is half-float and cannot be read back.
+    const eng::rhi::TextureId raw_color = dev->CreateRenderTarget(kW, kH, kFmt, true);
     if (!Valid(shadow_map) || !Valid(scene_color) || !Valid(scene_depth) ||
         !Valid(ao_target) || !Valid(final_color)) {
         std::fprintf(stderr, "FAIL: targets\n");
@@ -95,6 +99,20 @@ int main(int argc, char** argv) {
         }
 
         eng::RenderGraph g;
+        {
+            // A plain resolve of the scene: tone mapped, nothing else. The
+            // checks that want to see the geometry against a uniform
+            // background read this one.
+            eng::RenderGraph::Pass p;
+            p.name = "raw";
+            p.color = raw_color;
+            p.reads = {scene_color};
+            p.execute = [&](eng::rhi::Encoder& e) {
+                renderer->DrawComposite(e, scene_color, {}, {}, 0.0f,
+                                        /*vignette=*/0.0f);
+            };
+            g.AddPass(std::move(p));
+        }
         {
             eng::RenderGraph::Pass p;
             p.name = "composite";
@@ -152,7 +170,7 @@ int main(int argc, char** argv) {
         f.px.resize(std::size_t(kW) * kH * 4);
         f.raw.resize(f.px.size());
         if (!dev->ReadPixels(out, kW, kH, f.px) ||
-            !dev->ReadPixels(scene_color, kW, kH, f.raw)) {
+            !dev->ReadPixels(raw_color, kW, kH, f.raw)) {
             std::fprintf(stderr, "FAIL: readback\n");
             std::exit(1);
         }
@@ -206,12 +224,22 @@ int main(int argc, char** argv) {
     std::printf("  coverage cut=%.1f%% uncut=%.1f%%   mean luma ao=%.1f no-ao=%.1f\n",
                 Coverage(cut_on), Coverage(cut_off), MeanLuma(cut_on), MeanLuma(no_ao));
 
-    // The graph derived a four-pass order from resource dependencies alone; the
-    // passes were added composite, ssao, scene, shadow.
-    Check(cut_on.order.size() == 4 && cut_on.order[0] == "shadow" &&
-              cut_on.order[1] == "scene" && cut_on.order[2] == "ssao" &&
-              cut_on.order[3] == "composite",
-          "graph ordered shadow -> scene -> ssao -> composite");
+    // The graph derived the order from resource dependencies alone; the passes
+    // were added raw, composite, ssao, scene, shadow. What has to hold is that
+    // the two producers come before every consumer — the relative order of
+    // "ssao" and "raw", which read the same things and write different ones, is
+    // genuinely free and asserting one of the two would be asserting the sort's
+    // tie-break rather than its correctness.
+    const auto at = [&](const char* name) {
+        for (std::size_t i = 0; i < cut_on.order.size(); ++i)
+            if (cut_on.order[i] == name) return int(i);
+        return -1;
+    };
+    Check(cut_on.order.size() == 5, "all five passes ran");
+    Check(at("shadow") == 0 && at("scene") == 1, "producers first, in order");
+    Check(at("ssao") > at("scene") && at("raw") > at("scene"),
+          "both consumers of the scene target come after it");
+    Check(at("composite") > at("ssao"), "the composite comes after the occlusion");
 
     // Ground, floor, walls, roof, doors, frames, seven pieces of furniture, glass.
     Check(cut_on.stats.submitted == 14, "every part of the building submitted");

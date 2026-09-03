@@ -80,9 +80,12 @@ int main() {
     }
 
     const eng::rhi::TextureId shadow_map = dev->CreateShadowMap(1024);
-    const eng::rhi::TextureId color = dev->CreateRenderTarget(kW, kH, kFmt, true);
+    const eng::rhi::TextureId color = dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
     const eng::rhi::TextureId depth = dev->CreateDepthTarget(kW, kH);
-    if (!Valid(shadow_map) || !Valid(color) || !Valid(depth)) {
+    // The scene target is half-float now; the composite tone maps it into this
+    // one, which is the only kind that can be read back.
+    const eng::rhi::TextureId out = dev->CreateRenderTarget(kW, kH, kFmt, true);
+    if (!Valid(shadow_map) || !Valid(color) || !Valid(depth) || !Valid(out)) {
         std::fprintf(stderr, "FAIL: targets\n");
         return 1;
     }
@@ -115,6 +118,16 @@ int main() {
             };
             graph.AddPass(std::move(p));
         }
+        {
+            eng::RenderGraph::Pass p;
+            p.name = "composite";
+            p.color = out;
+            p.reads = {color};
+            p.execute = [&](eng::rhi::Encoder& e) {
+                renderer->DrawComposite(e, color, {}, {}, 0.0f, /*vignette=*/0.0f);
+            };
+            graph.AddPass(std::move(p));
+        }
         std::string e;
         if (!graph.Compile(e)) { std::fprintf(stderr, "FAIL: %s\n", e.c_str()); return; }
         dev->BeginFrame();
@@ -124,7 +137,7 @@ int main() {
         stats = renderer->LastStats();
         shadow_draws = renderer->ShadowDrawCount();
         pixels.assign(std::size_t(kW) * kH * 4, 0);
-        (void)dev->ReadPixels(color, kW, kH, pixels);
+        (void)dev->ReadPixels(out, kW, kH, pixels);
     };
 
     // The flag's bars are red and near-white; the ground is a desaturated

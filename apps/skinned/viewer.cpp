@@ -64,7 +64,7 @@ int main() {
         // paused, and dt is zero then by design.
         clip_time += app->Actions().Axis("scrub") * app->Time().RawDt() * 1.5f;
 
-        const eng::rhi::TextureId color = app->Targets().Color("scene");
+        const eng::rhi::TextureId color = app->Targets().Hdr("scene");
         const eng::rhi::TextureId depth = app->Targets().Depth("scene");
 
         eng::Scene scene = demo::MakeScene(assets, clip_time);

@@ -360,17 +360,12 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
     const float3 ambient =
         albedo * (1.0f - metallic) * skyAtN * (1.0f - Famb) + skyAtR * Famb;
 
-    // ACES filmic, then gamma.
+    // LINEAR HDR out, un-tone-mapped and un-gamma-corrected. The scene target
+    // is half-float and the composite does both at the end.
     //
-    // Reinhard was here first and it is why every earlier picture looked hazy:
-    // x/(1+x) starts compressing at zero, so it lifts the blacks and pulls all
-    // three channels toward each other, which desaturates exactly the coloured
-    // lights that were worth having. This curve leaves the toe alone and rolls
-    // the highlights off instead.
-    float3 color = direct + ambient;
-    const float a1 = 2.51f, b1 = 0.03f, c1 = 2.43f, d1 = 0.59f, e1 = 0.14f;
-    color = saturate((color * (a1 * color + b1)) / (color * (c1 * color + d1) + e1));
-    color = pow(color, 1.0f / 2.2f);
-
-    return float4(color, in.color.a);
+    // This is not a rearrangement for tidiness. Tone mapping here clamps every
+    // surface to one before anything downstream sees it, so a lamp and a sheet
+    // of white paper arrive at the bloom pass identical and it glows off the
+    // paper. Brightness has to survive to the end of the frame to be usable.
+    return float4(direct + ambient, in.color.a);
 }

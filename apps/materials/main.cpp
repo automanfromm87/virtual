@@ -140,8 +140,13 @@ int main() {
 
     // --- render --------------------------------------------------------------
     eng::rhi::PassDesc pass;
-    pass.color = dev->CreateRenderTarget(kW, kH, eng::rhi::Format::RGBA8Unorm, true);
+    // Half-float, because shading writes linear HDR and the composite maps it
+    // down. Reading this one back is refused outright, which is what the
+    // resolve pass below is for.
+    pass.color = dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
     pass.depth = dev->CreateDepthTarget(kW, kH);
+    const eng::rhi::TextureId readable =
+        dev->CreateRenderTarget(kW, kH, eng::rhi::Format::RGBA8Unorm, true);
     for (int i = 0; i < 4; ++i) pass.clear_color[i] = eng::kClearColor[i];
     pass.clear_depth = 0.0f;
 
@@ -150,10 +155,17 @@ int main() {
     renderer->DrawScene(enc, scene, kW, kH);
     dev->EndPass();
     const eng::RenderStats stats = renderer->LastStats();
+    {
+        eng::rhi::PassDesc resolve;
+        resolve.color = readable;
+        eng::rhi::Encoder re = dev->BeginPass(resolve);
+        renderer->DrawComposite(re, pass.color, {}, {}, 0.0f, /*vignette=*/0.0f);
+        dev->EndPass();
+    }
     if (!dev->CommitAndWait(error)) { std::fprintf(stderr, "FAIL: %s\n", error.c_str()); return 1; }
 
     std::vector<std::uint8_t> px(std::size_t(kW) * kH * 4);
-    if (!dev->ReadPixels(pass.color, kW, kH, px)) {
+    if (!dev->ReadPixels(readable, kW, kH, px)) {
         std::fprintf(stderr, "FAIL: readback\n");
         return 1;
     }

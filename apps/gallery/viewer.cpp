@@ -32,6 +32,7 @@ int main() {
     app->Actions().Bind("pause", ' ');
     app->Actions().Bind("ssao", 'a');
     app->Actions().Bind("lights", 'l');
+    app->Actions().Bind("bloom", 'b');
 
     eng::OrbitController orbit;
     orbit.target = eng::Vec3{0.0f, 1.15f, 0.0f};
@@ -39,10 +40,10 @@ int main() {
     orbit.yaw = 1.02f;
     orbit.pitch = 0.20f;
 
-    bool ssao_on = true, locals_on = true;
+    bool ssao_on = true, locals_on = true, bloom_on = true;
     std::printf(
         "drag: orbit   scroll: zoom   space: pause   a: ambient occlusion\n"
-        "l: local lights on/off (the whole point)   esc: quit\n");
+        "l: local lights   b: bloom   esc: quit\n");
 
     eng::RenderGraph graph;
     while (app->Running()) {
@@ -55,8 +56,9 @@ int main() {
             app->Time().SetPaused(!app->Time().Paused());
         if (app->Actions().Pressed("ssao")) ssao_on = !ssao_on;
         if (app->Actions().Pressed("lights")) locals_on = !locals_on;
+        if (app->Actions().Pressed("bloom")) bloom_on = !bloom_on;
 
-        const eng::rhi::TextureId color = app->Targets().Color("scene");
+        const eng::rhi::TextureId color = app->Targets().Hdr("scene");
         const eng::rhi::TextureId depth =
             app->Targets().Depth("scene", /*sampleable=*/true);
         const eng::rhi::TextureId ao = app->Targets().Color("ao");
@@ -112,15 +114,57 @@ int main() {
             };
             graph.AddPass(std::move(p));
         }
+        // --- bloom: bright pass, then a separable blur at two octaves --------
+        const eng::rhi::TextureId bA = app->Targets().Hdr("bloomA", 2);
+        const eng::rhi::TextureId bB = app->Targets().Hdr("bloomB", 2);
+        const eng::rhi::TextureId bC = app->Targets().Hdr("bloomC", 4);
+        const eng::rhi::TextureId bD = app->Targets().Hdr("bloomD", 4);
+        const eng::rhi::TextureId bOut = app->Targets().Hdr("bloomOut", 2);
+        const float hx = 2.0f / float(f.width), hy = 2.0f / float(f.height);
+        const float qx = 4.0f / float(f.width), qy = 4.0f / float(f.height);
+        if (bloom_on) {
+            struct Step {
+                const char* name;
+                eng::rhi::TextureId src, dst;
+                float dx, dy;
+            };
+            const Step steps[4] = {{"blurAx", bA, bB, hx, 0.0f},
+                                   {"blurAy", bB, bC, 0.0f, hy},
+                                   {"blurBx", bC, bD, qx, 0.0f},
+                                   {"blurBy", bD, bOut, 0.0f, qy}};
+            {
+                eng::RenderGraph::Pass p;
+                p.name = "bright";
+                p.color = bA;
+                p.reads = {color};
+                p.execute = [&](eng::rhi::Encoder& e) {
+                    app->Draw().DrawBloomBright(e, color, 3.2f, 0.9f);
+                };
+                graph.AddPass(std::move(p));
+            }
+            for (const Step& st : steps) {
+                eng::RenderGraph::Pass p;
+                p.name = st.name;
+                p.color = st.dst;
+                p.reads = {st.src};
+                p.execute = [&, st](eng::rhi::Encoder& e) {
+                    app->Draw().DrawBloomBlur(e, st.src, st.dx, st.dy);
+                };
+                graph.AddPass(std::move(p));
+            }
+        }
         {
             eng::RenderGraph::Pass p;
             p.name = "composite";
             p.color = f.drawable;
-            p.reads = ssao_on ? std::vector<eng::rhi::TextureId>{color, ao}
-                              : std::vector<eng::rhi::TextureId>{color};
+            p.reads = {color};
+            if (ssao_on) p.reads.push_back(ao);
+            if (bloom_on) p.reads.push_back(bOut);
             p.execute = [&](eng::rhi::Encoder& e) {
                 app->Draw().DrawComposite(e, color,
-                                          ssao_on ? ao : eng::rhi::TextureId{});
+                                          ssao_on ? ao : eng::rhi::TextureId{},
+                                          bloom_on ? bOut : eng::rhi::TextureId{},
+                                          0.34f);
             };
             graph.AddPass(std::move(p));
         }

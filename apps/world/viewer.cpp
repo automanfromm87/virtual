@@ -91,7 +91,7 @@ int main(int argc, char** argv) {
             app->Time().SetPaused(!app->Time().Paused());
         if (app->Actions().Pressed("reset")) demo::Reset(world);
 
-        const eng::rhi::TextureId color = app->Targets().Color("scene");
+        const eng::rhi::TextureId color = app->Targets().Hdr("scene");
         const eng::rhi::TextureId depth = app->Targets().Depth("scene");
 
         // dt is zero while paused, so the simulation stops without this demo

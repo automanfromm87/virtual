@@ -1,5 +1,8 @@
 #include "engine/app/targets.h"
 
+#include <algorithm>
+#include <string>
+
 namespace eng::app {
 
 FrameTargets::FrameTargets(rhi::Device& device, rhi::Format color)
@@ -24,7 +27,8 @@ void FrameTargets::Resize(int width, int height) {
 }
 
 FrameTargets::Target& FrameTargets::Lookup(std::string_view name, bool is_depth,
-                                           bool sampleable) {
+                                           bool sampleable, rhi::Format format,
+                                           int divisor) {
     // The kind is part of the key. Without it Color("scene") and Depth("scene")
     // collide and the second call hands back the first one's texture — a colour
     // target bound as a depth buffer, which is not a subtle failure but is a
@@ -46,20 +50,34 @@ FrameTargets::Target& FrameTargets::Lookup(std::string_view name, bool is_depth,
     Target t;
     t.is_depth = is_depth;
     t.sampleable = sampleable;
+    const int w = std::max(width_ / std::max(divisor, 1), 1);
+    const int h = std::max(height_ / std::max(divisor, 1), 1);
     if (width_ > 0 && height_ > 0) {
-        t.id = is_depth ? device_.CreateDepthTarget(width_, height_, sampleable)
-                        : device_.CreateRenderTarget(width_, height_, color_);
+        t.id = is_depth ? device_.CreateDepthTarget(w, h, sampleable)
+                        : device_.CreateRenderTarget(w, h, format);
         if (Valid(t.id)) ++allocations_;
     }
     return targets_[key] = t;
 }
 
 rhi::TextureId FrameTargets::Color(std::string_view name) {
-    return Lookup(name, /*is_depth=*/false, /*sampleable=*/false).id;
+    return Lookup(name, /*is_depth=*/false, /*sampleable=*/false, color_, 1).id;
+}
+
+rhi::TextureId FrameTargets::Hdr(std::string_view name, int divisor) {
+    // The divisor is part of the key. Two callers asking for "bloom" at
+    // different sizes want two textures, and handing them one would silently
+    // give the second whichever size the first asked for.
+    std::string key(name);
+    key += '@';
+    key += char('0' + std::clamp(divisor, 1, 9));
+    return Lookup(key, /*is_depth=*/false, /*sampleable=*/false,
+                  rhi::Format::RGBA16Float, divisor)
+        .id;
 }
 
 rhi::TextureId FrameTargets::Depth(std::string_view name, bool sampleable) {
-    return Lookup(name, /*is_depth=*/true, sampleable).id;
+    return Lookup(name, /*is_depth=*/true, sampleable, color_, 1).id;
 }
 
 }  // namespace eng::app

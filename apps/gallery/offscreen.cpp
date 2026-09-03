@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
 #include "apps/gallery/gallery_scene.h"
+#include "engine/app/targets.h"
 #include "engine/render/rendergraph.h"
 #include "engine/render/renderer.h"
 #include "engine/rhi/rhi.h"
@@ -39,13 +41,20 @@ int main() {
     }
 
     const eng::rhi::TextureId shadow_map = dev->CreateShadowMap(2048);
-    const eng::rhi::TextureId color = dev->CreateRenderTarget(kW, kH, kFmt, true);
+    const eng::rhi::TextureId color = dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
     const eng::rhi::TextureId depth = dev->CreateDepthTarget(kW, kH);
     const eng::rhi::TextureId out = dev->CreateRenderTarget(kW, kH, kFmt, true);
     if (!Valid(shadow_map) || !Valid(color) || !Valid(depth) || !Valid(out)) {
         std::fprintf(stderr, "FAIL: targets\n");
         return 1;
     }
+
+    // The gate owns a FrameTargets so the bloom chain can ask for half- and
+    // quarter-sized buffers by name instead of hand-rolling six textures.
+    eng::app::FrameTargets targets(*dev, kFmt);
+    targets.Resize(kW, kH);
+    bool bloom_on = true;
+    float bloom_strength = 0.34f;
 
     std::vector<std::uint8_t> pixels;
     eng::RenderStats stats;
@@ -92,12 +101,88 @@ int main() {
             };
             graph.AddPass(std::move(p));
         }
+        // --- bloom ------------------------------------------------------------
+        // Bright pass at half resolution, then a separable blur at half and
+        // again at quarter. Two octaves: the tight one puts a halo right
+        // against the source, the wide one the soft glow further out. One
+        // radius alone gives either a hard ring or a flat wash.
+        const eng::rhi::TextureId b_half = targets.Hdr("bloomA", 2);
+        const eng::rhi::TextureId b_half2 = targets.Hdr("bloomB", 2);
+        const eng::rhi::TextureId b_quarter = targets.Hdr("bloomC", 4);
+        const eng::rhi::TextureId b_quarter2 = targets.Hdr("bloomD", 4);
+        // A target of its own for the last blur. Reusing the bright pass's
+        // buffer was the obvious saving and the render graph refused it: two
+        // passes writing one texture have no defined order without resource
+        // versioning, and it would have worked right up until the graph
+        // reordered them.
+        const eng::rhi::TextureId b_out = targets.Hdr("bloomOut", 2);
+        const float hw = 2.0f / float(kW), hh = 2.0f / float(kH);
+        const float qw = 4.0f / float(kW), qh = 4.0f / float(kH);
+        {
+            eng::RenderGraph::Pass p;
+            p.name = "bright";
+            p.color = b_half;
+            p.reads = {color};
+            p.execute = [&](eng::rhi::Encoder& e) {
+                // Linear radiance, and the scene's lamps run into the tens.
+                // 1.15 was the first guess and it bloomed off the lit floor,
+                // which turned the whole frame magenta -- the pools ARE that
+                // bright, so the threshold has to sit above them and not just
+                // above white.
+                (*renderer).DrawBloomBright(e, color, 3.2f, 0.9f);
+            };
+            graph.AddPass(std::move(p));
+        }
+        {
+            eng::RenderGraph::Pass p;
+            p.name = "blurAx";
+            p.color = b_half2;
+            p.reads = {b_half};
+            p.execute = [&](eng::rhi::Encoder& e) {
+                (*renderer).DrawBloomBlur(e, b_half, hw, 0.0f);
+            };
+            graph.AddPass(std::move(p));
+        }
+        {
+            eng::RenderGraph::Pass p;
+            p.name = "blurAy";
+            p.color = b_quarter;
+            p.reads = {b_half2};
+            p.execute = [&](eng::rhi::Encoder& e) {
+                (*renderer).DrawBloomBlur(e, b_half2, 0.0f, hh);
+            };
+            graph.AddPass(std::move(p));
+        }
+        {
+            eng::RenderGraph::Pass p;
+            p.name = "blurBx";
+            p.color = b_quarter2;
+            p.reads = {b_quarter};
+            p.execute = [&](eng::rhi::Encoder& e) {
+                (*renderer).DrawBloomBlur(e, b_quarter, qw, 0.0f);
+            };
+            graph.AddPass(std::move(p));
+        }
+        {
+            eng::RenderGraph::Pass p;
+            p.name = "blurBy";
+            p.color = b_out;
+            p.reads = {b_quarter2};
+            p.execute = [&](eng::rhi::Encoder& e) {
+                (*renderer).DrawBloomBlur(e, b_quarter2, 0.0f, qh);
+            };
+            graph.AddPass(std::move(p));
+        }
         {
             eng::RenderGraph::Pass p;
             p.name = "composite";
             p.color = out;
-            p.reads = {color};
-            p.execute = [&](eng::rhi::Encoder& e) { renderer->DrawComposite(e, color); };
+            p.reads = {color, b_out};
+            p.execute = [&](eng::rhi::Encoder& e) {
+                renderer->DrawComposite(e, color, {},
+                                        bloom_on ? b_out : eng::rhi::TextureId{},
+                                        bloom_strength);
+            };
             graph.AddPass(std::move(p));
         }
         std::string e;
@@ -250,6 +335,65 @@ int main() {
                     lr, lg, lb, rr, rg, rb);
         Check(lb > lr * 1.25, "the left of the room is blue");
         Check(rr > rb * 1.25, "the right of the room is warm");
+    }
+
+    std::printf("bloom\n");
+    {
+        // THE invariant. Binding the bloom texture with a strength of zero must
+        // produce exactly the image you get with no bloom at all.
+        //
+        // This is the check that would have saved a very long hunt. The bloom
+        // pipelines were compiled against the eight-bit output format while
+        // rendering into half-float targets — which Metal does not reject, it
+        // just leaves the contents undefined. Every pixel came back NaN, and
+        // NaN times a strength of zero is still NaN, so it survived the add,
+        // the tone map and saturate() to zero one colour channel of the whole
+        // frame. "Turn the effect off and nothing changes" catches that at once.
+        bloom_strength = 0.0f;
+        draw(full);
+        const std::vector<std::uint8_t> zero_strength = pixels;
+        bloom_on = false;
+        draw(full);
+        int differ = 0;
+        for (std::size_t i = 0; i < pixels.size(); i += 4)
+            if (std::abs(int(pixels[i]) - int(zero_strength[i])) > 1 ||
+                std::abs(int(pixels[i + 1]) - int(zero_strength[i + 1])) > 1 ||
+                std::abs(int(pixels[i + 2]) - int(zero_strength[i + 2])) > 1)
+                ++differ;
+        std::printf("    %d pixels differ between zero-strength and no bloom\n",
+                    differ);
+        Check(differ == 0, "bloom at zero strength changes nothing");
+
+        // And with it on, it brightens — but only around what is actually
+        // bright. The far corner of the room has no light source in it.
+        bloom_on = true;
+        bloom_strength = 0.34f;
+        draw(full);
+        const std::vector<std::uint8_t> lit = pixels;
+
+        auto mean_of = [&](const std::vector<std::uint8_t>& img, int x0, int y0,
+                           int x1, int y1) {
+            double sum = 0;
+            int n = 0;
+            for (int y = y0; y < y1; ++y)
+                for (int x = x0; x < x1; ++x) {
+                    const std::size_t i = (std::size_t(y) * kW + x) * 4;
+                    sum += img[i] + img[i + 1] + img[i + 2];
+                    ++n;
+                }
+            return sum / std::max(n, 1);
+        };
+        // Around the lit spheres.
+        const double near_on = mean_of(lit, 380, 230, 760, 380);
+        const double near_off = mean_of(zero_strength, 380, 230, 760, 380);
+        // The top-left corner: dark wall, no lamp anywhere near it.
+        const double far_on = mean_of(lit, 20, 20, 200, 120);
+        const double far_off = mean_of(zero_strength, 20, 20, 200, 120);
+        std::printf("    near the lights %.1f -> %.1f   dark corner %.1f -> %.1f\n",
+                    near_off, near_on, far_off, far_on);
+        Check(near_on > near_off + 4.0, "bloom brightens around the bright things");
+        Check(far_on < far_off + 2.0, "and leaves the dark parts of the room alone");
+        bloom_strength = 0.34f;
     }
 
     std::printf("spot lights cast shadows into the atlas\n");

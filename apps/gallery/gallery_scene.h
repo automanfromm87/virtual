@@ -231,10 +231,16 @@ inline eng::Scene MakeScene(const Assets& a, float time, float flicker = 1.0f) {
         bulb.mesh = a.lamp;
         bulb.material = a.lamp_mat;
         bulb.model = eng::Mat4::Translation(l.position);
-        // Flat shading takes its colour from the tint, normalised so a bright
-        // light does not produce a white blob.
+        // The bulb is the SOURCE, so it has to be the brightest thing in the
+        // frame — otherwise the pools of light it casts bloom and the lamp
+        // itself does not, which reads as backwards.
+        //
+        // Flat shading writes the tint straight out, and the scene target is
+        // linear HDR, so a value above one is meaningful here in a way it was
+        // not when every shader tone mapped its own output.
         const float peak = std::fmax(std::fmax(l.color.x, l.color.y), l.color.z);
-        bulb.tint = eng::Vec4{l.color.x / peak, l.color.y / peak, l.color.z / peak, 1};
+        const float k = 7.0f / peak;
+        bulb.tint = eng::Vec4{l.color.x * k, l.color.y * k, l.color.z * k, 1};
         s.instances.push_back(bulb);
     }
     return s;

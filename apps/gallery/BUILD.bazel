@@ -33,6 +33,7 @@ cc_binary(
     target_compatible_with = ["@platforms//os:macos"],
     deps = [
         ":gallery_scene",
+        "//engine/app:targets",
         "//engine/render",
         "//engine/rhi",
     ],
@@ -44,6 +45,7 @@ cc_test(
     target_compatible_with = ["@platforms//os:macos"],
     deps = [
         ":gallery_scene",
+        "//engine/app:targets",
         "//engine/render",
         "//engine/rhi",
     ],

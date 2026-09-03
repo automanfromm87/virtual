@@ -99,9 +99,13 @@ int main() {
 
     const eng::rhi::TextureId shadow_map = dev->CreateShadowMap(kShadowSize);
     const eng::rhi::TextureId color =
+        dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
+    // The scene target is half-float and cannot be read back; the composite
+    // tone maps it into this one.
+    const eng::rhi::TextureId readable =
         dev->CreateRenderTarget(kW, kH, eng::rhi::Format::RGBA8Unorm, true);
     const eng::rhi::TextureId depth = dev->CreateDepthTarget(kW, kH);
-    if (!Valid(shadow_map) || !Valid(color) || !Valid(depth)) {
+    if (!Valid(shadow_map) || !Valid(color) || !Valid(depth) || !Valid(readable)) {
         std::fprintf(stderr, "FAIL: targets\n");
         return 1;
     }
@@ -142,6 +146,19 @@ int main() {
             graph.AddPass(std::move(sh));
         }
 
+        {
+            // Tone map into the readable target. Not decoration: the scene
+            // target is linear half-float, and reading it back is refused.
+            eng::RenderGraph::Pass resolve;
+            resolve.name = "composite";
+            resolve.color = readable;
+            resolve.reads = {color};
+            resolve.execute = [&](eng::rhi::Encoder& e) {
+                renderer->DrawComposite(e, color, {}, {}, 0.0f, /*vignette=*/0.0f);
+            };
+            graph.AddPass(std::move(resolve));
+        }
+
         if (!graph.Compile(error)) {
             std::fprintf(stderr, "FAIL: %s\n", error.c_str());
             return 1;
@@ -154,7 +171,7 @@ int main() {
             std::fprintf(stderr, "FAIL: %s\n", error.c_str());
             return 1;
         }
-        if (!dev->ReadPixels(color, kW, kH, pass_shadows ? with : without)) {
+        if (!dev->ReadPixels(readable, kW, kH, pass_shadows ? with : without)) {
             std::fprintf(stderr, "FAIL: readback\n");
             return 1;
         }
@@ -185,8 +202,11 @@ int main() {
     std::printf("\n  %zu px darkened (%.1f%%), %zu px brightened (worst %.1f)\n",
                 darker, pct, brighter, worst_brighten);
 
-    Check(order.size() == 2 && order[0] == "shadow" && order[1] == "lit",
-          "graph put the shadow pass before the lit pass");
+    // Three passes now: the scene target is half-float, so a composite has to
+    // tone map it before anything can read it back.
+    Check(order.size() == 3 && order[0] == "shadow" && order[1] == "lit" &&
+              order[2] == "composite",
+          "graph put the shadow pass before the lit pass, and the resolve last");
     // Enough to be a real shadow, not so much that the whole frame went dark
     // (which is what a broken lookup or a wrong bias sign produces).
     //

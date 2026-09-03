@@ -12,6 +12,7 @@ cc_library(
     name = "shaders",
     hdrs = ["shader_types.h"],
     textual_hdrs = [
+        "bloom.metal",
         "composite.metal",
         "shadow.metal",
         "ssao.metal",
