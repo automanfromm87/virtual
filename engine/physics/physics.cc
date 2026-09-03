@@ -766,6 +766,22 @@ Vec3 ClosestOnSimplex(SupportPoint* s, int& n) {
     // n == 4. The origin is inside unless it is outside a face; test each face
     // that it is outside of and take the nearest.
     const Vec3 p[4] = {s[0].p, s[1].p, s[2].p, s[3].p};
+
+    // DEGENERATE TETRAHEDRON. Four coplanar points enclose nothing, so the
+    // origin cannot be inside one -- but each face test then decides on the
+    // sign of a number that is zero to within rounding, and they can all come
+    // back "inside". The caller reads that as the shapes overlapping.
+    //
+    // This is not a rare shape. GJK against a BOX collects support points from
+    // whichever face is pointing at the query, and a box's face has four
+    // coplanar corners -- so a point approaching a cube face-on produces
+    // exactly this. Measured before the guard: the distance from a point to a
+    // unit cube came back as zero for every point within 2.7 units of it, and
+    // correct beyond that, which made every hull raycast stop short.
+    const float vol = Dot(p[1] - p[0], Cross(p[2] - p[0], p[3] - p[0]));
+    const float scale = Length(p[1] - p[0]) * Length(p[2] - p[0]) *
+                        Length(p[3] - p[0]);
+    const bool flat = std::fabs(vol) <= 1e-5f * std::max(scale, 1e-12f);
     static const int kFace[4][3] = {{0, 1, 2}, {0, 2, 3}, {0, 3, 1}, {1, 3, 2}};
     Vec3 best{0, 0, 0};
     float best_d2 = 1e30f;
@@ -774,14 +790,15 @@ Vec3 ClosestOnSimplex(SupportPoint* s, int& n) {
     for (const auto& f : kFace) {
         const Vec3 fa = p[f[0]], fb = p[f[1]], fc = p[f[2]];
         const Vec3 nrm = Cross(fb - fa, fc - fa);
-        // The opposite vertex tells us which side is "in".
+        // The opposite vertex tells us which side is "in". On a flat
+        // tetrahedron it tells us nothing, so every face is a candidate.
         int opp = 0;
         for (int i = 0; i < 4; ++i)
             if (i != f[0] && i != f[1] && i != f[2]) opp = i;
         const float side = Dot(nrm, p[opp] - fa);
         const float here = Dot(nrm, fa * -1.0f);
         // Origin on the same side as the opposite vertex: inside this face.
-        if (side * here >= 0.0f) continue;
+        if (!flat && side * here >= 0.0f) continue;
 
         SupportPoint sub[3] = {s[f[0]], s[f[1]], s[f[2]]};
         int sn = 3;
@@ -896,6 +913,204 @@ float TimeOfImpact(const Body& a, const Body& b, Vec3 motion_a, Vec3 motion_b,
         if (t >= 1.0f) return 1.0f;
     }
     return t;
+}
+
+// ---------------------------------------------------------------- queries ---
+
+namespace {
+
+// Ray against a sphere, solved directly. `dir` need not be unit; `t` comes back
+// in its units.
+bool RaySphere(Vec3 origin, Vec3 dir, Vec3 centre, float radius, float max_t,
+               float* t_out, Vec3* normal_out) {
+    const Vec3 m = origin - centre;
+    const float a = Dot(dir, dir);
+    if (a < 1e-20f) return false;
+    const float b = 2.0f * Dot(m, dir);
+    const float c = Dot(m, m) - radius * radius;
+    // Starting INSIDE is a hit at t = 0 with no meaningful normal. Reporting a
+    // miss instead is the more common choice and the wrong one: a character
+    // that spawns inside geometry then has no way to discover it.
+    if (c <= 0.0f) {
+        *t_out = 0.0f;
+        *normal_out = Dot(m, m) > 1e-12f ? Normalize(m) : Vec3{0, 1, 0};
+        return true;
+    }
+    const float disc = b * b - 4.0f * a * c;
+    if (disc < 0.0f) return false;
+    const float root = std::sqrt(disc);
+    // The NEAR root. Both are positive here because c > 0 means the origin is
+    // outside, so taking the far one would report the exit wound.
+    const float t = (-b - root) / (2.0f * a);
+    if (t < 0.0f || t > max_t) return false;
+    *t_out = t;
+    *normal_out = Normalize(origin + dir * t - centre);
+    return true;
+}
+
+// Ray against an oriented box, by the slab method in the box's own frame --
+// where it is axis-aligned and the test is three interval intersections.
+bool RayBox(Vec3 origin, Vec3 dir, const Body& b, float max_t, float* t_out,
+            Vec3* normal_out) {
+    const Vec3 o = RotateInverse(b.orientation, origin - b.position);
+    const Vec3 d = RotateInverse(b.orientation, dir);
+    const Vec3 h = b.shape.half_extents;
+
+    float tmin = 0.0f, tmax = max_t;
+    int axis = 0;
+    float sign = 1.0f;
+    for (int i = 0; i < 3; ++i) {
+        const float oi = (&o.x)[i], di = (&d.x)[i], hi = (&h.x)[i];
+        if (std::fabs(di) < 1e-9f) {
+            // Parallel to this pair of faces: either inside the slab forever or
+            // outside it forever, and no finite t divides the two.
+            //
+            // DEFENSIVE, and honestly so: removing it changes no answer that
+            // this engine's tests can produce. Dividing by zero gives a signed
+            // infinity, the interval arithmetic below comes out right for both
+            // inside and outside, and a ray exactly ON a face makes one bound
+            // 0/0 -- a NaN that then vanishes, because `NaN > tmin` is false
+            // and `std::min(tmax, NaN)` returns tmax by specification. So the
+            // NaN never reaches either bound.
+            //
+            // It stays because that is three coincidences deep, two of them in
+            // the standard library's argument order, and the cost is one
+            // compare per axis.
+            if (oi < -hi || oi > hi) return false;
+            continue;
+        }
+        const float inv = 1.0f / di;
+        float t1 = (-hi - oi) * inv, t2 = (hi - oi) * inv;
+        float s = -1.0f;
+        if (t1 > t2) { std::swap(t1, t2); s = 1.0f; }
+        if (t1 > tmin) { tmin = t1; axis = i; sign = s; }
+        tmax = std::min(tmax, t2);
+        if (tmin > tmax) return false;
+    }
+    *t_out = tmin;
+    Vec3 n{0, 0, 0};
+    (&n.x)[axis] = sign;
+    // Started inside: tmin stayed at zero and no axis was chosen, so the normal
+    // above is arbitrary. Say so by pointing back along the ray.
+    if (tmin <= 0.0f) n = Normalize(dir) * -1.0f;
+    *normal_out = Rotate(b.orientation, n);
+    return true;
+}
+
+}  // namespace
+
+bool World::Raycast(Vec3 origin, Vec3 direction, float max_distance, RayHit* out,
+                    const QueryFilter& filter) const {
+    if (!out) return false;
+    *out = RayHit{};
+    const float len = Length(direction);
+    if (len < 1e-12f || max_distance <= 0.0f) return false;
+
+    float best_t = max_distance;
+    for (int i = 0; i < int(bodies_.size()); ++i) {
+        if (i == filter.ignore) continue;
+        const Body& b = bodies_[std::size_t(i)];
+        if ((b.layer & filter.mask) == 0u) continue;
+        if (b.trigger && !filter.hit_triggers) continue;
+
+        // A cheap reject against the bounding sphere first. Every shape keeps
+        // its radius up to date, and the exact tests below are ten times the
+        // work of this one.
+        float t = 0.0f;
+        Vec3 n{0, 1, 0};
+        if (!RaySphere(origin, direction, b.position, b.shape.radius, best_t, &t, &n))
+            continue;
+
+        switch (b.shape.type) {
+            case ShapeType::Sphere:
+                break;  // the bounding test WAS the exact test
+            case ShapeType::Box:
+                if (!RayBox(origin, direction, b, best_t, &t, &n)) continue;
+                break;
+            case ShapeType::Hull: {
+                // CONSERVATIVE ADVANCEMENT, the same idea the continuous
+                // collision code uses: the distance from a point to a convex
+                // body is a lower bound on how far the point may travel before
+                // touching it, so advancing by exactly that is always safe and
+                // never skips the surface.
+                //
+                // The alternative is clipping the ray against the hull's face
+                // planes, which is faster and needs the FACES -- and a hull
+                // shape deliberately stores only its vertices, because that is
+                // all a support function needs. Paying a few iterations here
+                // keeps that true.
+                Body probe;
+                probe.shape = Shape::MakeSphere(0.0f);
+                float march = 0.0f;
+                bool hit = false;
+                for (int iter = 0; iter < 32; ++iter) {
+                    probe.position = origin + direction * march;
+                    Vec3 dir_to;
+                    const float dist = Distance(probe, b, &dir_to, nullptr, nullptr);
+                    if (dist <= 1e-4f) { hit = true; break; }
+                    march += dist / len;
+                    if (march > best_t) break;
+                    n = dir_to * -1.0f;  // Distance points probe -> body
+                }
+                if (!hit || march > best_t) continue;
+                t = march;
+                break;
+            }
+        }
+
+        // Also belt-and-braces: every shape test above is given `best_t` as
+        // its own limit and rejects anything beyond it, so a farther body
+        // cannot get this far. Kept because that is a property of three
+        // separate routines agreeing, not of this loop.
+        if (t < best_t) {
+            best_t = t;
+            out->body = i;
+            out->t = t;
+            out->point = origin + direction * t;
+            out->normal = n;
+        }
+    }
+    return out->Hit();
+}
+
+int World::OverlapShape(const Shape& shape, Vec3 position, Quat orientation,
+                        std::vector<int>* out, const QueryFilter& filter) const {
+    if (!out) return 0;
+    Body probe;
+    probe.shape = shape;
+    probe.position = position;
+    probe.orientation = orientation;
+    probe.inverse_mass = 0.0f;
+
+    int found = 0;
+    for (int i = 0; i < int(bodies_.size()); ++i) {
+        if (i == filter.ignore) continue;
+        const Body& b = bodies_[std::size_t(i)];
+        if ((b.layer & filter.mask) == 0u) continue;
+        if (b.trigger && !filter.hit_triggers) continue;
+        // Bounding spheres first, for the same reason as the raycast.
+        const float reach = probe.shape.radius + b.shape.radius;
+        if (Dot(b.position - position, b.position - position) > reach * reach)
+            continue;
+        // The general convex test, not the specialised ones: a query shape can
+        // be any of the three against any of the three, and CollideConvex is
+        // the path that needs no case analysis.
+        Contact c;
+        if (!CollideConvex(probe, b, &c)) continue;
+        out->push_back(i);
+        ++found;
+    }
+    return found;
+}
+
+int World::OverlapSphere(Vec3 centre, float radius, std::vector<int>* out,
+                         const QueryFilter& filter) const {
+    return OverlapShape(Shape::MakeSphere(radius), centre, Quat{}, out, filter);
+}
+
+int World::OverlapBox(Vec3 centre, Vec3 half_extents, std::vector<int>* out,
+                      const QueryFilter& filter) const {
+    return OverlapShape(Shape::MakeBox(half_extents), centre, Quat{}, out, filter);
 }
 
 void World::Collide() {

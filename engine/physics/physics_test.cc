@@ -986,6 +986,259 @@ int main() {
                            Vec3{0, 0, 0}) < 1e-2f);
     }
 
+    // --- raycasts --------------------------------------------------------------
+    //
+    // The engine could trace a million shadow rays on the GPU and could not
+    // answer "what did the player click on". This is that.
+    //
+    // Every expectation here is arithmetic, because a raycast is easy to write
+    // so that it ALMOST works: off by the radius, returning the far root,
+    // returning the second-nearest body, or reporting the surface normal of the
+    // face opposite the one it hit. None of those show up in a demo.
+    {
+        std::printf("raycasts\n");
+        World w;
+        w.gravity = Vec3{0, 0, 0};
+
+        // A sphere of radius 1 at x = 5. A ray down +x from the origin meets
+        // its NEAR surface at 4, not its centre at 5 and not its far side at 6.
+        const int ball = w.Add(Ball(Vec3{5, 0, 0}, 1.0f));
+        RayHit hit;
+        CHECK(w.Raycast(Vec3{0, 0, 0}, Vec3{1, 0, 0}, 100.0f, &hit));
+        std::printf("    sphere r=1 at x=5, ray from the origin: t = %.5f, "
+                    "normal (%.2f %.2f %.2f)\n", hit.t, hit.normal.x,
+                    hit.normal.y, hit.normal.z);
+        CHECK(hit.body == ball);
+        CHECK(std::fabs(hit.t - 4.0f) < 1e-4f);
+        CHECK(std::fabs(hit.point.x - 4.0f) < 1e-4f);
+        // Pointing OUT of the surface, so back toward the shooter.
+        CHECK(hit.normal.x < -0.999f);
+
+        // Misses. Past the end, beside it, and behind the origin.
+        CHECK(!w.Raycast(Vec3{0, 0, 0}, Vec3{1, 0, 0}, 3.5f, &hit));
+        CHECK(!w.Raycast(Vec3{0, 3, 0}, Vec3{1, 0, 0}, 100.0f, &hit));
+        CHECK(!w.Raycast(Vec3{0, 0, 0}, Vec3{-1, 0, 0}, 100.0f, &hit));
+
+        // A direction scaled to the ray's LENGTH makes t a fraction, which is
+        // what a "did this segment hit anything" query wants.
+        CHECK(w.Raycast(Vec3{0, 0, 0}, Vec3{8, 0, 0}, 1.0f, &hit));
+        CHECK(std::fabs(hit.t - 0.5f) < 1e-4f);
+
+        // The NEAREST of several, not the first one added or the last.
+        const int near_ball = w.Add(Ball(Vec3{2, 0, 0}, 0.5f));
+        CHECK(w.Raycast(Vec3{0, 0, 0}, Vec3{1, 0, 0}, 100.0f, &hit));
+        CHECK(hit.body == near_ball);
+        CHECK(std::fabs(hit.t - 1.5f) < 1e-4f);
+        // ...and adding a FARTHER one after it must not change the answer.
+        w.Add(Ball(Vec3{9, 0, 0}, 0.5f));
+        CHECK(w.Raycast(Vec3{0, 0, 0}, Vec3{1, 0, 0}, 100.0f, &hit));
+        CHECK(hit.body == near_ball);
+
+        // Starting INSIDE reports a hit at zero rather than a miss. A character
+        // that spawns in geometry has to be able to find out.
+        CHECK(w.Raycast(Vec3{2, 0, 0}, Vec3{1, 0, 0}, 100.0f, &hit));
+        CHECK(hit.body == near_ball && hit.t == 0.0f);
+    }
+
+    // --- raycasts against boxes, including rotated ones -------------------------
+    {
+        World w;
+        Body box;
+        box.shape = Shape::MakeBox(Vec3{1, 2, 3});
+        box.position = Vec3{0, 0, 0};
+        box.SetMass(0.0f);
+        w.Add(box);
+
+        RayHit hit;
+        // Down each axis, where the answer is the half-extent.
+        CHECK(w.Raycast(Vec3{-10, 0, 0}, Vec3{1, 0, 0}, 100.0f, &hit));
+        CHECK(std::fabs(hit.t - 9.0f) < 1e-4f && hit.normal.x < -0.999f);
+        CHECK(w.Raycast(Vec3{0, 10, 0}, Vec3{0, -1, 0}, 100.0f, &hit));
+        CHECK(std::fabs(hit.t - 8.0f) < 1e-4f && hit.normal.y > 0.999f);
+        CHECK(w.Raycast(Vec3{0, 0, -10}, Vec3{0, 0, 1}, 100.0f, &hit));
+        CHECK(std::fabs(hit.t - 7.0f) < 1e-4f && hit.normal.z < -0.999f);
+
+        // PARALLEL to a face. Outside the slab it must miss, inside it must
+        // hit, and EXACTLY ON the face it must still decide.
+        //
+        // All three pass with the parallel case handled and, as it turns out,
+        // without it: the signed infinities work, and the 0/0 an on-face ray
+        // produces is absorbed before it reaches either bound. So these do not
+        // prove the guard is needed -- they pin the ANSWERS, which is what they
+        // are for. See the guard's own comment for why it stays anyway.
+        CHECK(!w.Raycast(Vec3{-10, 5, 0}, Vec3{1, 0, 0}, 100.0f, &hit));
+        CHECK(w.Raycast(Vec3{-10, 1.5f, 0}, Vec3{1, 0, 0}, 100.0f, &hit));
+        CHECK(w.Raycast(Vec3{-10, 2.0f, 0}, Vec3{1, 0, 0}, 100.0f, &hit));
+        CHECK(std::isfinite(hit.t) && std::fabs(hit.t - 9.0f) < 1e-3f);
+        CHECK(w.Raycast(Vec3{-10, 0, 3.0f}, Vec3{1, 0, 0}, 100.0f, &hit));
+        CHECK(std::isfinite(hit.t) && std::fabs(hit.t - 9.0f) < 1e-3f);
+
+        // ROTATED. A cube turned 45 degrees about y presents its edge to a ray
+        // down x, and the edge is half_extent * sqrt(2) from the centre.
+        World r;
+        Body cube;
+        cube.shape = Shape::MakeBox(Vec3{1, 1, 1});
+        cube.orientation = QuatFromAxisAngle(Vec3{0, 1, 0}, 0.7853981634f);
+        cube.SetMass(0.0f);
+        r.Add(cube);
+        CHECK(r.Raycast(Vec3{-10, 0, 0}, Vec3{1, 0, 0}, 100.0f, &hit));
+        const float want = 10.0f - std::sqrt(2.0f);
+        std::printf("    a cube turned 45 degrees, hit at t = %.5f "
+                    "(edge-on gives %.5f)\n", hit.t, want);
+        CHECK(std::fabs(hit.t - want) < 1e-3f);
+        // The normal is a FACE normal of the rotated cube, not the world axis.
+        // At 45 degrees both x and z components are 1/sqrt(2).
+        CHECK(std::fabs(std::fabs(hit.normal.x) - 0.7071f) < 1e-2f);
+        CHECK(std::fabs(std::fabs(hit.normal.z) - 0.7071f) < 1e-2f);
+    }
+
+    // --- raycasts against hulls -------------------------------------------------
+    //
+    // A hull stores only its vertices, so the ray is marched in rather than
+    // clipped against faces. The check is that it agrees with the BOX routine
+    // on a shape that is both: the two share no code at all.
+    {
+        std::vector<Vec3> corners;
+        for (int i = 0; i < 8; ++i)
+            corners.push_back(Vec3{(i & 1) ? 1.0f : -1.0f, (i & 2) ? 1.0f : -1.0f,
+                                   (i & 4) ? 1.0f : -1.0f});
+        // First: is Distance() itself right for a point against a hull? The
+        // march is built entirely on it, and a march that stops early is
+        // indistinguishable from a Distance that reports zero too soon.
+        {
+            World probe_world;
+            Body h;
+            h.shape = Shape::MakeHull(corners);
+            h.SetMass(0.0f);
+            Body pt = Ball(Vec3{0, 0, 0}, 0.0f);
+            float worst_d = 0.0f;
+            for (int k = 0; k < 40; ++k) {
+                const float x = 1.0f + float(k) * 0.15f;
+                const float y = 0.35f * std::sin(float(k) * 0.5f);
+                pt.position = Vec3{x, y, 0.2f};
+                // Outside a box on the +x face only, the distance is x - 1.
+                const float want = x - 1.0f;
+                worst_d = std::fmax(worst_d, std::fabs(Distance(pt, h) - want));
+            }
+            std::printf("    point-to-hull distance, worst error over 40 "
+                        "samples: %.6f\n", worst_d);
+            CHECK(worst_d < 1e-3f);
+        }
+
+        float worst = 0.0f;
+        int compared = 0;
+        for (int k = 0; k < 24; ++k) {
+            const float a = float(k) * 0.26f;
+            World wb, wh;
+            Body b, h;
+            b.shape = Shape::MakeBox(Vec3{1, 1, 1});
+            h.shape = Shape::MakeHull(corners);
+            b.orientation = h.orientation =
+                QuatFromAxisAngle(Normalize(Vec3{0.3f, 1.0f, 0.2f}), a);
+            b.SetMass(0.0f);
+            h.SetMass(0.0f);
+            wb.Add(b);
+            wh.Add(h);
+            const Vec3 from{-8.0f, 0.4f * std::sin(a), 0.3f * std::cos(a * 1.3f)};
+            RayHit hb, hh;
+            const bool ok_b = wb.Raycast(from, Vec3{1, 0, 0}, 100.0f, &hb);
+            const bool ok_h = wh.Raycast(from, Vec3{1, 0, 0}, 100.0f, &hh);
+            CHECK(ok_b == ok_h);
+            if (!ok_b) continue;
+            ++compared;
+            worst = std::fmax(worst, std::fabs(hb.t - hh.t));
+        }
+        std::printf("    %d rays at a box and the same shape as a hull: worst "
+                    "disagreement %.5f\n", compared, worst);
+        CHECK(compared > 20);
+        // The march stops within its own tolerance of the surface, so it is
+        // slightly SHORT rather than exact -- a bound, not a coincidence.
+        CHECK(worst < 1e-3f);
+    }
+
+    // --- filtering ---------------------------------------------------------------
+    //
+    // Every game needs this on the first day: a ray from a gun must not hit the
+    // gun, and a bullet must not stop at a checkpoint volume.
+    {
+        World w;
+        Body shooter = Ball(Vec3{0, 0, 0}, 0.5f);
+        shooter.layer = 0x2;
+        const int me = w.Add(shooter);
+        Body zone = Ball(Vec3{3, 0, 0}, 1.0f);
+        zone.trigger = true;
+        const int trig = w.Add(zone);
+        Body wall;
+        wall.shape = Shape::MakeBox(Vec3{0.2f, 5, 5});
+        wall.position = Vec3{6, 0, 0};
+        wall.layer = 0x4;
+        wall.SetMass(0.0f);
+        const int solid = w.Add(wall);
+
+        RayHit hit;
+        // Cast from inside the shooter. Without `ignore` it hits itself at t=0.
+        CHECK(w.Raycast(Vec3{0, 0, 0}, Vec3{1, 0, 0}, 100.0f, &hit));
+        CHECK(hit.body == me && hit.t == 0.0f);
+
+        QueryFilter f;
+        f.ignore = me;
+        CHECK(w.Raycast(Vec3{0, 0, 0}, Vec3{1, 0, 0}, 100.0f, &hit, f));
+        // The trigger is INVISIBLE by default, so the bullet reaches the wall.
+        CHECK(hit.body == solid);
+        CHECK(std::fabs(hit.t - 5.8f) < 1e-3f);
+
+        // A query that wants triggers asks for them, and then finds the nearer.
+        f.hit_triggers = true;
+        CHECK(w.Raycast(Vec3{0, 0, 0}, Vec3{1, 0, 0}, 100.0f, &hit, f));
+        CHECK(hit.body == trig);
+
+        // And a mask picks a layer out.
+        QueryFilter only_wall;
+        only_wall.mask = 0x4;
+        CHECK(w.Raycast(Vec3{0, 0, 0}, Vec3{1, 0, 0}, 100.0f, &hit, only_wall));
+        CHECK(hit.body == solid);
+    }
+
+    // --- overlap queries ---------------------------------------------------------
+    {
+        std::printf("overlap queries\n");
+        World w;
+        for (int i = 0; i < 5; ++i) w.Add(Ball(Vec3{float(i) * 2.0f, 0, 0}, 0.5f));
+
+        std::vector<int> found;
+        // A sphere of radius 1 at the origin reaches x = 1, and the ball at
+        // x = 2 has radius 0.5, so its surface is at 1.5. Not touching.
+        CHECK(w.OverlapSphere(Vec3{0, 0, 0}, 1.0f, &found) == 1);
+        CHECK(found.size() == 1 && found[0] == 0);
+
+        found.clear();
+        // Radius 2 reaches 2, and the second ball's surface is at 1.5. Two.
+        CHECK(w.OverlapSphere(Vec3{0, 0, 0}, 2.0f, &found) == 2);
+
+        found.clear();
+        // A blast radius covering the lot.
+        CHECK(w.OverlapSphere(Vec3{4, 0, 0}, 10.0f, &found) == 5);
+
+        found.clear();
+        CHECK(w.OverlapSphere(Vec3{0, 50, 0}, 1.0f, &found) == 0);
+
+        // A box, and it must be tighter than the sphere that contains it: a
+        // 0.9-cube at the origin does NOT reach the ball at x = 2, while a
+        // sphere through its corners (radius 1.56) would.
+        found.clear();
+        CHECK(w.OverlapBox(Vec3{0, 0, 0}, Vec3{0.9f, 0.9f, 0.9f}, &found) == 1);
+        found.clear();
+        CHECK(w.OverlapBox(Vec3{0, 0, 0}, Vec3{1.6f, 0.2f, 0.2f}, &found) == 2);
+
+        // OVERLAP APPENDS rather than replacing, so several queries can build
+        // one list -- and a caller that expected replacement gets a bug that
+        // only shows on the second call.
+        found.clear();
+        w.OverlapSphere(Vec3{0, 0, 0}, 1.0f, &found);
+        w.OverlapSphere(Vec3{8, 0, 0}, 1.0f, &found);
+        CHECK(found.size() == 2 && found[0] == 0 && found[1] == 4);
+    }
+
     if (g_failures == 0) std::printf("physics_test: all checks passed\n");
     return g_failures == 0 ? 0 : 1;
 }

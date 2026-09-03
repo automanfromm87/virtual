@@ -30,7 +30,11 @@ enum class ShapeType : std::uint8_t { Sphere, Box, Hull };
 
 struct Shape {
     ShapeType type = ShapeType::Sphere;
-    float radius = 0.5f;                  // Sphere
+    // Sphere: the radius. EVERY shape: the bounding sphere, which the cheap
+    // rejects in raycasts, overlap queries and the CCD broadphase all read
+    // without asking what kind of shape it is. Each factory below keeps it
+    // right, and a shape built by hand must too.
+    float radius = 0.5f;
     Vec3 half_extents{0.5f, 0.5f, 0.5f};  // Box, in the body's own frame
     // Hull: the vertices, in the body's own frame, already reduced by
     // geom::ConvexHull. Only the vertices are kept -- GJK never asks anything
@@ -57,6 +61,16 @@ struct Shape {
         Shape s;
         s.type = ShapeType::Box;
         s.half_extents = half;
+        // The BOUNDING SPHERE, which every cheap reject in the engine reads off
+        // `radius` regardless of shape -- MakeHull has always set it and this
+        // did not, so a box carried the default 0.5 whatever its size.
+        //
+        // It was invisible because the two places that use it both happened to
+        // survive: continuous collision's broadphase reject only ever ran
+        // against small bullets, and nothing else asked. A raycast asks
+        // immediately, and a ray passing 1.5 m above the centre of a 4 m box
+        // was rejected before the exact test ever ran.
+        s.radius = Length(half);
         return s;
     }
     // From a built hull, which is the form that also knows its own volume and
@@ -115,6 +129,18 @@ struct Body {
     // start and the end of the step and the wall was only ever in between.
     bool bullet = false;
 
+    // A BIT MASK, for filtering queries and (later) collisions. One bit per
+    // layer: the player, the world, projectiles, triggers. A raycast that
+    // cannot be told to ignore the shooter hits the shooter, and every game
+    // that has ever been written needed that on the first day.
+    std::uint32_t layer = 1u;
+
+    // A TRIGGER generates contacts and no impulses: things pass through it, and
+    // the world reports that they did. A door's threshold, a checkpoint, a
+    // damage volume. Without it the only way to ask "is the player in this
+    // region" is to test it by hand every frame against every region.
+    bool trigger = false;
+
     float restitution = 0.35f;  // 0 = dead drop, 1 = never loses energy
     float friction = 0.5f;
 
@@ -153,6 +179,30 @@ struct Contact {
     Vec3 normal{0.0f, 1.0f, 0.0f};  // unit, points from a toward b
     Vec3 point{0.0f, 0.0f, 0.0f};   // world space, on the overlap
     float depth = 0.0f;             // positive when overlapping
+};
+
+// Where a ray met a body.
+struct RayHit {
+    int body = -1;  // index into the world, or -1 for nothing
+    float t = 0.0f;  // distance along the ray, in the direction's own units
+    Vec3 point{0.0f, 0.0f, 0.0f};
+    // Points OUT of the surface that was hit, so a bullet decal or a bounce
+    // uses it directly. Undefined when the ray starts inside the body.
+    Vec3 normal{0.0f, 1.0f, 0.0f};
+    [[nodiscard]] bool Hit() const { return body >= 0; }
+};
+
+// What a query is allowed to see.
+struct QueryFilter {
+    // A body is considered when `body.layer & mask` is non-zero.
+    std::uint32_t mask = 0xFFFFFFFFu;
+    // Skipped outright. The common case is the body doing the querying: a
+    // character casting a ray to find the ground must not find itself.
+    int ignore = -1;
+    // Triggers are invisible to queries by DEFAULT. A ray looking for a wall
+    // to stop a bullet should not stop at a checkpoint volume; a query that
+    // wants to find triggers asks for them.
+    bool hit_triggers = false;
 };
 
 struct WorldStats {
@@ -247,6 +297,29 @@ class World {
     void StepFixed();
 
     [[nodiscard]] const std::vector<Contact>& Contacts() const { return contacts_; }
+
+    // --- queries ---------------------------------------------------------------
+    //
+    // The half of a physics engine gameplay is actually built on. Simulation
+    // answers "where does everything end up"; queries answer "what is under the
+    // crosshair", "is there ground beneath my feet", "who is inside the blast
+    // radius" -- and nothing above can be asked without them.
+    //
+    // `direction` need not be normalised; `t` comes back in its units, so a
+    // direction scaled to the ray's length makes `t` a fraction from 0 to 1.
+    [[nodiscard]] bool Raycast(Vec3 origin, Vec3 direction, float max_distance,
+                               RayHit* out, const QueryFilter& = {}) const;
+
+    // Every body overlapping a sphere or a box, appended to `out`. Returns how
+    // many were added. The box is axis-aligned; an oriented one is an overlap
+    // test against a temporary body, which is what OverlapShape is for.
+    int OverlapSphere(Vec3 centre, float radius, std::vector<int>* out,
+                      const QueryFilter& = {}) const;
+    int OverlapBox(Vec3 centre, Vec3 half_extents, std::vector<int>* out,
+                   const QueryFilter& = {}) const;
+    // The general form: anything the narrowphase understands, at any pose.
+    int OverlapShape(const Shape&, Vec3 position, Quat orientation,
+                     std::vector<int>* out, const QueryFilter& = {}) const;
     [[nodiscard]] const WorldStats& Stats() const { return stats_; }
 
     // Kinetic (linear + rotational) plus gravitational potential energy,
