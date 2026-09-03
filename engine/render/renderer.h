@@ -145,23 +145,28 @@ class Renderer {
     //
     // Must run before DrawScene, into a pass whose depth target is
     // ShadowAtlas(). Assigns tiles in scene order and stops when they run out —
-    // a light that gets none is drawn unshadowed rather than dropped.
+    // a light that cannot fit is drawn unshadowed rather than dropped, and a
+    // point light needs all six or none: five faces of a cube shadow is worse
+    // than no cube shadow, because the sixth direction is lit through walls.
     void DrawLightShadows(rhi::Encoder&, const Scene&);
 
     // The atlas texture, created lazily on the first call. Null before that.
     [[nodiscard]] rhi::TextureId ShadowAtlas();
-    // Lights that were given a tile by the most recent DrawLightShadows.
+    // Lights that were given tiles by the most recent DrawLightShadows.
     [[nodiscard]] int ShadowedLightCount() const;
+    // Tiles those lights consumed: one per spot, six per point light.
+    [[nodiscard]] int ShadowTilesUsed() const;
 
     // What a scene target must be. HDR, because the tone map now happens in
     // the composite rather than in every surface shader — which is what lets
     // the passes in between see how bright a pixel really was.
     static constexpr rhi::Format kSceneFormat = rhi::Format::RGBA16Float;
 
-    static constexpr int kShadowAtlasSize = 2048;
-    static constexpr int kShadowTilesPerSide = 2;   // 2x2 tiles of 1024
-    static constexpr int kMaxShadowedLights =
-        kShadowTilesPerSide * kShadowTilesPerSide;
+    // 4x4 tiles of 1024. Sixteen because a POINT light needs six of them —
+    // one per cube face — so a 2x2 atlas could not hold a single one.
+    static constexpr int kShadowAtlasSize = 4096;
+    static constexpr int kShadowTilesPerSide = 4;
+    static constexpr int kShadowTiles = kShadowTilesPerSide * kShadowTilesPerSide;
 
     // Depth-only pass from the light's point of view. Must run BEFORE
     // DrawScene, into a pass whose depth target is `shadow_map`.

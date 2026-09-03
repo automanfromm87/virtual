@@ -81,8 +81,13 @@ struct GpuLight {
     // .x cos(inner cone), .y cos(outer cone). Equal for a point light, where
     // they are ignored.
     ENG_VEC4 cone;
-    // Where this light's depth map sits in the atlas: .xy the tile's origin in
-    // uv, .z the tile's size in uv, .w nonzero if it has one at all.
+    // Shadow map placement. .x the FIRST tile index this light owns, .y how
+    // many tiles the atlas has per side, .z the near plane its maps were drawn
+    // with, .w the kind: 0 none, 1 spot, 2 point.
+    //
+    // A tile INDEX rather than a uv rectangle, because a point light owns six
+    // consecutive tiles and the shader picks among them from a direction. Six
+    // matrices per light would also work and would cost 384 bytes each.
     ENG_VEC4 shadow;
 };
 

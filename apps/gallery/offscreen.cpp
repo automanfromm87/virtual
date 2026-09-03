@@ -496,8 +496,11 @@ int main() {
     {
         Check(Valid(renderer->ShadowAtlas()), "the atlas exists");
         draw(full);
-        Check(renderer->ShadowedLightCount() == 3,
-              "the three spots each got a tile");
+        Check(renderer->ShadowedLightCount() == 4,
+              "three spots and one point light got shadow space");
+        // Three spots at one tile each, one point light at six.
+        Check(renderer->ShadowTilesUsed() == 3 + 6,
+              "a point light takes six tiles and a spot one");
 
         // On versus off. Every darkened pixel has to be INSIDE a pool: the
         // directional key light's shadows are unchanged between these two
@@ -562,26 +565,98 @@ int main() {
         Check(differ < 400, "reordering the lights does not change the frame");
     }
 
-    std::printf("only spots get a tile\n");
+    std::printf("a point light shadows in every direction\n");
     {
-        eng::Scene points = full;
-        for (eng::Light& l : points.lights) {
-            l.type = eng::LightType::Point;   // a point light cannot use one
-            l.casts_shadow = true;
-        }
-        draw(points);
-        // Six lights all asking, none eligible. Handing a point light a single
-        // tile would shadow one sixth of the directions it lights and leave the
-        // rest wrong, which is worse than leaving it unshadowed.
-        Check(renderer->ShadowedLightCount() == 0,
-              "a point light asking for a shadow is refused, not half-served");
-        Check(stats.draws > 8, "and the frame still renders");
+        // The check that separates a cube shadow from a spot is not "does it
+        // shadow" but "is the shadow in the right PLACE".
+        //
+        // "Both sides darken" was tried first and a mutation that always
+        // sampled cube face zero passed it: that face's map holds plinths too,
+        // so the wrong face still produced plausible shadows. So: ONE blocker,
+        // off to one side, and the shadow has to land behind it and nowhere
+        // else.
+        eng::Scene s2;
+        s2.lightColor = eng::Vec4{0, 0, 0, 1};
+        s2.ambientSky = eng::Vec3{0, 0, 0};
+        s2.ambientGround = eng::Vec3{0, 0, 0};
+
+        eng::Instance ground;
+        ground.mesh = assets.floor;
+        ground.material = assets.floor_mat;
+        ground.model = eng::Mat4::Translation(eng::Vec3{0, -0.2f, 0});
+        s2.instances.push_back(ground);
+
+        // Lamp above the origin; blocker a little to its +x, at the same
+        // height. The shadow must be cast further along +x.
+        const eng::Vec3 lamp_at{0.0f, 2.4f, 0.0f};
+        // OFF the axis in both other directions. A blocker sitting exactly on
+        // an axis maps to the centre of its cube face, where a flipped or
+        // rotated `up` vector barely moves the lookup — so an on-axis test
+        // cannot tell whether the shader and the renderer agree about which way
+        // is up on a face. Off-centre, a disagreement rotates the shadow away.
+        // Below the lamp, so the shadow reaches the floor, and off BOTH other
+        // axes so the lookup lands away from the centre of its cube face.
+        // X is the largest component, so face +X is the one selected — which
+        // is where a disagreement about that face's `up` shows up.
+        const eng::Vec3 blocker_at{1.4f, 1.6f, 0.5f};
+        eng::Instance blocker;
+        blocker.mesh = assets.sphere;
+        blocker.material = assets.stone;
+        blocker.model = eng::Mat4::Translation(blocker_at);
+        s2.instances.push_back(blocker);
+
+        eng::Light lamp;
+        lamp.position = lamp_at;
+        lamp.color = eng::Vec3{70.0f, 70.0f, 70.0f};
+        lamp.range = 16.0f;
+        lamp.casts_shadow = true;
+        lamp.shadow_near = 0.25f;
+        s2.lights.push_back(lamp);
+
+        draw(s2);
+        const std::vector<std::uint8_t> shadowed = pixels;
+        Check(renderer->ShadowTilesUsed() == 6, "it took all six faces");
+        s2.lights[0].casts_shadow = false;
+        draw(s2);
+
+        // Where the blocker's shadow must land: along the ray from the lamp
+        // through the blocker, continued down to the floor.
+        const eng::Vec3 dir = Normalize(blocker_at - lamp_at);
+        const float t = (0.0f - lamp_at.y) / (dir.y != 0.0f ? dir.y : -1.0f);
+        // The ray is horizontal here, so use a fixed distance out instead.
+        // Continue the lamp->blocker ray until it reaches the floor.
+        const float reach = dir.y < -1e-3f ? (0.02f - lamp_at.y) / dir.y : 3.0f;
+        const eng::Vec3 expect = lamp_at + dir * reach;
+        const eng::Vec3 mirror{-expect.x, expect.y, -expect.z};
+        (void)t;
+
+        auto darkened_at = [&](eng::Vec3 world) {
+            int px = 0, py = 0;
+            Project(world, &px, &py);
+            int n = 0;
+            for (int y = std::max(py - 22, 0); y < std::min(py + 22, kH); ++y)
+                for (int x = std::max(px - 34, 0); x < std::min(px + 34, kW); ++x) {
+                    const std::size_t i = (std::size_t(y) * kW + x) * 4;
+                    const int a = pixels[i] + pixels[i + 1] + pixels[i + 2];
+                    const int b = shadowed[i] + shadowed[i + 1] + shadowed[i + 2];
+                    if (a - b > 25) ++n;
+                }
+            return n;
+        };
+        const int behind = darkened_at(expect);
+        const int opposite = darkened_at(mirror);
+        std::printf("    darkened behind the blocker %d, mirrored across the lamp %d\n",
+                    behind, opposite);
+        Check(behind > 300, "the blocker casts a shadow on its own far side");
+        Check(opposite < behind / 4,
+              "and NOT on the opposite side, which a wrong cube face would give");
     }
 
-    std::printf("more tiles than the atlas holds\n");
+    std::printf("shadow space runs out gracefully\n");
+
     {
         eng::Scene crowd = full;
-        for (int i = 0; i < 10; ++i) {
+        for (int i = 0; i < 24; ++i) {
             eng::Light l;
             l.type = eng::LightType::Spot;
             l.position = eng::Vec3{float(i) - 4.0f, 3.5f, 1.0f};
@@ -591,9 +666,36 @@ int main() {
             crowd.lights.push_back(l);
         }
         draw(crowd);
-        Check(renderer->ShadowedLightCount() == eng::Renderer::kMaxShadowedLights,
+        Check(renderer->ShadowTilesUsed() == eng::Renderer::kShadowTiles,
               "tiles are handed out until they run out");
         Check(stats.invalid == 0, "the lights that missed out still light, unshadowed");
+
+        // A point light that cannot fit ALL six faces gets none. Five faces is
+        // worse than zero: the sixth direction is lit straight through walls,
+        // and it is the one nobody thinks to check.
+        eng::Scene tight = full;
+        tight.lights.clear();
+        for (int i = 0; i < 3; ++i) {
+            eng::Light spot;
+            spot.type = eng::LightType::Spot;
+            spot.position = eng::Vec3{float(i), 4.0f, 0.0f};
+            spot.direction = eng::Vec3{0, -1, 0};
+            spot.color = eng::Vec3{20, 20, 20};
+            spot.casts_shadow = true;
+            tight.lights.push_back(spot);
+        }
+        // 3 spots leave 13 tiles; two point lights want 12, a third cannot fit.
+        for (int i = 0; i < 3; ++i) {
+            eng::Light p;
+            p.position = eng::Vec3{float(i) * 2.0f - 2.0f, 1.5f, 2.0f};
+            p.color = eng::Vec3{10, 10, 10};
+            p.casts_shadow = true;
+            tight.lights.push_back(p);
+        }
+        draw(tight);
+        Check(renderer->ShadowTilesUsed() == 3 + 6 + 6,
+              "the point light that could not fit six took none");
+        Check(renderer->ShadowedLightCount() == 5, "and is simply unshadowed");
     }
 
     std::printf("more lights than the budget are dropped, not wrapped\n");

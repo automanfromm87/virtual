@@ -76,6 +76,23 @@ Mat4 Light::ViewProj() const {
     return Mat4::PerspectiveReverseZ(fov, 1.0f, shadow_near) * view;
 }
 
+Mat4 Light::CubeFaceViewProj(int face) const {
+    // The six axis directions, in the standard cube-face order. The `up`
+    // vectors are the conventional ones: what matters is only that each is
+    // perpendicular to its forward, and that the SAME choice is used here and
+    // in the shader — disagree and the lookup samples a rotated copy of the
+    // right face, which reads as a shadow that slides as the light turns.
+    static const Vec3 kForward[6] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
+                                     {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+    static const Vec3 kUp[6] = {{0, -1, 0}, {0, -1, 0}, {0, 0, 1},
+                                {0, 0, -1}, {0, -1, 0}, {0, -1, 0}};
+    const int f = (face < 0 || face > 5) ? 0 : face;
+    const Mat4 view = Mat4::LookAt(position, position + kForward[f], kUp[f]);
+    // Exactly ninety degrees, so the six frusta tile the sphere with no gap and
+    // no overlap. Anything else leaves seams or wastes resolution.
+    return Mat4::PerspectiveReverseZ(1.5707963f, 1.0f, shadow_near) * view;
+}
+
 Mat4 Scene::LightViewProj() const {
     const Vec3 dir = Normalize(Vec3{lightDir.x, lightDir.y, lightDir.z});
     // lightDir points TOWARD the light, so the virtual camera sits out along it

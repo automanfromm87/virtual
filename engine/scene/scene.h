@@ -86,18 +86,30 @@ struct Light {
     float inner_degrees = 22.0f;
     float outer_degrees = 34.0f;
 
-    // Asks for a tile of the shadow atlas. Honoured for SPOTS only, and only
-    // while tiles remain — a point light casts in every direction at once and
-    // needs six faces, which is a different piece of work.
+    // Asks for shadow map space. A spot needs one tile; a POINT light needs
+    // six, because it casts in every direction and a single frustum covers at
+    // most one of them.
     //
-    // Not free: every shadowed light adds a pass over the casters.
+    // Not free: a shadowed spot adds one pass over the casters, a shadowed
+    // point light six.
     bool casts_shadow = false;
     // How close to the lamp the shadow map starts. Too small wastes precision
     // on space nothing occupies; too large clips geometry near the bulb.
     float shadow_near = 0.20f;
 
-    // World -> this light's clip space. Meaningless for a point light.
+    // World -> this light's clip space. For a spot. Meaningless for a point
+    // light, which has six of them.
     [[nodiscard]] Mat4 ViewProj() const;
+
+    // One face of a point light's cube, 0..5 in the order +X -X +Y -Y +Z -Z —
+    // the order Metal and every other API number cube faces in, so a lookup
+    // can pick a face from a direction without a translation table.
+    [[nodiscard]] Mat4 CubeFaceViewProj(int face) const;
+    // How many shadow tiles this light wants: 0, 1 for a spot, or 6.
+    [[nodiscard]] int ShadowFaces() const {
+        if (!casts_shadow) return 0;
+        return type == LightType::Spot ? 1 : 6;
+    }
 };
 
 // One drawable placement: which mesh, where, what colour. The scene refers to

@@ -205,47 +205,101 @@ static inline float3 Brdf(float3 N, float3 V, float3 L, float3 albedo,
     return diffuse + specular;
 }
 
-// A spot's shadow lookup, into its tile of the atlas.
-//
-// Perspective, unlike the directional light's, so the divide by w is real work
-// rather than a formality — a spot's rays diverge and the depth is not linear
-// in clip space.
-static inline float SpotShadow(float4 clip, float4 tile, depth2d<float> atlas,
-                               sampler smp)
+// The uv rectangle of one tile of the atlas.
+static inline float4 AtlasTile(float index, float per_side)
 {
-    if (clip.w <= 0.0f) return 1.0f;   // behind the lamp
-    const float3 ndc = clip.xyz / clip.w;
-    float2 uv = ndc.xy * 0.5f + 0.5f;
-    uv.y = 1.0f - uv.y;
-    // Outside its own frustum: lit. The cone falloff has already darkened
-    // anything out here, so the alternative is a black ring around the pool.
-    if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) return 1.0f;
-    if (ndc.z <= 0.0f) return 1.0f;    // past the far plane
+    const float span = 1.0f / per_side;
+    const float i = floor(index + 0.5f);
+    return float4(fmod(i, per_side) * span, floor(i / per_side) * span, span, 0.0f);
+}
 
-    // Into the tile. Clamped a texel inside it, because a bilinear tap at the
-    // very edge reaches into the neighbouring light's map and puts a stripe of
-    // someone else's shadow along the border.
+// A depth comparison against one tile, with 3x3 filtering.
+//
+// Clamped a texel inside the tile: a bilinear tap at the very edge reaches into
+// the neighbouring light's map and draws a stripe of someone else's shadow
+// along the border.
+static inline float SampleTile(depth2d<float> atlas, sampler smp, float2 uv,
+                               float4 tile, float depth, float bias)
+{
+    if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) return 1.0f;
     const float texel = 1.0f / float(atlas.get_width());
     const float2 lo = tile.xy + texel;
     const float2 hi = tile.xy + tile.z - texel;
-
-    // Reversed-Z: nearer the light is a GREATER depth, so lit means "at least
-    // as near as whatever was recorded".
-    //
-    // The bias scales with depth. A constant one is either useless near the
-    // lamp or lets the far end of the cone shadow itself, because a
-    // perspective map's precision falls off with distance in a way an
-    // orthographic one's does not.
-    const float bias = 2.5e-4f + 4.0e-3f * ndc.z;
     float lit = 0.0f;
     for (int dy = -1; dy <= 1; ++dy)
         for (int dx = -1; dx <= 1; ++dx) {
             const float2 at = clamp(uv * tile.z + tile.xy +
                                         float2(float(dx), float(dy)) * texel,
                                     lo, hi);
-            lit += (ndc.z >= atlas.sample(smp, at) - bias) ? 1.0f : 0.0f;
+            // Reversed-Z: nearer the light is a GREATER depth, so lit means "at
+            // least as near as whatever was recorded".
+            lit += (depth >= atlas.sample(smp, at) - bias) ? 1.0f : 0.0f;
         }
     return lit * (1.0f / 9.0f);
+}
+
+// A spot's lookup: one tile, through its own projection.
+//
+// Perspective, unlike the directional light's, so the divide by w is real work
+// rather than a formality — a spot's rays diverge and depth is not linear in
+// clip space.
+static inline float SpotShadow(float4 clip, float4 place, depth2d<float> atlas,
+                               sampler smp)
+{
+    if (clip.w <= 0.0f) return 1.0f;   // behind the lamp
+    const float3 ndc = clip.xyz / clip.w;
+    if (ndc.z <= 0.0f) return 1.0f;    // past the far plane
+    float2 uv = ndc.xy * 0.5f + 0.5f;
+    uv.y = 1.0f - uv.y;
+    // The bias scales with depth: a perspective map's precision falls off with
+    // distance in a way an orthographic one's does not, so a constant is either
+    // useless near the lamp or lets the far end of the cone shadow itself.
+    const float bias = 2.5e-4f + 4.0e-3f * ndc.z;
+    return SampleTile(atlas, smp, uv, AtlasTile(place.x, place.y), ndc.z, bias);
+}
+
+// A point light's lookup: SIX tiles, and the direction chooses which.
+//
+// No matrix. The six faces are the axis directions with ninety-degree frusta,
+// so the face is whichever component of the direction is largest and the uv is
+// the other two divided by it — which is exactly what a cube map lookup does in
+// hardware. Storing six matrices per light would work and would cost 384 bytes
+// each; this costs a compare and a divide.
+static inline float PointShadow(float3 to_frag, float4 place,
+                                depth2d<float> atlas, sampler smp)
+{
+    const float3 a = abs(to_frag);
+    const float major = max(max(a.x, a.y), a.z);
+    if (major <= 1e-5f) return 1.0f;
+
+    // Face order +X -X +Y -Y +Z -Z, and the `up` vectors below must match the
+    // ones Light::CubeFaceViewProj rendered with — disagree and the lookup
+    // samples a rotated copy of the right face, which reads as a shadow that
+    // slides as the light turns.
+    int face;
+    float2 st;
+    if (a.x >= a.y && a.x >= a.z) {
+        face = to_frag.x > 0.0f ? 0 : 1;
+        st = to_frag.x > 0.0f ? float2(-to_frag.z, -to_frag.y)
+                              : float2(to_frag.z, -to_frag.y);
+    } else if (a.y >= a.z) {
+        face = to_frag.y > 0.0f ? 2 : 3;
+        st = to_frag.y > 0.0f ? float2(to_frag.x, to_frag.z)
+                              : float2(to_frag.x, -to_frag.z);
+    } else {
+        face = to_frag.z > 0.0f ? 4 : 5;
+        st = to_frag.z > 0.0f ? float2(to_frag.x, -to_frag.y)
+                              : float2(-to_frag.x, -to_frag.y);
+    }
+    float2 uv = st / major * 0.5f + 0.5f;
+    uv.y = 1.0f - uv.y;
+
+    // Reversed-Z with an infinite far plane: z = near / distance along the
+    // face's forward axis, which for the chosen face is exactly `major`.
+    const float depth = place.z / major;
+    const float bias = 3.0e-4f + 6.0e-3f * depth;
+    return SampleTile(atlas, smp, uv, AtlasTile(place.x + float(face), place.y),
+                      depth, bias);
 }
 
 // Inverse-square falloff, windowed so it actually reaches zero at `range`.
@@ -318,7 +372,11 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
         const float ndotl = saturate(dot(N, L));
         if (attenuation * ndotl <= 0.0f) continue;
 
-        if (lt.shadow.w > 0.5f) {
+        if (lt.shadow.w > 1.5f) {
+            attenuation *= PointShadow(in.worldPos - lt.position.xyz, lt.shadow,
+                                       shadowAtlas, smp);
+            if (attenuation <= 0.0f) continue;
+        } else if (lt.shadow.w > 0.5f) {
             attenuation *= SpotShadow(lt.viewProj * float4(in.worldPos, 1.0f),
                                       lt.shadow, shadowAtlas, smp);
             if (attenuation <= 0.0f) continue;

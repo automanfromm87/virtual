@@ -209,6 +209,10 @@ inline eng::Scene MakeScene(const Assets& a, float time, float flicker = 1.0f) {
     cool.position = eng::Vec3{-4.6f, 1.5f, 2.6f};
     cool.color = eng::Vec3{5.0f, 16.0f, 44.0f * pulse};
     cool.range = 11.0f;
+    // A point light with shadows: six cube faces, so the plinths block it the
+    // way they block the spots.
+    cool.casts_shadow = true;
+    cool.shadow_near = 0.35f;
     s.lights.push_back(cool);
 
     eng::Light warm;
