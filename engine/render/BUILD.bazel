@@ -15,6 +15,7 @@ cc_library(
         "post.cc",
         "rendergraph.cc",
         "renderer.cc",
+        "volumetric.cc",
     ],
     hdrs = [
         "decals.h",
@@ -24,6 +25,7 @@ cc_library(
         "post.h",
         "rendergraph.h",
         "renderer.h",
+        "volumetric.h",
     ],
     copts = [
         # #embed is a C23 feature; clang accepts it in C++ mode but warns.

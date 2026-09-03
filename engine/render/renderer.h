@@ -587,6 +587,23 @@ class Renderer {
     };
     [[nodiscard]] ClusterStats ReadClusterStats();
 
+    // The light list and the cascade block this frame, for a pass outside the
+    // renderer that has to agree with it.
+    //
+    // Froxel volumetrics is the caller: a shaft of light has to line up exactly
+    // with the shadow that casts it, and reading the same cascade matrices at
+    // the same offsets is the only way to guarantee that. Filling a second copy
+    // would put the shaft's edge somewhere the geometry's shadow is not, by a
+    // fraction of a texel, on every frame.
+    //
+    // VALID ONLY after a DrawScene this frame -- both are slices of a ring
+    // buffer that DrawScene allocates. Before then they point at the previous
+    // frame's contents.
+    [[nodiscard]] rhi::BufferId LightBuffer() const;
+    [[nodiscard]] std::size_t LightOffset() const;
+    [[nodiscard]] rhi::BufferId CascadeBuffer() const;
+    [[nodiscard]] std::size_t CascadeOffset() const;
+
     // Anisotropic filtering for MATERIAL textures, 1 to 16. Rebuilds the
     // sampler, so it is a settings change and not a per-frame one.
     //

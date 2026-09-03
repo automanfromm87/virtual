@@ -1,0 +1,16 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Froxel volumetrics, checked for the three things the analytic height fog it
+# replaces cannot do: a shaft, a glow, and forward scattering.
+cc_test(
+    name = "volumetric_test",
+    srcs = ["main.cpp"],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+    ],
+)

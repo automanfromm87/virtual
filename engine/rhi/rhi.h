@@ -473,6 +473,11 @@ class Device {
     // A 2D texture a COMPUTE kernel writes into. Distinct from a render target
     // because the usage flags differ and Metal validates them: a texture
     // created for rendering cannot be bound for shader writes.
+    // A 3D texture a compute pass WRITES and a later pass samples. The froxel
+    // volume is exactly this: filled by one kernel, prefix-summed by another
+    // and read trilinearly by a fullscreen pass.
+    [[nodiscard]] TextureId CreateStorageTexture3D(int width, int height, int depth,
+                                                   Format);
     [[nodiscard]] TextureId CreateStorageTexture2D(int width, int height, Format,
                                                    int mip_levels = 1);
 

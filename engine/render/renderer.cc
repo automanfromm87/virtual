@@ -875,6 +875,15 @@ MaterialHandle Renderer::CreateMaterial(const MaterialDesc& desc,
 
 int Renderer::Samples() const { return impl_->samples; }
 
+rhi::BufferId Renderer::LightBuffer() const { return impl_->lights; }
+std::size_t Renderer::LightOffset() const {
+    return std::size_t(impl_->dev->FrameSlot()) * impl_->light_slot_bytes;
+}
+rhi::BufferId Renderer::CascadeBuffer() const { return impl_->cascades; }
+std::size_t Renderer::CascadeOffset() const {
+    return std::size_t(impl_->dev->FrameSlot()) * impl_->cascade_slot_bytes;
+}
+
 void Renderer::SetOrderIndependentTransparency(bool on) { impl_->oit_enabled = on; }
 bool Renderer::OrderIndependentTransparency() const { return impl_->oit_enabled; }
 
@@ -1585,7 +1594,21 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
     stats = RenderStats{};
     stats.submitted = int(scene.instances.size());
     draw_order.clear();
-    if (width <= 0 || height <= 0 || scene.instances.empty()) return;
+    if (width <= 0 || height <= 0) return;
+    // THE LIGHT LIST IS UPLOADED EVEN WITH NOTHING TO DRAW, and before the
+    // early return below. A pass outside the renderer reads this buffer --
+    // froxel volumetrics does -- and a scene of nothing but lights and fog is
+    // perfectly reasonable. Returning first left that buffer holding whatever
+    // the previous frame put there, which is not "no lights", it is the wrong
+    // lights.
+    {
+        const std::size_t off = std::size_t(dev->FrameSlot()) * light_slot_bytes;
+        UploadLights(scene, off,
+                     std::min(int(scene.lights.size()), int(ENG_MAX_LIGHTS)));
+        UploadCascades(scene, std::size_t(dev->FrameSlot()) * cascade_slot_bytes,
+                       float(width) / float(height));
+    }
+    if (scene.instances.empty()) return;
 
     // A pipeline built without depth cannot run in a pass that has one, and
     // vice versa — Metal rejects the draw outright. Rather than let the caller

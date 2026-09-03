@@ -707,6 +707,23 @@ TextureId Device::CreateCubemap(int size, Format format, int mip_levels) {
     return TextureId{impl_->AllocTextureSlot(t)};
 }
 
+TextureId Device::CreateStorageTexture3D(int width, int height, int depth,
+                                         Format format) {
+    if (width <= 0 || height <= 0 || depth <= 0) return {};
+    MTLTextureDescriptor* td = [[MTLTextureDescriptor alloc] init];
+    td.textureType = MTLTextureType3D;
+    td.pixelFormat = ToMTL(format);
+    td.width = NSUInteger(width);
+    td.height = NSUInteger(height);
+    td.depth = NSUInteger(depth);
+    td.mipmapLevelCount = 1;
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> t = [impl_->dev newTextureWithDescriptor:td];
+    if (!t) return {};
+    return TextureId{impl_->AllocTextureSlot(t)};
+}
+
 TextureId Device::CreateStorageTexture2D(int width, int height, Format format,
                                          int mip_levels) {
     if (width <= 0 || height <= 0) return {};

@@ -191,6 +191,44 @@ struct GpuClusters {
     ENG_VEC4 slope;
 };
 
+// FROXEL VOLUMETRICS. The grid's placement and the medium's properties, bound
+// once per pass.
+//
+// 160 x 90 x 64 froxels is 921600 of them -- the same count as a 1280x720
+// screen has pixels, but each one is doing a shadow lookup ONCE instead of once
+// per step of a per-pixel ray march, and the trilinear sample in the apply pass
+// filters the result for free.
+#define ENG_FROXEL_X 160
+#define ENG_FROXEL_Y 90
+#define ENG_FROXEL_Z 64
+
+struct GpuVolumetrics {
+    // xyz = froxel counts, w unused.
+    ENG_VEC4 grid;
+    // x near, y far, z log(far/near) precomputed, w this frame's slice jitter
+    // in 0..1.
+    ENG_VEC4 range;
+    // rgb = scattering coefficient per metre, a = extinction per metre.
+    //
+    // SEPARATE, not one coefficient. A medium that scatters as much as it
+    // absorbs is a very particular medium; smoke absorbs far more than it
+    // scatters and clean air the reverse, and tying them together makes dense
+    // fog necessarily bright.
+    ENG_VEC4 scatter;
+    // rgb = ambient radiance in the medium, a unused. What stands in for light
+    // that has already bounced -- without it the inside of a shadow is
+    // perfectly black fog, which no real medium is.
+    ENG_VEC4 ambient;
+    // x = constant density per metre, y = the exponential term's density at
+    // the reference height, z = that reference height in world Y, w = the
+    // falloff rate per metre.
+    ENG_VEC4 medium;
+    // x = the Henyey-Greenstein anisotropy g. Above zero throws light forward,
+    // which is why a shaft is bright looking toward the lamp and faint looking
+    // away. yzw spare.
+    ENG_VEC4 medium2;
+};
+
 // Skinning attributes, in their OWN buffer rather than inside VertexIn. A
 // static mesh vastly outnumbers a skinned one in most scenes, and adding this
 // to every vertex would cost 32 bytes each for four weights that are all zero.

@@ -16,6 +16,7 @@ cc_library(
         "composite.metal",
         "cluster.metal",
         "oit.metal",
+        "volumetric.metal",
         "cull.metal",
         "decal.metal",
         "deferred.metal",
