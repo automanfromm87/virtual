@@ -21,6 +21,8 @@
 #include "engine/geometry/mesh.h"
 #include "engine/physics/character.h"
 #include "engine/physics/physics.h"
+#include "engine/audio/system.h"
+#include "engine/platform/audio_file.h"
 #include "engine/platform/font.h"
 #include "engine/render/rendergraph.h"
 #include "engine/text/ui.h"
@@ -55,6 +57,59 @@ int main() {
     auto ui = eng::ui::Canvas::Create(app->Gpu(), font, config.color,
                                       error, 1);
     if (!ui) return Fail(error);
+
+    // --- audio ---------------------------------------------------------------
+    //
+    // Optional, deliberately: a machine with no output device, or a missing
+    // music file, should cost the sound and not the game.
+    auto audio = eng::audio::AudioSystem::Create(error);
+    if (!audio) std::fprintf(stderr, "no audio: %s\n", error.c_str());
+
+    eng::audio::Clip music;
+    if (audio) {
+        std::string e;
+        music = eng::platform::DecodeAudioFile(
+            "music.flac", e);
+        if (!music.Valid()) std::fprintf(stderr, "no music: %s\n", e.c_str());
+    }
+
+    // Synthesised rather than loaded, so the demo needs no asset it did not
+    // ship with. A coin is a two-note arpeggio and a footstep is filtered
+    // noise -- both are a few lines and neither needs an artist.
+    const int rate = audio ? audio->SampleRate() : 48000;
+    eng::audio::Clip coin_sfx, step_sfx;
+    {
+        coin_sfx.rate = rate;
+        coin_sfx.channels = 1;
+        const int n = rate / 5;
+        coin_sfx.samples.resize(std::size_t(n));
+        for (int i = 0; i < n; ++i) {
+            const float t = float(i) / float(rate);
+            // Up a fifth part way through, which is what makes it read as a
+            // pickup rather than a beep.
+            const float hz = t < 0.06f ? 880.0f : 1318.5f;
+            const float env = std::min(t * 90.0f, 1.0f) * std::exp(-t * 9.0f);
+            coin_sfx.samples[std::size_t(i)] =
+                0.5f * env * std::sin(2.0f * 3.14159265f * hz * t);
+        }
+
+        step_sfx.rate = rate;
+        step_sfx.channels = 1;
+        const int m = rate / 12;
+        step_sfx.samples.resize(std::size_t(m));
+        std::uint32_t seed = 12345;
+        float low = 0.0f;
+        for (int i = 0; i < m; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            const float white = float(seed >> 8) / 8388608.0f - 1.0f;
+            // One-pole low pass: unfiltered noise is a hiss, and a footstep is
+            // a thud.
+            low += (white - low) * 0.12f;
+            const float t = float(i) / float(rate);
+            step_sfx.samples[std::size_t(i)] =
+                0.7f * low * std::exp(-t * 34.0f);
+        }
+    }
 
     const eng::MeshHandle cube = app->Draw().UploadMesh(
         eng::MakeBox(eng::Vec3{0.5f, 0.5f, 0.5f}, eng::Vec4{1, 1, 1, 1}));
@@ -162,6 +217,15 @@ int main() {
     std::printf("left click the ground to walk there   w a s d also works\n"
                 "scroll: zoom   r: reset   esc: quit\n");
 
+    if (audio && music.Valid()) {
+        eng::audio::PlayDesc bg;
+        bg.clip = &music;
+        bg.gain = 0.9f;
+        bg.loop = true;
+        (void)audio->Play(bg);
+    }
+    float step_timer = 0.0f;
+
     eng::RenderGraph graph;
     while (app->Running()) {
         if (!app->BeginFrame()) continue;
@@ -230,6 +294,40 @@ int main() {
         }
         player.Move(world, wish * f.dt + eng::Vec3{0.0f, -9.0f * f.dt, 0.0f});
 
+        // THE LISTENER rides the player, not the camera. In an isometric view
+        // the camera is forty metres back and fixed; putting the listener there
+        // would make everything equally distant and everything centred, which
+        // is every spatial cue there is.
+        //
+        // Its forward is the camera's, though, because left and right on screen
+        // must be left and right in the ears -- the player has no facing of
+        // their own to use.
+        if (audio) {
+            audio->SetListener(player.Feet() + eng::Vec3{0, 0.8f, 0}, kViewDir,
+                               eng::Vec3{0, 1, 0});
+        }
+
+        // FOOTSTEPS, paced by distance travelled rather than by time. Timed
+        // steps keep playing while the character is pressed against a wall and
+        // going nowhere.
+        if (audio && player.Grounded()) {
+            step_timer += Length(eng::Vec3{player.LastMotion().x, 0.0f,
+                                           player.LastMotion().z});
+            if (step_timer > 0.9f) {
+                step_timer = 0.0f;
+                eng::audio::PlayDesc d;
+                d.clip = &step_sfx;
+                d.spatial = true;
+                d.position = player.Feet();
+                d.gain = 0.55f;
+                // A little detune each time, because a footstep sample played
+                // identically twice in a row stops sounding like a footstep and
+                // starts sounding like a sample.
+                d.pitch = 0.9f + 0.2f * std::fabs(std::sin(f.time * 12.3f));
+                (void)audio->Play(d);
+            }
+        }
+
         scene.instances[player_instance].model =
             eng::Mat4::Translation(player.Feet() + eng::Vec3{0, 0.5f, 0}) *
             eng::Mat4::Scale(1.0f);
@@ -244,6 +342,18 @@ int main() {
                        eng::Vec3{player.Feet().x, 0, player.Feet().z}) < 0.8f) {
                 p.collected = true;
                 ++score;
+                if (audio) {
+                    eng::audio::PlayDesc d;
+                    d.clip = &coin_sfx;
+                    d.spatial = true;
+                    d.position = eng::Vec3{pos.x, pos.y, pos.z};
+                    d.min_distance = 2.0f;
+                    d.gain = 0.8f;
+                    // Rising with the count, so the eighth coin is a payoff
+                    // rather than the same sound an eighth time.
+                    d.pitch = 1.0f + float(score) * 0.06f;
+                    (void)audio->Play(d);
+                }
             }
             const float pulse = 1.0f + 0.35f * std::sin(f.time * 4.0f);
             inst.tint = eng::Vec4{p.tint.x * pulse, p.tint.y * pulse,
@@ -261,8 +371,11 @@ int main() {
         ui->Text(pad + 14.0f, pad + 10.0f, line, eng::Vec4{1, 0.92f, 0.55f, 1});
         std::snprintf(line, sizeof(line), "%.0f fps", app->Time().Fps());
         ui->Text(pad + 14.0f, pad + 38.0f, line, eng::Vec4{0.75f, 0.82f, 0.9f, 1});
-        std::snprintf(line, sizeof(line), "%s", player.Grounded() ? "grounded"
-                                                                  : "falling");
+        if (audio)
+            std::snprintf(line, sizeof(line), "%d voices   peak %.2f",
+                          audio->ActiveVoices(), audio->LastPeak());
+        else
+            std::snprintf(line, sizeof(line), "no audio device");
         ui->Text(pad + 14.0f, pad + 64.0f, line, eng::Vec4{0.6f, 0.7f, 0.8f, 1});
 
         // A marker under the cursor, drawn in SCREEN space over the world.

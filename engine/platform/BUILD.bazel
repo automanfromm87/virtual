@@ -11,10 +11,14 @@ package(default_visibility = ["//visibility:public"])
 objc_library(
     name = "platform",
     srcs = [
+        "audio_file.mm",
+        "audio_out.mm",
         "font.mm",
         "window.mm",
     ],
     hdrs = [
+        "audio_file.h",
+        "audio_out.h",
         "font.h",
         "window.h",
     ],
@@ -31,6 +35,11 @@ objc_library(
         "CoreText",
         "-framework",
         "CoreGraphics",
+        # AudioToolbox is both the speaker and the decoder for every
+        # compressed format the OS knows.
+        "-framework",
+        "AudioToolbox",
     ],
+    deps = ["//engine/audio"],
     target_compatible_with = ["@platforms//os:macos"],
 )

@@ -1,0 +1,52 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Pure C++20. No CoreAudio, no hardware -- the mixing arithmetic is the part
+# that can be wrong, and it is all testable without a speaker.
+cc_library(
+    name = "audio",
+    srcs = [
+        "mixer.cc",
+        "wav.cc",
+    ],
+    hdrs = [
+        "clip.h",
+        "mixer.h",
+        "wav.h",
+    ],
+    deps = ["//engine/core"],
+)
+
+cc_test(
+    name = "wav_test",
+    srcs = ["wav_test.cc"],
+    deps = [":audio"],
+)
+
+cc_test(
+    name = "mixer_test",
+    srcs = ["mixer_test.cc"],
+    deps = [":audio"],
+)
+
+# The front end, which needs the speaker and so cannot be pure the way :audio
+# is. Everything testable lives next door on purpose.
+cc_library(
+    name = "system",
+    srcs = ["system.cc"],
+    hdrs = [
+        "queue.h",
+        "system.h",
+    ],
+    deps = [
+        ":audio",
+        "//engine/platform",
+    ],
+)
+
+cc_test(
+    name = "queue_test",
+    srcs = ["queue_test.cc"],
+    deps = [":system"],
+)
