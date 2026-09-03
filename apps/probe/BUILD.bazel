@@ -1,0 +1,17 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Parallax-corrected probes and the dithered LOD crossfade. Both are checked by
+# DIFFERENCE: each has a failure mode that produces a perfectly convincing
+# picture, just not one that changes when it should.
+cc_test(
+    name = "probe_test",
+    srcs = ["main.cpp"],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+    ],
+)

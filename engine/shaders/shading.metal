@@ -301,6 +301,35 @@ static inline float3 SampleIrradianceVolume(float3 worldPos, float3 N,
     return max(float3(dot(cr, w), dot(cg, w), dot(cb, w)) * inv_pi, 0.0f);
 }
 
+// Re-aims a reflection vector so the cubemap is read as a picture of a BOX
+// rather than of the sky.
+//
+// The ray is intersected with the probe's bounding box and the sample direction
+// becomes "from where the cube was captured, toward the point the ray actually
+// hits". Two surfaces reflecting the same direction from different places then
+// see different parts of the wall, which is the whole difference between a
+// mirror in a room and a mirror with a room painted on it.
+static inline float3 BoxProject(float3 R, float3 worldPos,
+                                constant FrameUniforms& u)
+{
+    if (u.probeBoxMin.w < 0.5f) return R;
+    // Distance to each of the six planes. A component of R that is zero gives
+    // +/-infinity here, and that is the correct answer -- a ray parallel to a
+    // pair of planes never reaches them -- so the min below drops that axis on
+    // its own. The guard is only for R exactly zero in a component AND the
+    // surface exactly on the plane, where 0/0 is NaN and would poison the min.
+    const float3 safe = select(R, float3(1e-6f), abs(R) < 1e-6f);
+    const float3 to_max = (u.probeBoxMax.xyz - worldPos) / safe;
+    const float3 to_min = (u.probeBoxMin.xyz - worldPos) / safe;
+    const float3 furthest = max(to_max, to_min);
+    const float dist = min(min(furthest.x, furthest.y), furthest.z);
+    // BEHIND the surface means the surface is outside the box; the correction
+    // is meaningless there and the raw direction is the better answer.
+    if (!(dist > 0.0f)) return R;
+    const float3 hit = worldPos + R * dist;
+    return hit - u.probePosition.xyz;
+}
+
 static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
                                   float roughness, float metallic,
                                   float4 lightClip,
@@ -395,8 +424,29 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
             shadow = SampleTile(shadowMap, shadowSmp, uv, tile, ndc.z, 1.2e-3f);
         }
     }
+    // ENERGY COMPENSATION on the direct lobe too, from the same table.
+    //
+    // A single-scattering GGX loses the same 40% at roughness 1 whether the
+    // light comes from an environment map or from the sun, and correcting only
+    // the ambient half makes a rough metal change brightness depending on which
+    // one is lighting it. 1 + F0 (1/Ess - 1) is the Kulla-Conty factor: scale
+    // the lobe up by exactly what the microsurface's later bounces would have
+    // added.
+    //
+    // Zero when no BRDF table is bound, because there is nothing to read Ess
+    // from -- the direct lobe is then uncompensated, which is what it was
+    // before and is at least consistent with the ambient in the same frame.
+    float3 energy_compensation = float3(1.0f);
+    if (!is_null_texture(brdfLut)) {
+        const float2 dfg =
+            brdfLut.sample(envSmp, float2(saturate(dot(N, V)), saturate(roughness))).xy;
+        const float Ess = max(dfg.x + dfg.y, 1e-3f);
+        const float3 f0d = mix(float3(0.04f), albedo, metallic);
+        energy_compensation = float3(1.0f) + f0d * (1.0f / Ess - 1.0f);
+    }
     float3 direct = Brdf(N, V, Lsun, albedo, roughness, metallic) *
-                    u.lightColor.rgb * saturate(dot(N, Lsun)) * shadow;
+                    u.lightColor.rgb * saturate(dot(N, Lsun)) * shadow *
+                    energy_compensation;
 
     // --- local lights --------------------------------------------------------
     //
@@ -530,14 +580,36 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
         // and nothing about the picture says which end is wrong.
         const float mips = max(u.lighting.y, 1.0f);
         const float lod = saturate(roughness) * (mips - 1.0f);
-        const float3 prefiltered = specularMap.sample(envSmp, R, level(lod)).rgb;
+        const float3 prefiltered =
+            specularMap.sample(envSmp, BoxProject(R, worldPos, u), level(lod)).rgb;
         const float2 ab = brdfLut.sample(envSmp, float2(NdotVamb, saturate(roughness))).xy;
 
-        // The energy NOT taken by the specular lobe is what is left for the
-        // diffuse one, and a metal has no diffuse lobe at all.
-        const float3 kD = (float3(1.0f) - Famb) * (1.0f - metallic);
-        ambient = kD * albedo * irradiance + prefiltered * (f0amb * ab.x + ab.y);
-        ambient_specular = prefiltered * (f0amb * ab.x + ab.y);
+        // MULTIPLE SCATTERING, the Fdez-Aguera formulation.
+        //
+        // The split sum integrates light that bounces off the microsurface
+        // ONCE. At low roughness that is nearly all of it; at roughness 1 a
+        // GGX surface loses about 40% of its energy to bounces the model never
+        // puts back, so a rough metal comes out visibly too dark. It reads as a
+        // material choice rather than as a bug, which is why it survives.
+        //
+        // The correction rides on numbers already in hand. ab.x + ab.y is the
+        // surface's directional albedo -- the fraction of energy the single
+        // bounce DID keep -- so 1 minus it is what went missing, and a
+        // geometric series in the average Fresnel puts it back as an extra,
+        // rougher lobe. The 1/21 is the analytic average of Schlick's Fresnel
+        // over the hemisphere.
+        const float3 FssEss = f0amb * ab.x + ab.y;
+        const float Ems = 1.0f - (ab.x + ab.y);
+        const float3 Favg = f0amb + (float3(1.0f) - f0amb) / 21.0f;
+        const float3 Fms = FssEss * Favg / (float3(1.0f) - Ems * Favg);
+
+        // The energy NOT taken by the specular lobe, single and multiple
+        // together, is what is left for the diffuse one -- and a metal has no
+        // diffuse lobe at all. Using Famb here instead double-counts, because
+        // Famb is the Fresnel at one angle and FssEss is the integral.
+        const float3 kD = (float3(1.0f) - FssEss - Fms * Ems) * (1.0f - metallic);
+        ambient_specular = FssEss * prefiltered + Fms * Ems * irradiance;
+        ambient = kD * albedo * irradiance + ambient_specular;
     }
 
     // LINEAR HDR out, un-tone-mapped and un-gamma-corrected. The scene target

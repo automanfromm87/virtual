@@ -86,6 +86,17 @@ struct FrameUniforms {
     // texture coordinate: a 3D texture samples in 0..1, and the half-texel
     // inset is what stops the outermost probes being blended with nothing.
     ENG_VEC4 giCounts;
+    // PARALLAX CORRECTION for the reflection probe. xyz = the box's minimum
+    // corner, w = 1 when correction is on.
+    //
+    // A cubemap is a picture of the world from ONE point, and sampling it by
+    // direction alone says every reflected thing is infinitely far away. That
+    // is right for a sky and wrong for a room: a mirror ball moved across a
+    // room reflects exactly the same walls in exactly the same places, so it
+    // reads as a ball with a sky painted on it rather than as a ball in a room.
+    ENG_VEC4 probeBoxMin;
+    ENG_VEC4 probeBoxMax;   // xyz, w unused
+    ENG_VEC4 probePosition; // where the cube was captured from
 };
 
 // A local light. Sixteen bytes times four, so the array packs with no padding

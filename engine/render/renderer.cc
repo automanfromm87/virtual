@@ -75,7 +75,7 @@ constexpr char kClusterSrc[] = {
     , 0};
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
-static_assert(sizeof(FrameUniforms) == 496, "FrameUniforms layout drifted");
+static_assert(sizeof(FrameUniforms) == 544, "FrameUniforms layout drifted");
 static_assert(sizeof(GpuClusters) == 64, "GpuClusters layout drifted");
 static_assert(sizeof(GpuLight) == 144, "GpuLight layout drifted");
 static_assert(sizeof(GpuCascades) == 288, "GpuCascades layout drifted");
@@ -1674,8 +1674,8 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
         u.viewDir = Vec4{vd.x, vd.y, vd.z, 0.0f};
     }
         u.invViewProj = inv_view_proj;
-        u.lighting = Vec4{float(light_count),
-                          float(env.specular_mips), 0.0f, 0.0f};
+        u.lighting = Vec4{float(light_count), float(env.specular_mips),
+                          std::clamp(inst.lod_fade, -1.0f, 1.0f), 0.0f};
         u.ambientSky = Vec4{scene.ambientSky.x, scene.ambientSky.y,
                             scene.ambientSky.z, 0.0f};
         u.ambientGround = Vec4{scene.ambientGround.x, scene.ambientGround.y,
@@ -1685,6 +1685,11 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
         u.giOrigin = gi_origin;
         u.giSpacing = gi_spacing;
         u.giCounts = gi_counts;
+        u.probeBoxMin = Vec4{env.box_min.x, env.box_min.y, env.box_min.z,
+                             env.parallax ? 1.0f : 0.0f};
+        u.probeBoxMax = Vec4{env.box_max.x, env.box_max.y, env.box_max.z, 0.0f};
+        u.probePosition = Vec4{env.capture_position.x, env.capture_position.y,
+                               env.capture_position.z, 0.0f};
 
         // Sub-allocate out of this frame's slot instead of a per-draw setBytes.
         std::memcpy(uniform_map + offset, &u, sizeof(u));
@@ -1922,8 +1927,12 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
         const Vec3 vd = Normalize(scene.camera.target - scene.camera.eye);
         u.viewDir = Vec4{vd.x, vd.y, vd.z, 0.0f};
     }
-    u.lighting = Vec4{float(light_count),
-                      float(impl_->env.specular_mips), 0.0f, 0.0f};
+    // lighting.z is the LOD FADE, and 1 means "draw every pixel". Leaving it at
+    // zero makes the dither discard the whole surface -- which is what happened
+    // here the moment the fade was added, because a field that used to be an
+    // unused zero now means something.
+    u.lighting = Vec4{float(light_count), float(impl_->env.specular_mips), 1.0f,
+                      0.0f};
     u.ambientSky = Vec4{scene.ambientSky.x, scene.ambientSky.y,
                         scene.ambientSky.z, 0.0f};
     u.ambientGround = Vec4{scene.ambientGround.x, scene.ambientGround.y,
@@ -1934,6 +1943,11 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
     u.giOrigin = impl_->gi_origin;
     u.giSpacing = impl_->gi_spacing;
     u.giCounts = impl_->gi_counts;
+    u.probeBoxMin = Vec4{impl_->env.box_min.x, impl_->env.box_min.y, impl_->env.box_min.z,
+                         impl_->env.parallax ? 1.0f : 0.0f};
+    u.probeBoxMax = Vec4{impl_->env.box_max.x, impl_->env.box_max.y, impl_->env.box_max.z, 0.0f};
+    u.probePosition = Vec4{impl_->env.capture_position.x, impl_->env.capture_position.y,
+                           impl_->env.capture_position.z, 0.0f};
 
     const std::size_t offset = impl_->AllocUniform();
     if (offset == Impl::kNoSpace) return;
@@ -2238,8 +2252,11 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
         const Vec3 vd = Normalize(scene.camera.target - scene.camera.eye);
         u.viewDir = Vec4{vd.x, vd.y, vd.z, 0.0f};
     }
-        u.lighting = Vec4{float(light_count),
-                          float(impl_->env.specular_mips), 0.0f, 0.0f};
+        // 1, not 0: lighting.z is the LOD fade and zero discards everything.
+        // The instanced path has no per-instance fade -- GPU LOD selection is a
+        // different mechanism -- so it always draws in full.
+        u.lighting = Vec4{float(light_count), float(impl_->env.specular_mips),
+                          1.0f, 0.0f};
         u.ambientSky = Vec4{scene.ambientSky.x, scene.ambientSky.y,
                             scene.ambientSky.z, 0.0f};
         u.ambientGround = Vec4{scene.ambientGround.x, scene.ambientGround.y,
@@ -2249,6 +2266,14 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
         u.giOrigin = impl_->gi_origin;
         u.giSpacing = impl_->gi_spacing;
         u.giCounts = impl_->gi_counts;
+        u.probeBoxMin =
+            Vec4{impl_->env.box_min.x, impl_->env.box_min.y, impl_->env.box_min.z,
+                 impl_->env.parallax ? 1.0f : 0.0f};
+        u.probeBoxMax = Vec4{impl_->env.box_max.x, impl_->env.box_max.y,
+                             impl_->env.box_max.z, 0.0f};
+        u.probePosition =
+            Vec4{impl_->env.capture_position.x, impl_->env.capture_position.y,
+                 impl_->env.capture_position.z, 0.0f};
         std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
 
         enc.SetPipeline(mat.instanced_pipeline);

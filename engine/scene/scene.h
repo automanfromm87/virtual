@@ -136,6 +136,32 @@ struct Instance {
     MaterialHandle material = kMaterialLit;
     Mat4 model = Mat4::Identity();
     Vec4 tint = Vec4{1.0f, 1.0f, 1.0f, 1.0f};
+    // LOD CROSSFADE. The magnitude is this instance's share of the pixels, from
+    // 0 to 1; the SIGN selects which half of the dither pattern it takes.
+    //
+    // A crossfade is two draws: the incoming level at +f and the outgoing one
+    // at -(1 - f). Both numbers read as "my share", and the opposite signs are
+    // what makes the two patterns exact complements -- every pixel covered once,
+    // no holes and no doubling.
+    //
+    // The sign is not decoration. Giving both levels a positive fade makes the
+    // patterns NESTED rather than complementary: the same "keep where fade is
+    // above this pixel's threshold" test means the larger fade keeps a superset
+    // of the smaller one, so the overlap is drawn twice and the rest not at
+    // all. Measured on the first attempt at this: 3331 pixels doubled and 3324
+    // holes out of 8880.
+    //
+    // What it is for: swapping one level of detail for another is a POP, and
+    // the eye is extremely good at catching a silhouette that changes in one
+    // frame. Drawing both levels for a moment with complementary fades -- one
+    // at f, the other at 1-f -- turns the pop into a dissolve, and because the
+    // two dither patterns are complements every pixel is covered exactly once.
+    //
+    // A DITHER and not alpha blending, which would need the two levels sorted
+    // against each other and against everything else, would not write depth,
+    // and would double-shade the overlap. Discarding is order-independent and
+    // costs nothing but the discard.
+    float lod_fade = 1.0f;
     // Offset into Scene::joint_matrices, or -1 for an unskinned instance. The
     // mesh knows how many joints to read.
     //

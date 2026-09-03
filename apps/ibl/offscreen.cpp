@@ -501,6 +501,51 @@ int main() {
                 colours_ok = false;
         }
         Check(colours_ok, "and reflects the environment's colour, not another one");
+
+        // THE WHITE FURNACE, ON THE SHADED SURFACE.
+        //
+        // The check at the top of this file puts a uniform environment of 1
+        // through the BAKE and requires 1 back. This puts one through the whole
+        // SHADER and requires the same: a mirror-white metal in a uniform
+        // environment of any radiance must reflect exactly that radiance,
+        // whatever its roughness. Nothing is absorbed, so nothing may go
+        // missing.
+        //
+        // Single-scattering GGX fails this by construction. It models one
+        // bounce off the microsurface, and at roughness 1 about 40% of the
+        // energy goes into bounces it never puts back -- so the sphere gets
+        // steadily darker as the roughness rises. It reads as a material
+        // choice, which is exactly why it survives in renderers for years.
+        std::printf("\n    a white furnace, through the shader\n");
+        if (!bake_flat(1.0f, 1.0f, 1.0f)) { std::fprintf(stderr, "FAIL bake\n"); return 1; }
+        float at_roughness[5] = {};
+        const float kRough[5] = {0.05f, 0.3f, 0.55f, 0.8f, 1.0f};
+        for (int k = 0; k < 5; ++k) {
+            eng::MaterialDesc rd;
+            rd.shading = eng::Shading::Lit;
+            rd.roughness = kRough[k];
+            rd.metallic = 1.0f;
+            rd.base_color = eng::Vec4{1.0f, 1.0f, 1.0f, 1.0f};
+            scene.instances[0].material = r->CreateMaterial(rd, error);
+            if (!render(true)) return 1;
+            at_roughness[k] = patch(1);
+            std::printf("      roughness %.2f -> %.1f\n", double(kRough[k]),
+                        double(at_roughness[k]));
+        }
+        float lo = at_roughness[0], hi = at_roughness[0];
+        for (int k = 1; k < 5; ++k) {
+            lo = std::min(lo, at_roughness[k]);
+            hi = std::max(hi, at_roughness[k]);
+        }
+        std::printf("      spread across roughness: %.1f%% of the mean\n",
+                    100.0 * double(hi - lo) / double((hi + lo) * 0.5f));
+        Check(lo > 100.0f, "a white metal in a white furnace is bright at every roughness");
+        // 8% rather than 0: the prefiltered environment is a finite cube with
+        // finite samples, and the tone map is a curve, so the readings cannot
+        // be identical. Without the multiple-scattering term the spread is
+        // several times this.
+        Check((hi - lo) < (hi + lo) * 0.5f * 0.08f,
+              "and it does not lose energy as the roughness rises");
     }
 
     {

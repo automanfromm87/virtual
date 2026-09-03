@@ -68,6 +68,17 @@ struct SkyConfig {
 // be evaluated, and a caller that binds three of the four gets a picture that
 // is wrong rather than one that fails.
 struct EnvironmentBindings {
+    // PARALLAX BOX. When `parallax` is set, a reflection is re-aimed at where
+    // the ray actually meets this box instead of being read as a direction to
+    // infinity. Set it to the room the probe was captured in.
+    //
+    // Off by default, because it is wrong for the case the probe was built for
+    // first: an outdoor sky genuinely IS at infinity, and box-projecting it
+    // would bend the horizon as the camera moved.
+    bool parallax = false;
+    Vec3 box_min{0.0f, 0.0f, 0.0f};
+    Vec3 box_max{0.0f, 0.0f, 0.0f};
+    Vec3 capture_position{0.0f, 0.0f, 0.0f};
     rhi::TextureId irradiance;   // cube, diffuse
     rhi::TextureId specular;     // cube, prefiltered mip chain
     rhi::TextureId brdf_lut;     // 2D, RG

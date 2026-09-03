@@ -189,6 +189,37 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
                        texture3d<float> giB [[texture(13)]],
                        sampler          giSmp [[sampler(3)]])
 {
+    // LOD CROSSFADE. A 4x4 ordered dither: the fragment survives when the
+    // fade exceeds this pixel's threshold.
+    //
+    // Ordered rather than random. A hash of the pixel coordinate gives a
+    // pattern that is different every frame if anything about the hash input
+    // moves, and the dissolve then boils; an ordered matrix is fixed to the
+    // screen, so a half-faded object looks like a static screen door and the
+    // two halves of a crossfade are exact complements pixel for pixel.
+    if (u.lighting.z < 0.999f) {
+        // Bayer 4x4, scaled to (0.5/16 .. 15.5/16) so that fade 0 discards
+        // everything and fade 1 keeps everything -- a matrix running 0..15/16
+        // would keep one pixel in sixteen at fade 0.
+        constexpr float kBayer[16] = {
+            0.5f / 16, 8.5f / 16, 2.5f / 16, 10.5f / 16,
+            12.5f / 16, 4.5f / 16, 14.5f / 16, 6.5f / 16,
+            3.5f / 16, 11.5f / 16, 1.5f / 16, 9.5f / 16,
+            15.5f / 16, 7.5f / 16, 13.5f / 16, 5.5f / 16};
+        const uint bx = uint(in.position.x) & 3u;
+        const uint by = uint(in.position.y) & 3u;
+        const float t = kBayer[by * 4u + bx];
+        const float f = u.lighting.z;
+        const float share = abs(f);
+        // POSITIVE takes the low thresholds, NEGATIVE takes the high ones, and
+        // the two are exact complements: "share >= t" and "t > 1 - share" cover
+        // every pixel between them exactly once when the shares sum to one.
+        // Two positive fades would instead be nested, drawing the overlap twice
+        // and leaving the rest bare.
+        const bool keep = f >= 0.0f ? (share >= t) : (t > 1.0f - share);
+        if (!keep) discard_fragment();
+    }
+
     // SECTION CUT before anything else: no point shading a fragment that is
     // about to be thrown away. This is what lets you look inside a building
     // without deleting its roof from the scene.
