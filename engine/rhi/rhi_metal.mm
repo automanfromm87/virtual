@@ -1238,6 +1238,14 @@ void Encoder::Draw(std::size_t vertex_count) {
                             vertexCount:vertex_count];
 }
 
+void Encoder::DrawInstanced(std::size_t vertex_count, std::size_t instance_count) {
+    if (!device_ || vertex_count == 0 || instance_count == 0) return;
+    [device_->impl_->enc drawPrimitives:MTLPrimitiveTypeTriangle
+                           vertexStart:0
+                           vertexCount:vertex_count
+                         instanceCount:instance_count];
+}
+
 void Encoder::DrawIndexedU16(BufferId indices, std::size_t index_count) {
     [device_->impl_->enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                                     indexCount:index_count

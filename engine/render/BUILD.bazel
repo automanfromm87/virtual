@@ -8,6 +8,7 @@ package(default_visibility = ["//visibility:public"])
 cc_library(
     name = "render",
     srcs = [
+        "decals.cc",
         "fluid.cc",
         "ibl.cc",
         "particles.cc",
@@ -16,6 +17,7 @@ cc_library(
         "renderer.cc",
     ],
     hdrs = [
+        "decals.h",
         "fluid.h",
         "ibl.h",
         "particles.h",

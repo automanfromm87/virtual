@@ -1,0 +1,16 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Projected decals. Every failure mode of one looks deliberate, so the test is
+# a red decal on a white floor and the question is only where the red went.
+cc_test(
+    name = "decal_test",
+    srcs = ["offscreen.cpp"],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+    ],
+)

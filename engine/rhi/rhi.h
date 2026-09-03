@@ -216,6 +216,11 @@ class Encoder {
     void SetVertexBytes(const void* data, std::size_t bytes, int slot);
     void SetFragmentBytes(const void* data, std::size_t bytes, int slot);
     void Draw(std::size_t vertex_count);
+    // `instance_count` copies of a NON-INDEXED draw. The indexed version below
+    // is the usual one; this exists for geometry generated entirely from the
+    // vertex id, where there is no index buffer to point at -- a decal's
+    // projection box, a batch of billboards.
+    void DrawInstanced(std::size_t vertex_count, std::size_t instance_count);
     void DrawIndexedU16(BufferId indices, std::size_t index_count);
     // One draw, `instance_count` copies. The shader reads instance_id and
     // looks up whatever differs per copy; nothing else changes.
