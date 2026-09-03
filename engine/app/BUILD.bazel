@@ -1,0 +1,58 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# The frame contract: what a timestep is, and what an input means. Pure C++20
+# with no GPU and no window, deliberately — this is the part that decides how
+# the simulation advances, so it has to be testable without either.
+cc_library(
+    name = "loop",
+    srcs = [
+        "actions.cc",
+        "clock.cc",
+    ],
+    hdrs = [
+        "actions.h",
+        "clock.h",
+    ],
+)
+
+cc_test(
+    name = "loop_test",
+    srcs = ["loop_test.cc"],
+    deps = [":loop"],
+)
+
+# Screen-sized targets. Needs the RHI, so unlike :loop it cannot be tested
+# without a GPU — which is exactly why the timing and input logic is not in
+# here with it.
+cc_library(
+    name = "targets",
+    srcs = ["targets.cc"],
+    hdrs = ["targets.h"],
+    deps = ["//engine/rhi"],
+)
+
+cc_test(
+    name = "targets_test",
+    srcs = ["targets_test.cc"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [":targets"],
+)
+
+# The whole thing wired together. cc_library, not objc_library: everything
+# Apple-specific stays behind engine/rhi and engine/platform, and a Metal type
+# leaking into this layer would stop the build.
+cc_library(
+    name = "app",
+    srcs = ["app.cc"],
+    hdrs = ["app.h"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":loop",
+        ":targets",
+        "//engine/platform",
+        "//engine/render",
+        "//engine/rhi",
+    ],
+)

@@ -32,6 +32,10 @@ struct BufferId {
 struct TextureId {
     std::uint32_t v = 0;
 };
+// Comparable, because "is this the same target as the one that pass wrote"
+// is a question the render graph and its tests keep needing to ask.
+inline bool operator==(TextureId a, TextureId b) { return a.v == b.v; }
+inline bool operator!=(TextureId a, TextureId b) { return a.v != b.v; }
 struct PipelineId {
     std::uint32_t v = 0;
 };

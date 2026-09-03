@@ -24,9 +24,8 @@ cc_binary(
     target_compatible_with = ["@platforms//os:macos"],
     deps = [
         ":house_scene",
-        "//engine/platform",
+        "//engine/app",
         "//engine/render",
-        "//engine/rhi",
     ],
 )
 

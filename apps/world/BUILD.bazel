@@ -32,10 +32,9 @@ cc_binary(
     deps = [
         ":default_scene",
         ":world_scene",
+        "//engine/app",
         "//engine/asset:testdata",
-        "//engine/platform",
         "//engine/render",
-        "//engine/rhi",
     ],
 )
 
