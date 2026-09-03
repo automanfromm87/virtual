@@ -16,8 +16,13 @@
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    const std::string path =
-        argc > 1 ? argv[1] : "music.flac";
+    if (argc < 2) {
+        std::fprintf(stderr,
+                     "usage: listen <audio file>\n"
+                     "  Any format the OS decodes: flac, mp3, m4a, aac, wav.\n");
+        return 2;
+    }
+    const std::string path = argv[1];
 
     std::string error;
     // Through the OS, so FLAC, mp3, m4a and wav all work. engine/audio's own

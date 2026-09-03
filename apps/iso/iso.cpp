@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -65,12 +66,19 @@ int main() {
     auto audio = eng::audio::AudioSystem::Create(error);
     if (!audio) std::fprintf(stderr, "no audio: %s\n", error.c_str());
 
+    // Music is whatever VIRTUAL_MUSIC points at, and nothing if it points at
+    // nothing. A path baked into the source only exists on the machine it was
+    // written on, and the sound effects below are synthesised precisely so the
+    // demo needs no asset it did not ship with.
     eng::audio::Clip music;
     if (audio) {
-        std::string e;
-        music = eng::platform::DecodeAudioFile(
-            "music.flac", e);
-        if (!music.Valid()) std::fprintf(stderr, "no music: %s\n", e.c_str());
+        if (const char* track = std::getenv("VIRTUAL_MUSIC")) {
+            std::string e;
+            music = eng::platform::DecodeAudioFile(track, e);
+            if (!music.Valid()) std::fprintf(stderr, "no music: %s\n", e.c_str());
+        } else {
+            std::printf("set VIRTUAL_MUSIC to an audio file for a soundtrack\n");
+        }
     }
 
     // Synthesised rather than loaded, so the demo needs no asset it did not
