@@ -21,6 +21,7 @@ cc_library(
         "skinning.metal",
         "shadow.metal",
         "ssao.metal",
+        "fluid.metal",
         "lit.metal",
         "particles.metal",
         "triangle.metal",

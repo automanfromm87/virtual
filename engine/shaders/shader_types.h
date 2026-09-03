@@ -183,6 +183,31 @@ struct GpuParticleParams {
     ENG_VEC4 limits;
 };
 
+// One SPH particle. Density and pressure ride in the w components because they
+// are computed and consumed within a single step and never leave the GPU --
+// giving them their own buffers would double the number of bindings for data
+// with the same lifetime.
+struct GpuFluidParticle {
+    ENG_VEC4 position;  // xyz, w = density
+    ENG_VEC4 velocity;  // xyz, w = pressure
+};
+
+struct GpuFluidParams {
+    ENG_VEC4 bounds_min;  // xyz, w = smoothing radius h
+    ENG_VEC4 bounds_max;  // xyz, w = particle mass
+    ENG_VEC4 grid;        // xyz = cells per axis, w = cell size (== h)
+    // x rest density, y stiffness, z viscosity, w dt
+    ENG_VEC4 physics;
+    // x particle count, y wall restitution, z bucket capacity, w gravity (down)
+    ENG_VEC4 misc;
+    // Precomputed kernel normalisations. They involve h to the ninth power and
+    // a division by pi; computing them per particle per neighbour would be
+    // three transcendentals in the innermost loop of the whole simulation.
+    ENG_VEC4 kernels;  // x poly6, y spiky gradient, z viscosity laplacian, w unused
+    // x = artificial viscosity alpha, y = sound speed sqrt(stiffness), zw spare.
+    ENG_VEC4 artificial;
+};
+
 struct SkinIn {
     ENG_UVEC4 joints;
     ENG_VEC4 weights;

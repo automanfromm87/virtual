@@ -8,11 +8,13 @@ package(default_visibility = ["//visibility:public"])
 cc_library(
     name = "render",
     srcs = [
+        "fluid.cc",
         "particles.cc",
         "rendergraph.cc",
         "renderer.cc",
     ],
     hdrs = [
+        "fluid.h",
         "particles.h",
         "rendergraph.h",
         "renderer.h",
