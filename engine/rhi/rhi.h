@@ -556,7 +556,23 @@ class Device {
     // responsible for not reusing it. No generation counters yet.
     void DestroyTexture(TextureId);
 
-    [[nodiscard]] std::unique_ptr<Swapchain> CreateSwapchain(Format, std::string& error);
+    // `hdr` asks the window server for extended dynamic range: the layer keeps
+    // values above 1 instead of clamping them, so a highlight the tone map
+    // decided is four times reference white reaches the panel as four times
+    // reference white.
+    //
+    // It needs a half-float format to mean anything -- an 8-bit layer has
+    // nowhere to put a value above one whatever the colour space says -- so
+    // asking for it with an 8-bit format is refused rather than silently
+    // ignored.
+    [[nodiscard]] std::unique_ptr<Swapchain> CreateSwapchain(Format,
+                                                             std::string& error,
+                                                             bool hdr = false);
+    // What the display can actually do, as a multiple of reference white, or 1
+    // when there is no extended range. Read it rather than assuming: the same
+    // machine reports a different headroom depending on the display, the
+    // brightness setting and whether it is on battery.
+    [[nodiscard]] float DisplayHeadroom(const Swapchain&) const;
 
     // --- submission ----------------------------------------------------------
     // Returns a null handle when no drawable is available; skip the frame.

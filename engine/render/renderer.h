@@ -149,6 +149,22 @@ struct RenderStats {
 // saturation at one. That matters more than it sounds -- a grade whose defaults
 // change the picture makes every existing test's expected colour wrong, and
 // makes "is this the grade or the lighting" unanswerable.
+// Where the composite's output is going. The tone curve has to know: an SDR
+// frame throws its highlights away as it is written, and nothing downstream can
+// put them back.
+enum class DisplayOutput : std::uint8_t {
+    // The ACES curve clamped to 0..1 and gamma-encoded. A conventional display.
+    Sdr,
+    // Extended-range linear, which is what scRGB and Apple's EDR are: no clamp
+    // and no encoding, 1.0 IS reference white, and a highlight at 6.0 stays at
+    // six times reference white all the way to the panel.
+    ExtendedLinear,
+    // Rec.2100 PQ -- SMPTE ST 2084 -- which is what an HDR10 signal carries.
+    // Its input is ABSOLUTE luminance, so `reference_white_nits` is not a
+    // preference here, it decides how bright the picture actually is.
+    Pq,
+};
+
 struct ColorGrade {
     // Per-channel three-way control. Lift moves the blacks, gain the whites,
     // gamma the middle without moving either end.
@@ -172,6 +188,25 @@ struct ColorGrade {
     // of the pipeline does not track.
     float temperature = 0.0f;
     float tint = 0.0f;  // green against magenta
+
+    // --- display ---------------------------------------------------------------
+    DisplayOutput output = DisplayOutput::Sdr;
+    // How much brighter than reference white the display can go. 1 is an SDR
+    // panel; a typical HDR laptop screen manages 3 or 4 and a good television
+    // 10. The highlight roll-off is built from this, so setting it higher than
+    // the panel can do puts the highlights where the panel clips them itself --
+    // abruptly, and in one channel at a time, which is how HDR content ends up
+    // with magenta suns.
+    float display_headroom = 4.0f;
+    // Where the roll-off starts, in multiples of reference white. Below it the
+    // mapping is the IDENTITY, so an SDR-looking image on an HDR display looks
+    // the same rather than washed out -- which is the failure everyone
+    // remembers from the first generation of HDR games.
+    float rolloff_start = 1.0f;
+    // What "1.0" is worth, in nits. Only PQ uses it, and only because PQ is an
+    // absolute encoding: 203 is the value the ITU recommends for graphics white
+    // in an HDR10 signal.
+    float reference_white_nits = 203.0f;
 };
 
 class Renderer {

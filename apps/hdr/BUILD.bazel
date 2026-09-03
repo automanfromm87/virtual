@@ -1,0 +1,16 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# HDR output, checked against SMPTE ST 2084 rather than against "it looks
+# brighter". PQ has an exact answer for every input luminance.
+cc_test(
+    name = "hdr_test",
+    srcs = ["main.cpp"],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+    ],
+)

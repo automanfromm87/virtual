@@ -37,6 +37,10 @@ struct GradeParams {
     float4 gain;        // .rgb per-channel highlights
     // .x contrast, .y saturation, .z temperature, .w tint
     float4 look;
+    // .x output mode (0 SDR, 1 extended linear, 2 PQ), .y display headroom in
+    // multiples of reference white, .z where the highlight roll-off starts,
+    // .w reference white in nits (PQ only).
+    float4 output;
 };
 
 fragment float4 fs_composite(CompositeOut in [[stage_in]],
@@ -91,8 +95,37 @@ fragment float4 fs_composite(CompositeOut in [[stage_in]],
     // This used to live in the surface shader, which meant every pass after it
     // was working on display-referred colour that had already been clamped to
     // one. Doing it here is what makes an HDR scene target worth having.
-    const float a1 = 2.51f, b1 = 0.03f, c1 = 2.43f, d1 = 0.59f, e1 = 0.14f;
-    color = saturate((color * (a1 * color + b1)) / (color * (c1 * color + d1) + e1));
+    //
+    // g.output.x picks the destination:
+    //   0  SDR. The ACES curve clamped to 0..1 and gamma-encoded. What a
+    //      conventional display wants.
+    //   1  extended-range linear (scRGB). NO clamp and NO gamma: the display
+    //      pipeline is linear and 1.0 means the reference white, so a specular
+    //      highlight at 6.0 is six times reference white and stays that way.
+    //   2  Rec.2100 PQ. Absolute luminance in nits through the SMPTE ST 2084
+    //      curve, which is what an HDR10 signal is.
+    //
+    // The KEY POINT, and the reason this is not just "skip the clamp": an SDR
+    // frame has already thrown the highlights away by the time it is written,
+    // and no amount of expanding it afterwards puts them back. The tone curve
+    // has to know what it is mapping to.
+    const int mode = int(g.output.x + 0.5f);
+    if (mode == 0) {
+        const float a1 = 2.51f, b1 = 0.03f, c1 = 2.43f, d1 = 0.59f, e1 = 0.14f;
+        color = saturate((color * (a1 * color + b1)) /
+                         (color * (c1 * color + d1) + e1));
+    } else {
+        // A SOFT SHOULDER instead of the SDR curve, rolling off only above the
+        // headroom the display actually has. Below reference white the mapping
+        // is the identity, so an SDR-looking image on an HDR display looks the
+        // same rather than washed out -- which is the failure everyone
+        // remembers from early HDR games.
+        const float peak = max(g.output.y, 1.0f);   // display headroom, x white
+        const float knee = min(g.output.z, peak * 0.99f);
+        const float3 over = max(color - knee, 0.0f);
+        const float range = max(peak - knee, 1e-3f);
+        color = min(color, knee) + range * over / (range + over);
+    }
 
     // --- the grade, in display-referred space ---------------------------------
     //
@@ -132,8 +165,26 @@ fragment float4 fs_composite(CompositeOut in [[stage_in]],
     const float luma = dot(color, float3(0.2126f, 0.7152f, 0.0722f));
     color = mix(float3(luma), color, g.look.y);
 
-    color = saturate(color);
-    color = pow(color, 1.0f / 2.2f);
+    if (mode == 0) {
+        color = saturate(color);
+        // The display's own transfer function, undone. 2.2 rather than the
+        // piecewise sRGB curve: the difference is confined to the darkest few
+        // codes and the whole pipeline is consistent about it.
+        color = pow(color, 1.0f / 2.2f);
+    } else if (mode == 2) {
+        // SMPTE ST 2084, the PQ curve. Its input is ABSOLUTE luminance in nits
+        // divided by 10000, which is why the reference white has to be stated
+        // in nits -- unlike every other stage here, PQ is not relative to
+        // anything and 0.5 means a specific brightness.
+        const float3 nits = max(color, 0.0f) * g.output.w;
+        const float3 y = nits / 10000.0f;
+        const float m1 = 0.1593017578125f, m2 = 78.84375f;
+        const float c1p = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;
+        const float3 yp = pow(y, m1);
+        color = pow((c1p + c2 * yp) / (1.0f + c3 * yp), m2);
+    }
+    // Mode 1 falls through unencoded, which is what extended-range linear
+    // means: the value IS the light, in units of reference white.
 
     return float4(color, 1.0f);
 }

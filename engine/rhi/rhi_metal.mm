@@ -5,6 +5,7 @@
 // means rewriting the renderer.
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <AppKit/AppKit.h>
 #include <dispatch/dispatch.h>
 
 #include <algorithm>
@@ -1092,7 +1093,13 @@ void Device::DestroyTexture(TextureId t) {
     impl_->free_textures.push_back(t.v);
 }
 
-std::unique_ptr<Swapchain> Device::CreateSwapchain(Format format, std::string& error) {
+std::unique_ptr<Swapchain> Device::CreateSwapchain(Format format,
+                                                   std::string& error, bool hdr) {
+    if (hdr && format != Format::RGBA16Float) {
+        error = "an HDR swapchain needs RGBA16Float; an 8-bit layer has nowhere "
+                "to put a value above one whatever colour space it is in";
+        return nullptr;
+    }
     CAMetalLayer* layer = [CAMetalLayer layer];
     if (!layer) {
         error = "CAMetalLayer creation failed";
@@ -1101,9 +1108,30 @@ std::unique_ptr<Swapchain> Device::CreateSwapchain(Format format, std::string& e
     layer.device = impl_->dev;
     layer.pixelFormat = ToMTL(format);
     layer.framebufferOnly = YES;
+    if (hdr) {
+        layer.wantsExtendedDynamicRangeContent = YES;
+        // EXTENDED LINEAR sRGB: the same primaries as everything else in this
+        // engine, with values allowed past 1. Display P3 would be a wider
+        // gamut and would need every colour in the pipeline reinterpreted --
+        // the same numbers would mean more saturated colours, so a scene tuned
+        // on an SDR display would shift the moment HDR was switched on.
+        CGColorSpaceRef cs =
+            CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
+        layer.colorspace = cs;
+        CGColorSpaceRelease(cs);
+    }
     std::unique_ptr<Swapchain> sc(new Swapchain());
     sc->impl_->layer = layer;
     return sc;
+}
+
+float Device::DisplayHeadroom(const Swapchain& sc) const {
+    if (!sc.impl_->layer.wantsExtendedDynamicRangeContent) return 1.0f;
+    NSScreen* screen = sc.impl_->layer.contentsScale > 0 ? [NSScreen mainScreen] : nil;
+    if (!screen) return 1.0f;
+    const float ratio = float(screen.maximumExtendedDynamicRangeColorComponentValue);
+    // Below 1 is meaningless and 1 means no headroom; both come back as "SDR".
+    return ratio > 1.0f ? ratio : 1.0f;
 }
 
 TextureId Device::AcquireDrawable(Swapchain& sc) { @autoreleasepool {
@@ -1324,17 +1352,37 @@ bool Device::ReadPixels(TextureId tex, int width, int height,
     // A Private texture has no CPU-visible contents; getBytes on one is a
     // Metal validation error rather than a silent zero fill.
     if (impl_->textures[tex.v].storageMode != MTLStorageModeShared) return false;
-    // Four bytes per pixel is baked into the stride below, so a half-float
-    // target would be read at half its width and the caller would get a
-    // plausible, wrong image rather than an error.
+    // The stride comes from the FORMAT. It used to be a hard-coded four bytes,
+    // which meant a half-float target could not be read back at all -- and a
+    // half-float target is exactly what an HDR composite writes, so there was
+    // no way to measure the one output where the values above 1 are the point.
+    //
+    // The caller still gets raw bytes and still has to know how to read them;
+    // what this fixes is the size, not the interpretation.
     const MTLPixelFormat pf = impl_->textures[tex.v].pixelFormat;
-    if (pf != MTLPixelFormatRGBA8Unorm && pf != MTLPixelFormatBGRA8Unorm)
-        return false;
-    const std::size_t need = std::size_t(width) * std::size_t(height) * 4;
+    std::size_t bpp = 0;
+    switch (pf) {
+        case MTLPixelFormatRGBA8Unorm:
+        case MTLPixelFormatRGBA8Unorm_sRGB:
+        case MTLPixelFormatBGRA8Unorm:
+            bpp = 4;
+            break;
+        case MTLPixelFormatRGBA16Float:
+            bpp = 8;
+            break;
+        case MTLPixelFormatRGBA32Float:
+            bpp = 16;
+            break;
+        default:
+            // Refused rather than guessed. A wrong stride does not fail, it
+            // returns a plausible image at the wrong width.
+            return false;
+    }
+    const std::size_t need = std::size_t(width) * std::size_t(height) * bpp;
     if (out.size() < need) return false;
     [impl_->textures[tex.v]
              getBytes:out.data()
-          bytesPerRow:std::size_t(width) * 4
+          bytesPerRow:std::size_t(width) * bpp
            fromRegion:MTLRegionMake2D(0, 0, NSUInteger(width), NSUInteger(height))
           mipmapLevel:0];
     return true;

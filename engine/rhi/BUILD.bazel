@@ -18,6 +18,13 @@ objc_library(
         "Foundation",
         "-framework",
         "QuartzCore",
+        # CoreGraphics for the extended-linear colour space an HDR layer needs,
+        # AppKit for the screen's reported headroom. Both only for HDR output;
+        # neither is used anywhere else.
+        "-framework",
+        "CoreGraphics",
+        "-framework",
+        "AppKit",
     ],
     target_compatible_with = ["@platforms//os:macos"],
 )

@@ -25,8 +25,9 @@ struct GradeParams {
     Vec4 gamma;
     Vec4 gain;
     Vec4 look;
+    Vec4 output;
 };
-static_assert(sizeof(GradeParams) == 80, "GradeParams layout drifted");
+static_assert(sizeof(GradeParams) == 96, "GradeParams layout drifted");
 
 
 // Shader source is baked into the binary at compile time by #embed (a clang C23
@@ -1966,6 +1967,9 @@ void Renderer::DrawComposite(rhi::Encoder& enc, rhi::TextureId src,
     gp.gamma = Vec4{g.gamma.x, g.gamma.y, g.gamma.z, 0.0f};
     gp.gain = Vec4{g.gain.x, g.gain.y, g.gain.z, 0.0f};
     gp.look = Vec4{g.contrast, g.saturation, g.temperature, g.tint};
+    gp.output = Vec4{float(int(g.output)), std::max(g.display_headroom, 1.0f),
+                     std::max(g.rolloff_start, 0.0f),
+                     std::max(g.reference_white_nits, 1.0f)};
 
     enc.SetPipeline(impl_->composite);
     enc.SetCull(rhi::Cull::None, rhi::Winding::CounterClockwise);
