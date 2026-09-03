@@ -8,10 +8,12 @@ cc_library(
     name = "geometry",
     srcs = [
         "floorplan.cc",
+        "hull.cc",
         "mesh.cc",
     ],
     hdrs = [
         "floorplan.h",
+        "hull.h",
         "mesh.h",
     ],
     deps = [
@@ -29,5 +31,11 @@ cc_test(
 cc_test(
     name = "floorplan_test",
     srcs = ["floorplan_test.cc"],
+    deps = [":geometry"],
+)
+
+cc_test(
+    name = "hull_test",
+    srcs = ["hull_test.cc"],
     deps = [":geometry"],
 )

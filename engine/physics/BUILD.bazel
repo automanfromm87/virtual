@@ -8,7 +8,12 @@ cc_library(
     name = "physics",
     srcs = ["physics.cc"],
     hdrs = ["physics.h"],
-    deps = ["//engine/core"],
+    deps = [
+        "//engine/core",
+        # Hull collision shapes come from the hull builder, and their mass
+        # properties are computed there rather than approximated here.
+        "//engine/geometry",
+    ],
 )
 
 cc_test(

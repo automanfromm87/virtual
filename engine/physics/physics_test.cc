@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <vector>
 
 namespace {
 
@@ -568,6 +569,259 @@ int main() {
         CHECK(Length(pb - pa) < 0.05f);
         // Gravity is still pulling on it, so it hangs rather than floating.
         CHECK(w[arm].position.y < 2.75f);
+    }
+
+    // --- convex hulls, through GJK and EPA -----------------------------------
+    //
+    // The strongest available check on GJK/EPA is that it must AGREE with the
+    // closed-form routines. A box expressed as a hull of its eight corners is
+    // the same shape as a box; if the general path and the special-cased one
+    // disagree about depth or normal, one of them is wrong, and the closed
+    // forms are already tested above.
+    {
+        std::printf("convex hulls\n");
+        std::vector<Vec3> corners;
+        for (int i = 0; i < 8; ++i)
+            corners.push_back(Vec3{(i & 1) ? 1.0f : -1.0f, (i & 2) ? 1.0f : -1.0f,
+                                   (i & 4) ? 1.0f : -1.0f});
+
+        Body as_box;
+        as_box.shape = Shape::MakeBox(Vec3{1, 1, 1});
+        Body as_hull;
+        as_hull.shape = Shape::MakeHull(corners);
+
+        // Support functions first: everything else in GJK is built on this one
+        // question, so a disagreement here explains any disagreement later.
+        const Vec3 dirs[7] = {{1, 0, 0},   {0, 1, 0},        {0, 0, 1},
+                              {1, 1, 1},   {-0.3f, 0.9f, 0}, {0.5f, -0.5f, 0.7f},
+                              {-1, -1, -1}};
+        // The support VALUE, not the point. Along (0,1,0) a cube has four
+        // equally furthest corners, and which one comes back is arbitrary --
+        // GJK only ever uses the dot product, so that is the only part that is
+        // defined. Comparing the points instead fails on every axis direction
+        // for a shape that is perfectly correct.
+        bool support_agrees = true;
+        for (const Vec3& d : dirs) {
+            const float sb = Dot(Support(as_box, d), d);
+            const float sh = Dot(Support(as_hull, d), d);
+            if (std::fabs(sb - sh) > 1e-5f) support_agrees = false;
+        }
+        CHECK(support_agrees);
+
+        // The reference for a penetration depth is not the box routine -- it
+        // is the DEFINITION. The depth is the smallest, over all directions, of
+        // the shapes' overlap along that direction, and both shapes answer
+        // "how far do you reach along n" directly. Sampling the sphere finely
+        // gives that minimum to whatever accuracy is wanted, with no shared
+        // code and no shared assumptions.
+        //
+        // This matters here because the box path is NOT a neutral reference: it
+        // biases toward face axes on purpose, because an edge-edge normal is
+        // unstable and a crate resting on one jitters. So it deliberately
+        // reports the face answer where the true minimum is an edge one, and
+        // asserting that EPA matches it would be asserting the bias.
+        const auto true_depth = [](const Body& x, const Body& y, Vec3* normal) {
+            float best = 1e30f;
+            // A Fibonacci sphere: even coverage with no clustering at the
+            // poles, which a lat/long grid has and which would starve exactly
+            // the equatorial directions an edge-edge contact lives on.
+            constexpr int kN = 20000;
+            const float golden = 3.14159265f * (3.0f - std::sqrt(5.0f));
+            for (int i = 0; i < kN; ++i) {
+                const float yy = 1.0f - 2.0f * (float(i) + 0.5f) / float(kN);
+                const float r = std::sqrt(std::fmax(0.0f, 1.0f - yy * yy));
+                const float th = golden * float(i);
+                const Vec3 n{std::cos(th) * r, yy, std::sin(th) * r};
+                const float d = Dot(Support(x, n) - Support(y, n * -1.0f), n);
+                if (d < best) { best = d; *normal = n; }
+            }
+            // Refine around the winner: 20000 directions is 1.4 degrees apart,
+            // and the last fraction of a percent of the depth lives inside that.
+            for (int pass = 0; pass < 3; ++pass) {
+                const float step = 0.02f / float(1 << pass);
+                Vec3 centre = *normal;
+                for (int i = 0; i < 400; ++i) {
+                    const float a1 = float(i % 20) - 9.5f, a2 = float(i / 20) - 9.5f;
+                    Vec3 n = Normalize(centre + Vec3{a1 * step, a2 * step,
+                                                     (a1 - a2) * step * 0.5f});
+                    const float d = Dot(Support(x, n) - Support(y, n * -1.0f), n);
+                    if (d < best) { best = d; *normal = n; }
+                }
+            }
+            return best;
+        };
+
+        // The same, for a ROTATED box. At identity the rotation in a box's
+        // support function is the identity too, so a version that ignores
+        // orientation entirely passes every axis-aligned test there is.
+        {
+            Body rot_box, rot_hull;
+            rot_box.shape = Shape::MakeBox(Vec3{1, 1, 1});
+            rot_hull.shape = Shape::MakeHull(corners);
+            const Quat q = QuatFromAxisAngle(Normalize(Vec3{1.0f, 0.4f, -0.2f}), 0.9f);
+            rot_box.orientation = rot_hull.orientation = q;
+            rot_box.position = rot_hull.position = Vec3{0.7f, -0.3f, 0.2f};
+            bool rotated_agrees = true;
+            float worst_support = 0.0f;
+            for (const Vec3& d : dirs) {
+                const Vec3 u = Normalize(d);
+                const float sb = Dot(Support(rot_box, u), u);
+                const float sh = Dot(Support(rot_hull, u), u);
+                worst_support = std::fmax(worst_support, std::fabs(sb - sh));
+                if (std::fabs(sb - sh) > 1e-5f) rotated_agrees = false;
+            }
+            std::printf("    rotated box vs the same shape as a hull: support "
+                        "differs by at most %.6f\n", worst_support);
+            CHECK(rotated_agrees);
+        }
+
+        // Now the collisions, over a sweep of offsets and orientations.
+        float worst_depth = 0.0f, worst_normal = 0.0f;
+        float worst_vs_sat = 0.0f;
+        int compared = 0, disagreed = 0;
+        for (int t = 0; t < 60; ++t) {
+            const float ang = float(t) * 0.11f;
+            Body a_box, a_hull, b_box, b_hull;
+            a_box.shape = Shape::MakeBox(Vec3{1, 1, 1});
+            a_hull.shape = Shape::MakeHull(corners);
+            b_box.shape = Shape::MakeBox(Vec3{1, 1, 1});
+            b_hull.shape = Shape::MakeHull(corners);
+            const Vec3 at{1.2f + 0.02f * float(t), 0.3f * std::sin(ang),
+                          0.4f * std::cos(ang * 1.7f)};
+            const Quat q = QuatFromAxisAngle(Normalize(Vec3{0.3f, 1.0f, 0.2f}), ang);
+            b_box.position = b_hull.position = at;
+            b_box.orientation = b_hull.orientation = q;
+
+            Contact cb, ch;
+            const bool hit_box = CollideBoxBox(a_box, b_box, &cb);
+            const bool hit_hull = CollideConvex(a_hull, b_hull, &ch);
+            if (hit_box != hit_hull) { ++disagreed; continue; }
+            if (!hit_box) continue;
+            ++compared;
+            Vec3 ref_normal;
+            const float ref = true_depth(a_hull, b_hull, &ref_normal);
+            worst_depth = std::fmax(worst_depth, std::fabs(ref - ch.depth));
+            // SELF-CONSISTENCY: the overlap measured along the normal EPA
+            // reports must be the depth EPA reports. This is the sharp version
+            // of the normal check. Comparing the two normals by angle is not,
+            // because the depth is at a minimum there and therefore FLAT in the
+            // direction: a few degrees of tilt costs a thousandth of a unit, so
+            // the angle is barely determined even when the answer is right.
+            const float along =
+                Dot(Support(a_hull, ch.normal) - Support(b_hull, ch.normal * -1.0f),
+                    ch.normal);
+            worst_normal = std::fmax(worst_normal, std::fabs(along - ch.depth));
+            worst_vs_sat = std::fmax(worst_vs_sat, std::fabs(cb.depth - ch.depth));
+        }
+        std::printf("    %d overlapping box pairs, solved as hulls:\n"
+                    "      vs the sampled true minimum: depth off by at most "
+                    "%.5f\n"
+                    "      overlap along its own reported normal differs from "
+                    "its reported depth by %.5f\n"
+                    "      vs the box routine's face-biased answer: %.5f\n"
+                    "      %d disagreed on whether they touch at all\n",
+                    compared, worst_depth, worst_normal, worst_vs_sat, disagreed);
+        CHECK(compared > 40);
+        // Whether two shapes touch is not a matter of bias or tolerance, so
+        // this one is exact.
+        CHECK(disagreed == 0);
+        CHECK(worst_depth < 5e-3f);
+        CHECK(worst_normal < 1e-3f);
+        // And the face bias is real but bounded -- worth pinning, because if it
+        // ever grew large it would mean the box routine had started reporting a
+        // separating axis that is not close to the true one.
+        CHECK(worst_vs_sat < 0.05f);
+
+        // A hull against a SPHERE, where the answer is arithmetic: the sphere's
+        // centre is 1.3 from the box face at x = 1, so a radius 0.5 sphere
+        // overlaps by 0.2.
+        Body sphere = Ball(Vec3{1.3f, 0, 0}, 0.5f);
+        Contact c;
+        CHECK(CollideConvex(as_hull, sphere, &c));
+        std::printf("    hull vs sphere: depth %.4f, contact point "
+                    "(%.4f %.4f %.4f)\n", c.depth, c.point.x, c.point.y,
+                    c.point.z);
+        CHECK(std::fabs(c.depth - 0.2f) < 2e-3f);
+        // The contact point sits in the MIDDLE of the overlap. The hull's face
+        // is at x=1 and the sphere reaches back to x=0.8, so it belongs at 0.9.
+        // Taking either witness alone puts it on one surface -- which is a
+        // plausible-looking answer that biases every impulse and every torque
+        // by half the penetration depth, in a direction that depends on which
+        // body happened to be listed first.
+        CHECK(std::fabs(c.point.x - 0.9f) < 0.02f);
+        CHECK(std::fabs(c.point.y) < 0.02f && std::fabs(c.point.z) < 0.02f);
+        CHECK(c.normal.x > 0.99f);  // hull -> sphere, along +x
+        CHECK(!CollideConvex(as_hull, Ball(Vec3{2.0f, 0, 0}, 0.5f), &c));
+
+        // Just touching, and just separated. The boundary is where a
+        // penetration algorithm is least stable, and reporting a contact of
+        // depth zero as a hit is what makes two resting bodies buzz.
+        CHECK(!CollideConvex(as_hull, Ball(Vec3{1.5001f, 0, 0}, 0.5f), &c));
+
+        // Deep overlap: one hull entirely inside another. EPA has to expand
+        // right across the polytope here, and a fixed iteration count that is
+        // too low returns the first face it looked at.
+        Body big;
+        std::vector<Vec3> big_corners;
+        for (const Vec3& p : corners) big_corners.push_back(p * 3.0f);
+        big.shape = Shape::MakeHull(big_corners);
+        CHECK(CollideConvex(big, as_hull, &c));
+        CHECK(c.depth > 3.9f && c.depth < 4.1f);  // 3 + 1 along the nearest face
+        CHECK(std::isfinite(c.point.x) && std::isfinite(c.depth));
+
+        // Mass properties from a real hull, against the box they describe.
+        const eng::geom::Hull built = eng::geom::ConvexHull(corners);
+        CHECK(!built.Empty());
+        Body h;
+        h.shape = Shape::MakeHull(built);
+        h.SetMass(4.0f);
+        Body bx;
+        bx.shape = Shape::MakeBox(Vec3{1, 1, 1});
+        bx.SetMass(4.0f);
+        std::printf("    hull inverse inertia %.5f vs the same box %.5f\n",
+                    h.inverse_inertia.x, bx.inverse_inertia.x);
+        CHECK(std::fabs(h.inverse_inertia.x - bx.inverse_inertia.x) < 1e-3f);
+
+        // An OFF-CENTRE hull is re-centred on its centre of mass, because that
+        // is the only point a free body rotates about. The offset is reported
+        // so the caller can put the body back where the art expects it.
+        std::vector<Vec3> shifted;
+        for (const Vec3& p : corners) shifted.push_back(p + Vec3{5, 0, 0});
+        const Shape off = Shape::MakeHull(eng::geom::ConvexHull(shifted));
+        CHECK(std::fabs(off.centre_offset.x - 5.0f) < 1e-3f);
+        float furthest = 0.0f;
+        for (const Vec3& p : off.points) furthest = std::fmax(furthest, Length(p));
+        CHECK(furthest < 1.8f);  // sqrt(3), not 6 -- the vertices moved back
+
+        // A hull body actually settling on the ground, which is the whole point.
+        {
+            World w;
+            Body floor;
+            floor.shape = Shape::MakeBox(Vec3{20, 1, 20});
+            floor.position = Vec3{0, -1, 0};
+            floor.SetMass(0.0f);
+            w.Add(floor);
+
+            // An octahedron, so it is genuinely not a box or a sphere.
+            std::vector<Vec3> oct = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
+                                     {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+            Body body;
+            body.shape = Shape::MakeHull(eng::geom::ConvexHull(oct));
+            body.position = Vec3{0, 4, 0};
+            body.restitution = 0.0f;
+            body.SetMass(1.0f);
+            const int id = w.Add(body);
+
+            for (int i = 0; i < 900; ++i) w.StepFixed();
+            std::printf("    an octahedron dropped from y=4 settles at y=%.4f\n",
+                        w[id].position.y);
+            // Resting on a vertex is unstable, so it tips onto a face; either
+            // way its centre ends up between the vertex height (1) and the
+            // face height (1/sqrt(3) = 0.577).
+            CHECK(w[id].position.y > 0.5f && w[id].position.y < 1.05f);
+            CHECK(std::isfinite(w[id].position.y));
+            CHECK(w[id].position.y > 0.0f);  // it did not sink through
+        }
     }
 
     if (g_failures == 0) std::printf("physics_test: all checks passed\n");

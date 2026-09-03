@@ -159,6 +159,39 @@ int BoxBoxPoints(const Body& a, const Body& b, Vec3 n, Contact* out, int max_out
 
 }  // namespace
 
+Shape Shape::MakeHull(const geom::Hull& hull) {
+    Shape s;
+    s.type = ShapeType::Hull;
+    if (hull.Empty()) return s;
+
+    const Vec3 centre = hull.Centroid();
+    s.centre_offset = centre;
+    s.points.reserve(hull.vertices.size());
+    for (const Vec3& p : hull.vertices) s.points.push_back(p - centre);
+
+    float r = 0.0f;
+    Vec3 half{0, 0, 0};
+    for (const Vec3& p : s.points) {
+        r = std::max(r, Length(p));
+        half.x = std::max(half.x, std::fabs(p.x));
+        half.y = std::max(half.y, std::fabs(p.y));
+        half.z = std::max(half.z, std::fabs(p.z));
+    }
+    s.radius = r;
+    s.half_extents = half;
+
+    // Per unit MASS, so that SetMass can scale it. Hull::Inertia() is for unit
+    // DENSITY, and dividing by the volume is what converts between the two --
+    // without it a small dense object and a large light one of the same mass
+    // would spin identically.
+    const float vol = hull.Volume();
+    if (vol > 1e-9f) {
+        const Vec3 d = hull.Inertia().Diagonal();
+        s.unit_inertia = d * (1.0f / vol);
+    }
+    return s;
+}
+
 void Body::SetMass(float mass) {
     if (mass <= 0.0f) {
         inverse_mass = 0.0f;
@@ -166,7 +199,16 @@ void Body::SetMass(float mass) {
         return;
     }
     inverse_mass = 1.0f / mass;
-    if (shape.type == ShapeType::Sphere) {
+    if (shape.type == ShapeType::Hull && shape.unit_inertia.x >= 0.0f) {
+        // The real tensor's diagonal, from the hull's own geometry. The
+        // off-diagonal terms are dropped: they are zero for any hull whose own
+        // axes are its principal axes, and small for anything roughly
+        // symmetric. A deliberately skewed hull will precess slightly wrong.
+        const Vec3 i = shape.unit_inertia * mass;
+        inverse_inertia = Vec3{i.x > 0.0f ? 1.0f / i.x : 0.0f,
+                               i.y > 0.0f ? 1.0f / i.y : 0.0f,
+                               i.z > 0.0f ? 1.0f / i.z : 0.0f};
+    } else if (shape.type == ShapeType::Sphere) {
         // Solid sphere: I = 2/5 m r², the same about every axis.
         const float i = 0.4f * mass * shape.radius * shape.radius;
         const float inv = i > 0.0f ? 1.0f / i : 0.0f;
@@ -365,6 +407,295 @@ Vec3 World::AngularMomentum() const {
     return l;
 }
 
+// ---------------------------------------------------------------- GJK/EPA ---
+
+Vec3 Support(const Body& body, Vec3 dir) {
+    switch (body.shape.type) {
+        case ShapeType::Sphere: {
+            const float len = Length(dir);
+            // A sphere's support is its centre plus r in the direction asked
+            // for. Zero direction happens on the very first GJK iteration when
+            // two centres coincide, and any unit vector is a correct answer.
+            const Vec3 unit = len > 1e-12f ? dir * (1.0f / len) : Vec3{1, 0, 0};
+            return body.position + unit * body.shape.radius;
+        }
+        case ShapeType::Box: {
+            // In the body's frame the answer is a corner, chosen per axis by
+            // the sign of the direction.
+            const Vec3 local = RotateInverse(body.orientation, dir);
+            const Vec3 h = body.shape.half_extents;
+            const Vec3 corner{local.x >= 0.0f ? h.x : -h.x,
+                              local.y >= 0.0f ? h.y : -h.y,
+                              local.z >= 0.0f ? h.z : -h.z};
+            return body.position + Rotate(body.orientation, corner);
+        }
+        case ShapeType::Hull: {
+            if (body.shape.points.empty()) return body.position;
+            const Vec3 local = RotateInverse(body.orientation, dir);
+            const Vec3* best = &body.shape.points[0];
+            float best_dot = Dot(local, *best);
+            for (const Vec3& p : body.shape.points) {
+                const float d = Dot(local, p);
+                if (d > best_dot) { best_dot = d; best = &p; }
+            }
+            return body.position + Rotate(body.orientation, *best);
+        }
+    }
+    return body.position;
+}
+
+namespace {
+
+// A point of the Minkowski difference, with the two points it came from. The
+// witnesses are what turn a penetration depth into a contact POINT: without
+// them EPA gives a direction and a distance and no place to apply the impulse.
+struct SupportPoint {
+    Vec3 p;  // pa - pb
+    Vec3 pa, pb;
+};
+
+SupportPoint MinkowskiSupport(const Body& a, const Body& b, Vec3 dir) {
+    SupportPoint s;
+    s.pa = Support(a, dir);
+    s.pb = Support(b, dir * -1.0f);
+    s.p = s.pa - s.pb;
+    return s;
+}
+
+// Triple product, the "vector perpendicular to ab in the direction of ac" that
+// every GJK simplex case is written in terms of.
+Vec3 TripleCross(Vec3 a, Vec3 b, Vec3 c) { return Cross(Cross(a, b), c); }
+
+// One GJK iteration on the current simplex: reduces it to the feature closest
+// to the origin and points `dir` at the origin from it. Returns true when the
+// simplex is a tetrahedron containing the origin.
+bool DoSimplex(SupportPoint* s, int& n, Vec3& dir) {
+    const Vec3 a = s[n - 1].p;         // the point just added
+    const Vec3 ao = a * -1.0f;         // toward the origin
+
+    if (n == 2) {
+        const Vec3 ab = s[0].p - a;
+        // Perpendicular to ab, in the plane containing the origin. Degenerate
+        // when the origin is ON the segment, which is a touching contact.
+        dir = TripleCross(ab, ao, ab);
+        if (Dot(dir, dir) < 1e-12f) dir = Cross(ab, Vec3{1, 0, 0});
+        if (Dot(dir, dir) < 1e-12f) dir = Cross(ab, Vec3{0, 1, 0});
+        return false;
+    }
+
+    if (n == 3) {
+        const Vec3 b = s[1].p, c = s[0].p;
+        const Vec3 ab = b - a, ac = c - a;
+        const Vec3 abc = Cross(ab, ac);
+        if (Dot(Cross(abc, ac), ao) > 0.0f) {
+            // Outside edge ac: drop b.
+            s[1] = s[2];
+            n = 2;
+            dir = TripleCross(ac, ao, ac);
+        } else if (Dot(Cross(ab, abc), ao) > 0.0f) {
+            // Outside edge ab: drop c.
+            s[0] = s[1];
+            s[1] = s[2];
+            n = 2;
+            dir = TripleCross(ab, ao, ab);
+        } else {
+            // Above or below the triangle.
+            dir = Dot(abc, ao) > 0.0f ? abc : abc * -1.0f;
+            if (Dot(abc, ao) <= 0.0f) std::swap(s[0], s[1]);
+        }
+        return false;
+    }
+
+    // n == 4: the origin is inside unless it is outside one of the three faces
+    // that touch the newest point.
+    const Vec3 b = s[2].p, c = s[1].p, d = s[0].p;
+    const Vec3 abc = Cross(b - a, c - a);
+    const Vec3 acd = Cross(c - a, d - a);
+    const Vec3 adb = Cross(d - a, b - a);
+    if (Dot(abc, ao) > 0.0f) {
+        s[0] = s[1]; s[1] = s[2]; s[2] = s[3];
+        n = 3;
+        dir = abc;
+        return false;
+    }
+    if (Dot(acd, ao) > 0.0f) {
+        s[2] = s[3];
+        n = 3;
+        dir = acd;
+        return false;
+    }
+    if (Dot(adb, ao) > 0.0f) {
+        s[1] = s[0]; s[0] = s[2]; s[2] = s[3];
+        n = 3;
+        dir = adb;
+        return false;
+    }
+    return true;
+}
+
+struct EpaFace {
+    int a, b, c;
+    Vec3 normal;
+    float dist;
+};
+
+// Barycentric coordinates of the projection of the origin onto triangle pqr.
+// Used to carry the witness points along: the contact point is the same blend
+// of the A-side witnesses that the origin's projection is of the triangle.
+void Barycentric(Vec3 p, Vec3 q, Vec3 r, float* u, float* v, float* w) {
+    // origin - p. The origin is not in the triangle's plane, but only the
+    // in-plane part survives the dots with v0 and v1, so this gives the
+    // barycentric coordinates of its PROJECTION -- which is what is wanted.
+    const Vec3 v0 = q - p, v1 = r - p, v2 = p * -1.0f;
+    const float d00 = Dot(v0, v0), d01 = Dot(v0, v1), d11 = Dot(v1, v1);
+    const float d20 = Dot(v2, v0), d21 = Dot(v2, v1);
+    const float denom = d00 * d11 - d01 * d01;
+    if (std::fabs(denom) < 1e-20f) { *u = 1.0f; *v = *w = 0.0f; return; }
+    *v = (d11 * d20 - d01 * d21) / denom;
+    *w = (d00 * d21 - d01 * d20) / denom;
+    *u = 1.0f - *v - *w;
+}
+
+}  // namespace
+
+bool CollideConvex(const Body& a, const Body& b, Contact* out) {
+    // --- GJK ----------------------------------------------------------------
+    Vec3 dir = b.position - a.position;
+    if (Dot(dir, dir) < 1e-12f) dir = Vec3{1, 0, 0};
+
+    SupportPoint simplex[4];
+    simplex[0] = MinkowskiSupport(a, b, dir);
+    int n = 1;
+    dir = simplex[0].p * -1.0f;
+
+    // Bounded, not while(true). A support function that returns the same point
+    // twice -- which floating point makes possible on a flat face -- would spin
+    // forever, and a physics step that never returns is worse than a missed
+    // contact.
+    for (int iter = 0; iter < 64; ++iter) {
+        if (Dot(dir, dir) < 1e-24f) break;
+        const SupportPoint s = MinkowskiSupport(a, b, dir);
+        // The new point did not pass the origin, so the origin is outside the
+        // Minkowski difference and the shapes are apart.
+        if (Dot(s.p, dir) < 0.0f) return false;
+        simplex[n++] = s;
+        if (DoSimplex(simplex, n, dir)) {
+            // --- EPA --------------------------------------------------------
+            std::vector<SupportPoint> poly(simplex, simplex + 4);
+            std::vector<EpaFace> faces;
+            // Winding must be CONSISTENT across the whole polytope, not merely
+            // outward on each face taken alone. The horizon walk below
+            // identifies interior edges by finding the same edge traversed in
+            // opposite directions by two deleted faces; flipping a face to make
+            // its normal point away from the origin breaks that pairing, and
+            // the polytope silently develops holes. With holes, "the closest
+            // face" is chosen from an incomplete set and EPA returns a plane
+            // that cuts through the shape -- a normal a few degrees off and a
+            // depth a little short, which is exactly the wrong kind of wrong:
+            // small enough to look like tolerance, large enough to matter.
+            const auto add_face = [&](int i, int j, int k) {
+                EpaFace f{i, j, k, {}, 0.0f};
+                const Vec3 nrm = Cross(poly[std::size_t(j)].p - poly[std::size_t(i)].p,
+                                       poly[std::size_t(k)].p - poly[std::size_t(i)].p);
+                const float len = Length(nrm);
+                if (len < 1e-12f) return;  // sliver: contributes no plane
+                f.normal = nrm * (1.0f / len);
+                f.dist = Dot(f.normal, poly[std::size_t(i)].p);
+                faces.push_back(f);
+            };
+            // The seed tetrahedron, wound outward by testing the OPPOSITE
+            // vertex rather than the origin. Same rule the hull builder uses,
+            // and unlike the origin test it stays correct when the origin sits
+            // exactly on a face -- which is a touching contact, not a rarity.
+            const auto seed = [&](int i, int j, int k, int opposite) {
+                const Vec3 nrm = Cross(poly[std::size_t(j)].p - poly[std::size_t(i)].p,
+                                       poly[std::size_t(k)].p - poly[std::size_t(i)].p);
+                if (Dot(nrm, poly[std::size_t(opposite)].p - poly[std::size_t(i)].p) > 0.0f)
+                    add_face(i, k, j);
+                else
+                    add_face(i, j, k);
+            };
+            seed(0, 1, 2, 3);
+            seed(0, 3, 1, 2);
+            seed(0, 2, 3, 1);
+            seed(1, 3, 2, 0);
+            if (faces.size() < 4) return false;  // degenerate simplex
+
+            for (int step = 0; step < 64; ++step) {
+                // The face closest to the origin is the current best guess at
+                // the penetration.
+                std::size_t best = 0;
+                for (std::size_t f = 1; f < faces.size(); ++f)
+                    if (faces[f].dist < faces[best].dist) best = f;
+                const EpaFace closest = faces[best];
+
+                const SupportPoint s2 = MinkowskiSupport(a, b, closest.normal);
+                const float reach = Dot(s2.p, closest.normal);
+                if (reach - closest.dist < 1e-4f || step == 63) {
+                    // Converged. The contact point is the origin's projection
+                    // onto this face, expressed through the A-side witnesses.
+                    float u, v, w;
+                    Barycentric(poly[std::size_t(closest.a)].p,
+                                poly[std::size_t(closest.b)].p,
+                                poly[std::size_t(closest.c)].p, &u, &v, &w);
+                    const Vec3 pa = poly[std::size_t(closest.a)].pa * u +
+                                    poly[std::size_t(closest.b)].pa * v +
+                                    poly[std::size_t(closest.c)].pa * w;
+                    const Vec3 pb = poly[std::size_t(closest.a)].pb * u +
+                                    poly[std::size_t(closest.b)].pb * v +
+                                    poly[std::size_t(closest.c)].pb * w;
+                    out->normal = closest.normal;
+                    out->depth = closest.dist;
+                    // Halfway between the witnesses: they are the same point
+                    // when the shapes just touch, and straddle the overlap when
+                    // they do not.
+                    out->point = (pa + pb) * 0.5f;
+                    return closest.dist > 0.0f;
+                }
+
+                // Expand: delete every face the new point can see, and close
+                // the hole with a fan from the horizon. Same cancellation rule
+                // as the hull builder -- an edge shared by two deleted faces is
+                // interior, not horizon.
+                const int added = int(poly.size());
+                poly.push_back(s2);
+                std::vector<std::pair<int, int>> horizon;
+                std::vector<EpaFace> kept;
+                for (const EpaFace& f : faces) {
+                    if (Dot(f.normal, s2.p) - f.dist <= 0.0f) {
+                        kept.push_back(f);
+                        continue;
+                    }
+                    const int tri[3][2] = {{f.a, f.b}, {f.b, f.c}, {f.c, f.a}};
+                    for (const auto& e : tri) {
+                        bool cancelled = false;
+                        for (std::size_t q = 0; q < horizon.size(); ++q)
+                            if (horizon[q].first == e[1] && horizon[q].second == e[0]) {
+                                horizon.erase(horizon.begin() + std::ptrdiff_t(q));
+                                cancelled = true;
+                                break;
+                            }
+                        if (!cancelled) horizon.emplace_back(e[0], e[1]);
+                    }
+                }
+                faces.swap(kept);
+                for (const auto& e : horizon) add_face(e.first, e.second, added);
+                if (faces.empty()) return false;
+                // A closed polytope on V vertices has 2V-4 faces, and EPA adds
+                // at most one vertex per step, so this cannot be reached by a
+                // correct expansion. It IS reached the moment the horizon walk
+                // leaks: every step then triples the face count, and what would
+                // otherwise be a wrong answer becomes an out-of-memory a few
+                // seconds later, in a function with no obvious connection to
+                // the cause. Failing here keeps it a collision result.
+                if (faces.size() > 4 * (poly.size() + 2)) return false;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
 void World::Collide() {
     contacts_.clear();
     stats_.pairs_tested = 0;
@@ -391,7 +722,21 @@ void World::Collide() {
             ++stats_.pairs_tested;
 
             Contact c;
-            if (a.shape.type == ShapeType::Sphere && b.shape.type == ShapeType::Sphere) {
+            // A HULL first, before anything else. The sphere branches below
+            // hand their second argument to CollideSphereBox, which would
+            // silently collide against the hull's bounding box -- a shape that
+            // is always bigger and never right.
+            if (a.shape.type == ShapeType::Hull || b.shape.type == ShapeType::Hull) {
+                // GJK/EPA, which needs no case analysis: it asks only for
+                // support points, so one path covers hull against hull, box or
+                // sphere.
+                if (CollideConvex(a, b, &c)) {
+                    c.a = i;
+                    c.b = j;
+                    contacts_.push_back(c);
+                }
+            } else if (a.shape.type == ShapeType::Sphere &&
+                       b.shape.type == ShapeType::Sphere) {
                 if (CollideSphereSphere(a, b, &c)) {
                     c.a = i;
                     c.b = j;

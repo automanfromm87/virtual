@@ -169,6 +169,48 @@ constexpr Mat4 operator*(const Mat4& a, const Mat4& b) {
     return Mat4{{a * b.col[0], a * b.col[1], a * b.col[2], a * b.col[3]}};
 }
 
+// ---------------------------------------------------------------- Mat3 ----
+// A 3x3 matrix, column-major and column-vector like Mat4.
+//
+// Not a smaller Mat4: it exists for the things that are genuinely 3x3 and would
+// be wrong padded out to four. An INERTIA TENSOR is the case that forced it --
+// it has no translation to carry, it is symmetric, and the operation that
+// matters (R * I * R^T, taking it from the body's frame to the world's) has no
+// meaning at all in homogeneous coordinates.
+struct Mat3 {
+    Vec3 col[3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+
+    [[nodiscard]] static Mat3 Identity() { return Mat3{}; }
+    [[nodiscard]] static Mat3 Diagonal(Vec3 d) {
+        return Mat3{{{d.x, 0, 0}, {0, d.y, 0}, {0, 0, d.z}}};
+    }
+    [[nodiscard]] Vec3 Diagonal() const {
+        return Vec3{col[0].x, col[1].y, col[2].z};
+    }
+};
+
+inline Vec3 operator*(const Mat3& m, Vec3 v) {
+    return m.col[0] * v.x + m.col[1] * v.y + m.col[2] * v.z;
+}
+
+inline Mat3 operator*(const Mat3& a, const Mat3& b) {
+    return Mat3{{a * b.col[0], a * b.col[1], a * b.col[2]}};
+}
+
+inline Mat3 operator+(const Mat3& a, const Mat3& b) {
+    return Mat3{{a.col[0] + b.col[0], a.col[1] + b.col[1], a.col[2] + b.col[2]}};
+}
+
+inline Mat3 operator*(const Mat3& m, float s) {
+    return Mat3{{m.col[0] * s, m.col[1] * s, m.col[2] * s}};
+}
+
+inline Mat3 Transpose(const Mat3& m) {
+    return Mat3{{{m.col[0].x, m.col[1].x, m.col[2].x},
+                 {m.col[0].y, m.col[1].y, m.col[2].y},
+                 {m.col[0].z, m.col[1].z, m.col[2].z}}};
+}
+
 // ---------------------------------------------------------------- Quat ----
 // Unit quaternion, (x,y,z) vector part and w scalar. Stored in glTF's order.
 //

@@ -16,19 +16,36 @@
 // Not here: convex hulls, continuous collision.
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
 #include "engine/core/math.h"
+#include "engine/geometry/hull.h"
 
 namespace eng::physics {
 
-enum class ShapeType : std::uint8_t { Sphere, Box };
+enum class ShapeType : std::uint8_t { Sphere, Box, Hull };
 
 struct Shape {
     ShapeType type = ShapeType::Sphere;
     float radius = 0.5f;                  // Sphere
     Vec3 half_extents{0.5f, 0.5f, 0.5f};  // Box, in the body's own frame
+    // Hull: the vertices, in the body's own frame, already reduced by
+    // geom::ConvexHull. Only the vertices are kept -- GJK never asks anything
+    // else of a convex shape, and carrying the faces here would mean keeping
+    // them in step with a shape that never changes.
+    //
+    // They are stored RE-CENTRED on the hull's centre of mass, because a body
+    // rotates about its centre of mass and nothing else. `centre_offset` is
+    // where that centre was in the vertices as supplied, so a caller can put
+    // the body where the art expects it.
+    std::vector<Vec3> points;
+    Vec3 centre_offset{0.0f, 0.0f, 0.0f};
+    // Inertia per unit MASS, about the centre of mass, in the body frame.
+    // Negative x means "not known", and SetMass falls back to the bounding box.
+    Vec3 unit_inertia{-1.0f, -1.0f, -1.0f};
 
     [[nodiscard]] static Shape MakeSphere(float r) {
         Shape s;
@@ -39,6 +56,36 @@ struct Shape {
     [[nodiscard]] static Shape MakeBox(Vec3 half) {
         Shape s;
         s.type = ShapeType::Box;
+        s.half_extents = half;
+        return s;
+    }
+    // From a built hull, which is the form that also knows its own volume and
+    // inertia. Preferred over the raw-vertex overload for anything that will
+    // actually tumble.
+    [[nodiscard]] static Shape MakeHull(const geom::Hull& hull);
+
+    // `vertices` must already be a hull. Passing a raw cloud is not wrong --
+    // the support function of a cloud and of its hull are identical -- but
+    // every interior point is then paid for on every query, forever.
+    //
+    // Mass properties fall back to the bounding box, which OVERESTIMATES the
+    // inertia of anything that is not a box: the shape resists spinning more
+    // than it should. Use the geom::Hull overload where that matters.
+    [[nodiscard]] static Shape MakeHull(std::vector<Vec3> vertices) {
+        Shape s;
+        s.type = ShapeType::Hull;
+        s.points = std::move(vertices);
+        // Kept in step so that broadphase and culling do not need to know
+        // which kind of shape they are looking at.
+        float r = 0.0f;
+        for (const Vec3& p : s.points) r = std::max(r, Length(p));
+        s.radius = r;
+        Vec3 half{0, 0, 0};
+        for (const Vec3& p : s.points) {
+            half.x = std::max(half.x, std::fabs(p.x));
+            half.y = std::max(half.y, std::fabs(p.y));
+            half.z = std::max(half.z, std::fabs(p.z));
+        }
         s.half_extents = half;
         return s;
     }
@@ -221,5 +268,24 @@ class World {
 [[nodiscard]] bool CollideSphereSphere(const Body& a, const Body& b, Contact* out);
 [[nodiscard]] bool CollideSphereBox(const Body& sphere, const Body& box, Contact* out);
 [[nodiscard]] bool CollideBoxBox(const Body& a, const Body& b, Contact* out);
+
+// The general pair, for anything involving a hull.
+//
+// GJK decides whether two convex shapes touch by asking only "which point of
+// you is furthest in this direction" -- so it needs no case analysis at all,
+// and one implementation covers hull-hull, hull-box and hull-sphere. EPA then
+// grows a polytope inside the Minkowski difference until it reaches the
+// boundary, which is where the penetration depth and normal come from.
+//
+// Slower than the specialised sphere and box routines, and they are kept for
+// exactly that reason: a scene is mostly spheres and boxes, and this is the
+// path for the shapes that are neither.
+[[nodiscard]] bool CollideConvex(const Body& a, const Body& b, Contact* out);
+
+// The furthest point of `body` along `dir`, in WORLD space. Exposed because it
+// is the whole interface GJK has to a shape, and a test that can call it
+// directly can check a shape's support function without going through a
+// collision at all.
+[[nodiscard]] Vec3 Support(const Body& body, Vec3 dir);
 
 }  // namespace eng::physics
