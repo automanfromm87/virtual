@@ -824,6 +824,168 @@ int main() {
         }
     }
 
+    // --- distance ------------------------------------------------------------
+    {
+        std::printf("distance queries\n");
+        Body a = Ball(Vec3{0, 0, 0}, 1.0f);
+        Body b = Ball(Vec3{5, 0, 0}, 1.0f);
+        Vec3 n, pa, pb;
+        const float d = Distance(a, b, &n, &pa, &pb);
+        // Centres 5 apart, two unit radii: 3 of clear air between the surfaces.
+        CHECK(std::fabs(d - 3.0f) < 1e-3f);
+        CHECK(n.x > 0.999f);                     // a -> b
+        CHECK(std::fabs(pa.x - 1.0f) < 1e-3f);   // on a's surface
+        CHECK(std::fabs(pb.x - 4.0f) < 1e-3f);   // on b's surface
+
+        // Overlapping reports zero, not a negative depth. Depth is a different
+        // question with a different answer and a different algorithm.
+        CHECK(Distance(a, Ball(Vec3{1.0f, 0, 0}, 1.0f)) == 0.0f);
+        // Exactly touching.
+        CHECK(Distance(a, Ball(Vec3{2.0f, 0, 0}, 1.0f)) < 1e-3f);
+
+        // Box to box, where the closest feature is an EDGE rather than a face
+        // -- the case a naive centre-to-centre estimate gets wrong.
+        Body b1, b2;
+        b1.shape = Shape::MakeBox(Vec3{1, 1, 1});
+        b2.shape = Shape::MakeBox(Vec3{1, 1, 1});
+        b2.position = Vec3{4, 4, 0};
+        // Corner (1,1,0) to corner (3,3,0): a diagonal gap of sqrt(8).
+        const float dd = Distance(b1, b2);
+        std::printf("    two boxes corner to corner: %.5f (exact %.5f)\n", dd,
+                    std::sqrt(8.0f));
+        CHECK(std::fabs(dd - std::sqrt(8.0f)) < 1e-3f);
+    }
+
+    // --- continuous collision ------------------------------------------------
+    //
+    // The failure this exists to stop: a small fast body and a thin wall, where
+    // the discrete test looks at the start of the step and the end of the step
+    // and the wall was only ever in between. It is not a rare case -- it is
+    // every bullet, every thrown object, and it gets WORSE as the frame rate
+    // improves the rest of the simulation.
+    {
+        std::printf("continuous collision\n");
+        const auto fire = [](bool ccd, float speed, float* end_x, int* clamps,
+                             float* end_vx = nullptr) {
+            World w;
+            w.gravity = Vec3{0, 0, 0};  // a flat trajectory, so only x matters
+            w.ccd_enabled = ccd;
+            Body wall;
+            wall.shape = Shape::MakeBox(Vec3{0.05f, 5, 5});  // 10 cm thick
+            wall.position = Vec3{0, 0, 0};
+            wall.SetMass(0.0f);
+            w.Add(wall);
+
+            Body bullet = Ball(Vec3{-4, 0, 0}, 0.05f, 0.0f);
+            bullet.bullet = true;
+            bullet.velocity = Vec3{speed, 0, 0};
+            bullet.SetMass(0.02f);
+            const int id = w.Add(bullet);
+
+            for (int i = 0; i < 240; ++i) w.StepFixed();
+            *end_x = w[id].position.x;
+            *clamps = w.Stats().toi_clamps;
+            if (end_vx) *end_vx = w[id].velocity.x;
+            return w[id].position.x;
+        };
+
+        // Slow enough that the discrete test cannot miss it: both must agree,
+        // which is what shows CCD is not changing answers it has no business
+        // changing.
+        float slow_on = 0, slow_off = 0, v_on = 0, v_off = 0;
+        int c1 = 0, c2 = 0;
+        fire(true, 2.0f, &slow_on, &c1, &v_on);
+        fire(false, 2.0f, &slow_off, &c2, &v_off);
+        std::printf("    2 m/s:   ccd on x=%.3f vx=%.3f, ccd off x=%.3f vx=%.3f\n",
+                    slow_on, v_on, slow_off, v_off);
+        CHECK(slow_on < 0.0f && slow_off < 0.0f);  // both stopped at the wall
+        CHECK(std::fabs(slow_on - slow_off) < 0.05f);
+        // And STOPPED, not merely somewhere plausible. A body held in place by
+        // the sweep rather than by the solver sits at the right position with
+        // its full speed intact -- the position alone cannot tell the two
+        // apart, and the difference is whether it leaps forward the moment the
+        // wall moves.
+        CHECK(std::fabs(v_on) < 1e-3f && std::fabs(v_off) < 1e-3f);
+
+        // Fast enough to cross the wall inside one step. At 400 m/s and a
+        // 1/120 s step the body moves 3.3 m per step against a 0.1 m wall: the
+        // discrete test has no chance at all.
+        float fast_on = 0, fast_off = 0, fv_on = 0, fv_off = 0;
+        int clamps_on = 0, clamps_off = 0;
+        fire(true, 400.0f, &fast_on, &clamps_on, &fv_on);
+        fire(false, 400.0f, &fast_off, &clamps_off, &fv_off);
+        std::printf("    400 m/s: ccd on x=%.3f (%d clamps), ccd off x=%.3f "
+                    "(%d clamps)\n", fast_on, clamps_on, fast_off, clamps_off);
+        // Without CCD it is somewhere far past the wall; with it, stopped short.
+        CHECK(fast_off > 10.0f);
+        CHECK(fast_on < 0.0f);
+        CHECK(clamps_on > 0 && clamps_off == 0);
+        std::printf("      final speeds: ccd on %.4f, ccd off %.4f\n", fv_on, fv_off);
+        CHECK(std::fabs(fv_on) < 1e-3f);   // resolved by the solver
+        CHECK(fv_off > 100.0f);            // still travelling, having missed it
+        // The bullet ends up just barely inside the wall, in the same shallow
+        // penetration a slow body would have. Not exactly on the surface: with
+        // no overlap there is no contact and nothing ever resolves it.
+        CHECK(fast_on > -0.11f && fast_on < -0.09f);
+
+        // A sweep of speeds, because a single one can pass by luck: the step
+        // size and the speed could happen to place a sample inside the wall.
+        int tunnelled = 0, unresolved = 0;
+        for (int i = 0; i < 40; ++i) {
+            float x = 0, vx = 0;
+            int clamps = 0;
+            fire(true, 50.0f + float(i) * 37.5f, &x, &clamps, &vx);
+            if (x > 0.1f) ++tunnelled;
+            if (std::fabs(vx) > 1e-2f) ++unresolved;
+        }
+        std::printf("    40 speeds from 50 to 1512 m/s: %d tunnelled, %d left "
+                    "with unresolved speed\n", tunnelled, unresolved);
+        CHECK(tunnelled == 0);
+        CHECK(unresolved == 0);
+
+        // A BOUNCING bullet. This is what distinguishes "the solver stopped
+        // it" from "the sweep froze it": with restitution the correct answer is
+        // that it comes back, and a body whose velocity was zeroed by the sweep
+        // sits against the wall instead. Both look identical with restitution
+        // zero, which is why the tests above cannot see the difference.
+        {
+            World w;
+            w.gravity = Vec3{0, 0, 0};
+            Body wall;
+            wall.shape = Shape::MakeBox(Vec3{0.05f, 5, 5});
+            wall.SetMass(0.0f);
+            w.Add(wall);
+            Body bullet = Ball(Vec3{-4, 0, 0}, 0.05f, 0.6f);  // bouncy
+            bullet.bullet = true;
+            bullet.velocity = Vec3{300.0f, 0, 0};
+            bullet.SetMass(0.02f);
+            const int id = w.Add(bullet);
+            for (int i = 0; i < 6; ++i) w.StepFixed();
+            std::printf("    a bouncy bullet at 300 m/s comes back at %.2f m/s\n",
+                        w[id].velocity.x);
+            CHECK(w[id].velocity.x < -100.0f);   // reversed, and fast
+            CHECK(w[id].velocity.x > -300.0f);   // having lost energy
+        }
+
+        // TimeOfImpact on its own, where the answer is arithmetic. A unit
+        // sphere at x=0 moving +10 meets a unit sphere at x=5: their surfaces
+        // touch after 3 of travel, which is 0.3 of the motion.
+        Body p = Ball(Vec3{0, 0, 0}, 1.0f), q = Ball(Vec3{5, 0, 0}, 1.0f);
+        const float toi = TimeOfImpact(p, q, Vec3{10, 0, 0}, Vec3{0, 0, 0});
+        std::printf("    time of impact %.4f (exact 0.3)\n", toi);
+        CHECK(std::fabs(toi - 0.3f) < 2e-3f);
+
+        // Moving APART never impacts, and neither does motion that falls short.
+        CHECK(TimeOfImpact(p, q, Vec3{-10, 0, 0}, Vec3{0, 0, 0}) == 1.0f);
+        CHECK(TimeOfImpact(p, q, Vec3{2, 0, 0}, Vec3{0, 0, 0}) == 1.0f);
+        // Both moving: closing at 10 again, so the same answer.
+        CHECK(std::fabs(TimeOfImpact(p, q, Vec3{5, 0, 0}, Vec3{-5, 0, 0}) - 0.3f) <
+              2e-3f);
+        // Already touching: impact is now.
+        CHECK(TimeOfImpact(p, Ball(Vec3{2, 0, 0}, 1.0f), Vec3{1, 0, 0},
+                           Vec3{0, 0, 0}) < 1e-2f);
+    }
+
     if (g_failures == 0) std::printf("physics_test: all checks passed\n");
     return g_failures == 0 ? 0 : 1;
 }

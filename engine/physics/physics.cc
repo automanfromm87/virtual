@@ -696,6 +696,208 @@ bool CollideConvex(const Body& a, const Body& b, Contact* out) {
     return false;
 }
 
+// ------------------------------------------------------------- distance -----
+
+namespace {
+
+// The point of a simplex closest to the ORIGIN, with the simplex reduced to
+// only the vertices that actually support that point.
+//
+// This is the half of GJK that a boolean intersection test does not need, and
+// it is where the fiddly cases live: the answer may be a vertex, an edge, a
+// face or the interior, and carrying along vertices that do not contribute is
+// what makes the next iteration pick a direction it has already tried.
+Vec3 ClosestOnSimplex(SupportPoint* s, int& n) {
+    const auto keep = [&](int count, const int* which) {
+        SupportPoint tmp[4];
+        for (int i = 0; i < count; ++i) tmp[i] = s[which[i]];
+        for (int i = 0; i < count; ++i) s[i] = tmp[i];
+        n = count;
+    };
+
+    if (n == 1) return s[0].p;
+
+    if (n == 2) {
+        const Vec3 a = s[0].p, b = s[1].p, ab = b - a;
+        const float denom = Dot(ab, ab);
+        if (denom < 1e-20f) { const int k[1] = {0}; keep(1, k); return a; }
+        const float t = std::clamp(Dot(a * -1.0f, ab) / denom, 0.0f, 1.0f);
+        if (t <= 0.0f) { const int k[1] = {0}; keep(1, k); return a; }
+        if (t >= 1.0f) { const int k[1] = {1}; keep(1, k); return b; }
+        return a + ab * t;
+    }
+
+    if (n == 3) {
+        const Vec3 a = s[0].p, b = s[1].p, c = s[2].p;
+        const Vec3 ab = b - a, ac = c - a, ao = a * -1.0f;
+        const float d1 = Dot(ab, ao), d2 = Dot(ac, ao);
+        if (d1 <= 0.0f && d2 <= 0.0f) { const int k[1] = {0}; keep(1, k); return a; }
+        const Vec3 bo = b * -1.0f;
+        const float d3 = Dot(ab, bo), d4 = Dot(ac, bo);
+        if (d3 >= 0.0f && d4 <= d3) { const int k[1] = {1}; keep(1, k); return b; }
+        const float vc = d1 * d4 - d3 * d2;
+        if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+            const int k[2] = {0, 1};
+            const float t = d1 / (d1 - d3);
+            keep(2, k);
+            return a + ab * t;
+        }
+        const Vec3 co = c * -1.0f;
+        const float d5 = Dot(ab, co), d6 = Dot(ac, co);
+        if (d6 >= 0.0f && d5 <= d6) { const int k[1] = {2}; keep(1, k); return c; }
+        const float vb = d5 * d2 - d1 * d6;
+        if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+            const int k[2] = {0, 2};
+            const float t = d2 / (d2 - d6);
+            keep(2, k);
+            return a + ac * t;
+        }
+        const float va = d3 * d6 - d5 * d4;
+        if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
+            const int k[2] = {1, 2};
+            const float t = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+            keep(2, k);
+            return b + (c - b) * t;
+        }
+        const float denom = 1.0f / (va + vb + vc);
+        return a + ab * (vb * denom) + ac * (vc * denom);
+    }
+
+    // n == 4. The origin is inside unless it is outside a face; test each face
+    // that it is outside of and take the nearest.
+    const Vec3 p[4] = {s[0].p, s[1].p, s[2].p, s[3].p};
+    static const int kFace[4][3] = {{0, 1, 2}, {0, 2, 3}, {0, 3, 1}, {1, 3, 2}};
+    Vec3 best{0, 0, 0};
+    float best_d2 = 1e30f;
+    int best_keep[3] = {0, 1, 2};
+    int best_n = 0;
+    for (const auto& f : kFace) {
+        const Vec3 fa = p[f[0]], fb = p[f[1]], fc = p[f[2]];
+        const Vec3 nrm = Cross(fb - fa, fc - fa);
+        // The opposite vertex tells us which side is "in".
+        int opp = 0;
+        for (int i = 0; i < 4; ++i)
+            if (i != f[0] && i != f[1] && i != f[2]) opp = i;
+        const float side = Dot(nrm, p[opp] - fa);
+        const float here = Dot(nrm, fa * -1.0f);
+        // Origin on the same side as the opposite vertex: inside this face.
+        if (side * here >= 0.0f) continue;
+
+        SupportPoint sub[3] = {s[f[0]], s[f[1]], s[f[2]]};
+        int sn = 3;
+        const Vec3 q = ClosestOnSimplex(sub, sn);
+        const float d2 = Dot(q, q);
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best = q;
+            best_n = sn;
+            for (int i = 0; i < sn; ++i) {
+                // Map the reduced sub-simplex back to indices in `s`.
+                for (int j = 0; j < 3; ++j)
+                    if (Dot(sub[i].p - p[f[j]], sub[i].p - p[f[j]]) < 1e-20f)
+                        best_keep[i] = f[j];
+            }
+        }
+    }
+    if (best_n == 0) { n = 4; return Vec3{0, 0, 0}; }  // origin is inside
+    keep(best_n, best_keep);
+    return best;
+}
+
+}  // namespace
+
+float Distance(const Body& a, const Body& b, Vec3* normal, Vec3* point_a,
+               Vec3* point_b) {
+    Vec3 dir = b.position - a.position;
+    if (Dot(dir, dir) < 1e-12f) dir = Vec3{1, 0, 0};
+
+    SupportPoint s[4];
+    s[0] = MinkowskiSupport(a, b, dir);
+    int n = 1;
+    Vec3 closest = s[0].p;
+
+    for (int iter = 0; iter < 48; ++iter) {
+        closest = ClosestOnSimplex(s, n);
+        const float d2 = Dot(closest, closest);
+        if (d2 < 1e-12f || n == 4) {
+            if (normal) *normal = Vec3{0, 1, 0};
+            return 0.0f;  // overlapping; use CollideConvex for the depth
+        }
+        dir = closest * -1.0f;
+        const SupportPoint w = MinkowskiSupport(a, b, dir);
+        // No progress: the support in the direction of the origin is no closer
+        // than the point we already have, so this IS the closest feature.
+        // Comparing progress rather than iterating a fixed number of times is
+        // what makes the result exact for a flat face instead of nearly right.
+        const float progress = Dot(closest, closest) - Dot(w.p, closest);
+        if (progress <= 1e-9f * std::sqrt(d2)) break;
+        s[n++] = w;
+        if (n > 4) break;  // cannot happen with a reduced simplex; belt and braces
+    }
+
+    const float dist = Length(closest);
+    if (normal) *normal = dist > 1e-9f ? closest * (-1.0f / dist) : Vec3{0, 1, 0};
+    // Witnesses, by the same barycentric blend EPA uses. Only meaningful when
+    // the simplex has been reduced to the supporting feature, which it has.
+    if (point_a || point_b) {
+        Vec3 pa{0, 0, 0}, pb{0, 0, 0};
+        if (n == 1) {
+            pa = s[0].pa;
+            pb = s[0].pb;
+        } else if (n == 2) {
+            const Vec3 ab = s[1].p - s[0].p;
+            const float denom = Dot(ab, ab);
+            const float t = denom > 1e-20f
+                                ? std::clamp(Dot(closest - s[0].p, ab) / denom, 0.0f, 1.0f)
+                                : 0.0f;
+            pa = s[0].pa + (s[1].pa - s[0].pa) * t;
+            pb = s[0].pb + (s[1].pb - s[0].pb) * t;
+        } else {
+            float u, v, w2;
+            Barycentric(s[0].p, s[1].p, s[2].p, &u, &v, &w2);
+            pa = s[0].pa * u + s[1].pa * v + s[2].pa * w2;
+            pb = s[0].pb * u + s[1].pb * v + s[2].pb * w2;
+        }
+        if (point_a) *point_a = pa;
+        if (point_b) *point_b = pb;
+    }
+    return dist;
+}
+
+// ------------------------------------------------------------------ CCD -----
+
+float TimeOfImpact(const Body& a, const Body& b, Vec3 motion_a, Vec3 motion_b,
+                   float tolerance) {
+    // CONSERVATIVE ADVANCEMENT. Given the distance between two shapes and an
+    // upper bound on how fast that distance can close, there is a span of time
+    // in which they certainly cannot touch. Advance by exactly that, and
+    // repeat. Each step is provably safe, so the result never skips an impact
+    // -- which a fixed number of intermediate samples always eventually does,
+    // and only for the fast objects where it matters most.
+    const Vec3 relative = motion_a - motion_b;
+    const float speed = Length(relative);
+    if (speed < 1e-9f) return 1.0f;
+
+    Body ma = a, mb = b;
+    float t = 0.0f;
+    for (int iter = 0; iter < 32; ++iter) {
+        ma.position = a.position + motion_a * t;
+        mb.position = b.position + motion_b * t;
+        Vec3 n;
+        const float dist = Distance(ma, mb, &n, nullptr, nullptr);
+        if (dist <= tolerance) return t;
+        // The distance closes at most at the full relative speed -- it closes
+        // exactly that fast only when the motion is straight along the
+        // separating direction. Using the projected speed instead would be
+        // tighter and would also be WRONG here, because the direction turns as
+        // the bodies move.
+        const float advance = (dist - tolerance) / speed;
+        t += advance;
+        if (t >= 1.0f) return 1.0f;
+    }
+    return t;
+}
+
 void World::Collide() {
     contacts_.clear();
     stats_.pairs_tested = 0;
@@ -1037,7 +1239,61 @@ void World::StepFixed() {
         if (b.IsStatic() || b.sleeping) continue;
         if (linear_damping > 0.0f) b.velocity = b.velocity * lin;
         if (angular_damping > 0.0f) b.angular_velocity = b.angular_velocity * ang;
-        b.position = b.position + b.velocity * fixed_dt;
+        // CONTINUOUS collision, for the bodies that asked for it. The step is
+        // clipped at the first impact so the body lands ON the surface instead
+        // of past it; the discrete solver then resolves the contact next step,
+        // exactly as it would for anything slow. Nothing else in the pipeline
+        // has to know.
+        Vec3 motion = b.velocity * fixed_dt;
+        if (b.bullet && ccd_enabled) {
+            float toi = 1.0f;
+            for (const Body& other : bodies_) {
+                if (&other == &b) continue;
+                // Only against things that are not themselves moving fast: two
+                // bullets meeting is a case this does not claim to handle, and
+                // pretending otherwise by sweeping against a stale position
+                // would be worse than the honest gap.
+                if (!other.IsStatic() && !other.sleeping) continue;
+                // A cheap reject first. If the swept sphere of one cannot reach
+                // the bounding sphere of the other, no sweep is needed -- and
+                // that is the overwhelmingly common case, which is what keeps
+                // this affordable at all.
+                const float reach = b.shape.radius + other.shape.radius +
+                                    Length(motion);
+                if (Dot(other.position - b.position, other.position - b.position) >
+                    reach * reach)
+                    continue;
+                toi = std::fmin(toi, TimeOfImpact(b, other, motion, Vec3{0, 0, 0}));
+            }
+            if (toi < 1.0f) {
+                // Stop a little PAST the touch point, not exactly on it.
+                //
+                // The discrete narrowphase needs an actual overlap to produce a
+                // contact. Landing exactly on the surface produces none, so the
+                // solver never runs, the velocity is never resolved, and next
+                // step the time of impact is zero again -- the body sits
+                // against the wall frozen, holding its full speed, and leaps
+                // forward if the wall ever moves. That is a worse failure than
+                // tunnelling, because it looks correct.
+                //
+                // Overshooting by a few millimetres hands the body to the
+                // ordinary contact path with a shallow penetration, which is
+                // exactly the state a slow-moving body would have arrived in.
+                constexpr float kSlop = 4e-3f;
+                const float len = Length(motion);
+                const float extra = len > 1e-9f ? kSlop / len : 0.0f;
+                motion = motion * std::fmin(1.0f, toi + extra);
+                // The velocity is NOT zeroed. The body has only been stopped
+                // early in time, not in space: it is touching the surface with
+                // its speed intact, and the next step's contact resolution is
+                // what decides whether it bounces, slides or stops. Killing the
+                // velocity here would make every fast impact a dead stop and
+                // quietly disable restitution for exactly the objects most
+                // likely to need it.
+                ++stats_.toi_clamps;
+            }
+        }
+        b.position = b.position + motion;
 
         // Orientation from angular velocity: q̇ = ½ ω q, integrated and
         // renormalised. The renormalise is not optional — the first-order step

@@ -107,6 +107,14 @@ struct Body {
     // which is how a static body and a rotation constraint are both expressed.
     Vec3 inverse_inertia{0.0f, 0.0f, 0.0f};
 
+    // CONTINUOUS collision for this body. Off by default and deliberately so:
+    // it costs a sweep against every candidate, and for anything moving less
+    // than its own size per step the ordinary discrete test already sees the
+    // overlap. Turn it on for the things that do not -- a bullet, a thrown
+    // object, anything small and fast -- where the discrete test samples the
+    // start and the end of the step and the wall was only ever in between.
+    bool bullet = false;
+
     float restitution = 0.35f;  // 0 = dead drop, 1 = never loses energy
     float friction = 0.5f;
 
@@ -151,6 +159,10 @@ struct WorldStats {
     int steps = 0;
     int contacts = 0;
     int pairs_tested = 0;
+    // How many times a bullet's step was cut short by an impact. Zero on a
+    // scene with nothing fast in it, and the number to look at when something
+    // fast still goes through a wall.
+    int toi_clamps = 0;
 };
 
 // A constraint between two bodies, solved alongside the contacts.
@@ -201,6 +213,9 @@ class World {
     // up and is choosing plausibility over the conservation law, knowingly.
     float linear_damping = 0.0f;
     float angular_damping = 0.0f;
+    // A master switch for continuous collision, so it can be turned off
+    // wholesale to see what it was costing -- or what it was hiding.
+    bool ccd_enabled = true;
 
     // Below these speeds a body counts as still. After `sleep_after` seconds of
     // that, it sleeps. Zero disables sleeping entirely, which is what the
@@ -287,5 +302,18 @@ class World {
 // directly can check a shape's support function without going through a
 // collision at all.
 [[nodiscard]] Vec3 Support(const Body& body, Vec3 dir);
+
+// The distance between two convex bodies, and the nearest points on each.
+// Zero when they overlap -- the depth is CollideConvex's job, and conflating
+// the two would mean every distance query paid for an EPA it did not need.
+[[nodiscard]] float Distance(const Body& a, const Body& b, Vec3* normal = nullptr,
+                             Vec3* point_a = nullptr, Vec3* point_b = nullptr);
+
+// The fraction of the given motion at which two bodies first touch, or 1 if
+// they do not touch within it. Rotation is ignored, which is what makes the
+// bound conservative and cheap; for the fast-moving thing CCD exists for, the
+// translation dominates by orders of magnitude.
+[[nodiscard]] float TimeOfImpact(const Body& a, const Body& b, Vec3 motion_a,
+                                 Vec3 motion_b, float tolerance = 1e-3f);
 
 }  // namespace eng::physics
