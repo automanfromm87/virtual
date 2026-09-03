@@ -19,7 +19,7 @@ int Fail(const std::string& error) {
 int main() {
     std::string error;
     eng::app::Config config;
-    config.title = "virtual — skeletal animation";
+    config.title = "virtual — a flag, skinned";
     auto app = eng::app::App::Create(config, error);
     if (!app) return Fail(error);
 
@@ -35,15 +35,16 @@ int main() {
     app->Actions().BindAxis("scrub", ',', '.');
 
     eng::OrbitController orbit;
-    orbit.target = eng::Vec3{0.0f, 2.0f, 0.0f};
-    orbit.distance = 9.0f;
-    orbit.pitch = 0.28f;
+    orbit.target = eng::Vec3{1.4f, 2.9f, 0.0f};
+    orbit.distance = 8.5f;
+    orbit.yaw = 1.32f;
+    orbit.pitch = 0.20f;
 
     float clip_time = 0.0f;
     std::printf(
         "drag: orbit   scroll: zoom   space: pause   , .: scrub   r: reset\n"
-        "%d joints, %zu vertices, one draw call   esc: quit\n",
-        demo::kJoints, assets.tentacle.mesh.vertices.size());
+        "%d bones, %zu vertices, one draw call   esc: quit\n",
+        demo::kJoints, assets.flag.mesh.vertices.size());
 
     eng::RenderGraph graph;
     while (app->Running()) {

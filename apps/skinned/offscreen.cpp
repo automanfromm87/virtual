@@ -69,13 +69,13 @@ int main() {
     // A skin array that does not match the vertex count would leave the tail of
     // the mesh reading whatever followed it.
     {
-        std::vector<eng::anim::SkinVertex> truncated = assets.tentacle.skin;
+        std::vector<eng::anim::SkinVertex> truncated = assets.flag.skin;
         truncated.pop_back();
-        Check(!Valid(renderer->UploadSkinnedMesh(assets.tentacle.mesh, truncated,
+        Check(!Valid(renderer->UploadSkinnedMesh(assets.flag.mesh, truncated,
                                                  demo::kJoints)),
               "a short skin array is refused, not clamped");
-        Check(!Valid(renderer->UploadSkinnedMesh(assets.tentacle.mesh,
-                                                 assets.tentacle.skin, 999)),
+        Check(!Valid(renderer->UploadSkinnedMesh(assets.flag.mesh,
+                                                 assets.flag.skin, 999)),
               "a palette larger than the ring is refused");
     }
 
@@ -127,17 +127,19 @@ int main() {
         (void)dev->ReadPixels(color, kW, kH, pixels);
     };
 
-    // The tentacle is warm; the ground is neutral and the background is dark
-    // blue. Picking it out by hue rather than by "not background" is what lets
-    // the extent be measured without the floor dragging it out to the edges.
-    auto TentacleBox = [&]() {
+    // The flag's bars are red and near-white; the ground is a desaturated
+    // green and the pole is dark. Picking the flag out by hue rather than by
+    // "not background" is what lets its extent be measured without the ground
+    // dragging the box out to the edges of the frame.
+    auto FlagBox = [&]() {
         Box b;
         for (int y = 0; y < kH; ++y)
             for (int x = 0; x < kW; ++x) {
                 const std::size_t i = (std::size_t(y) * kW + x) * 4;
-                if (int(pixels[i]) > int(pixels[i + 1]) + 25 &&
-                    int(pixels[i]) > int(pixels[i + 2]) + 25)
-                    b.Add(float(x), float(y));
+                const int r = pixels[i], g = pixels[i + 1], bl = pixels[i + 2];
+                const bool red = r > g + 40 && r > bl + 40;
+                const bool white = r > 150 && g > 140 && bl > 130 && r >= g && g >= bl - 8;
+                if (red || white) b.Add(float(x), float(y));
             }
         return b;
     };
@@ -158,12 +160,12 @@ int main() {
     // The same vertices, posed by engine/anim and projected by hand.
     auto CpuBox = [&](const eng::Scene& scene) {
         const eng::Mat4 vp = scene.camera.ViewProj(float(kW) / float(kH));
-        const eng::Mat4 model = demo::TentacleModel();
+        const eng::Mat4 model = demo::FlagModel();
         Box b;
-        for (std::size_t i = 0; i < assets.tentacle.mesh.vertices.size(); ++i) {
-            const eng::Vec4& p = assets.tentacle.mesh.vertices[i].position;
+        for (std::size_t i = 0; i < assets.flag.mesh.vertices.size(); ++i) {
+            const eng::Vec4& p = assets.flag.mesh.vertices[i].position;
             const eng::Vec3 skinned = eng::anim::SkinPosition(
-                eng::Vec3{p.x, p.y, p.z}, assets.tentacle.skin[i],
+                eng::Vec3{p.x, p.y, p.z}, assets.flag.skin[i],
                 scene.joint_matrices);
             const eng::Vec4 world =
                 model * eng::Vec4{skinned.x, skinned.y, skinned.z, 1.0f};
@@ -176,28 +178,32 @@ int main() {
     };
 
     auto Camera = [](eng::Scene& s) {
-        s.camera.eye = eng::Vec3{5.4f, 3.1f, 5.4f};
-        s.camera.target = eng::Vec3{0.0f, 2.0f, 0.0f};
+        // Oblique, not head on. A flag seen face-on hides its own ripple: the
+        // wave travels in z, and straight down the z axis that is exactly the
+        // direction you cannot see.
+        s.camera.eye = eng::Vec3{-3.6f, 4.3f, 6.4f};
+        s.camera.target = eng::Vec3{1.4f, 2.9f, 0.0f};
     };
 
     std::printf("gpu skinning agrees with the cpu reference\n");
     {
         // Several times through the clip, because one pose can agree by luck —
         // the bind pose agrees even with the palette ignored entirely.
-        const float kTimes[] = {0.0f, 0.35f, 0.9f, 1.4f, 1.85f};
+        const float kTimes[] = {0.0f, 0.3f, 0.7f, 1.1f, 1.5f};
         float worst = 0.0f;
         bool all_close = true;
         for (float t : kTimes) {
             eng::Scene s = demo::MakeScene(assets, t);
-            // WITHOUT the ground. Its top face is at y = 0 and so is the
-            // tentacle's base, so it hides the lowest rings — the CPU box
-            // counts vertices the GPU correctly never showed, and the
-            // difference is a constant 12 px on the bottom edge at every pose,
-            // which is what gave it away as occlusion rather than skinning.
-            s.instances.erase(s.instances.begin());
+            // The FLAG only. Anything else in the frame can occlude it, and an
+            // occluded vertex is one the CPU box counts and the GPU correctly
+            // never showed — which is what the first version of this check
+            // mistook for a skinning error.
+            const eng::Instance flag = s.instances.back();
+            s.instances.clear();
+            s.instances.push_back(flag);
             Camera(s);
             draw(s);
-            const Box gpu = TentacleBox();
+            const Box gpu = FlagBox();
             const Box cpu = CpuBox(s);
             if (gpu.Empty() || cpu.Empty()) {
                 all_close = false;
@@ -240,14 +246,14 @@ int main() {
         eng::Scene rest = demo::MakeScene(assets, 0.0f);
         Camera(rest);
         draw(rest);
-        const Box a = TentacleBox();
-        Check(stats.draws == 2 && stats.culled == 0,
-              "both instances drew; the posed mesh was not culled on bind bounds");
+        const Box a = FlagBox();
+        Check(stats.draws == 4 && stats.culled == 0,
+              "every instance drew; the posed flag was not culled on bind bounds");
 
-        eng::Scene bent = demo::MakeScene(assets, 0.9f);
+        eng::Scene bent = demo::MakeScene(assets, 0.55f);
         Camera(bent);
         draw(bent);
-        const Box b = TentacleBox();
+        const Box b = FlagBox();
         const float moved = std::fabs(a.x1 - b.x1) + std::fabs(a.y0 - b.y0);
         std::printf("    silhouette moved %.1f px between poses\n", moved);
         Check(moved > 12.0f, "posing the skeleton visibly moves the mesh");
@@ -255,7 +261,7 @@ int main() {
         // Every joint after the root sways with its own phase, so the tip
         // travels much further than the base. A rigid rotation of the whole
         // mesh would move both by the same amount.
-        Check(shadow_draws == 2, "the skinned mesh was also drawn into the shadow map");
+        Check(shadow_draws == 4, "the skinned mesh was also drawn into the shadow map");
     }
 
     std::printf("an unskinned instance is unaffected\n");
@@ -263,13 +269,14 @@ int main() {
         // The ground shares the frame and has no palette. If the renderer bound
         // a stale palette to it, or picked the skinned pipeline, it would
         // deform or vanish.
-        eng::Scene s = demo::MakeScene(assets, 0.6f);
+        eng::Scene s = demo::MakeScene(assets, 0.45f);
         Camera(s);
         draw(s);
         int ground_pixels = 0;
         for (std::size_t i = 0; i < pixels.size(); i += 4) {
             const int r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
-            if (std::abs(r - g) < 12 && std::abs(g - b) < 14 && r > 60) ++ground_pixels;
+            // The ground is desaturated green: g above both, and not bright.
+            if (g > r + 3 && g > b + 3 && g < 190 && g > 50) ++ground_pixels;
         }
         Check(ground_pixels > 20000, "the static ground still drew, undeformed");
         Check(stats.invalid == 0 && stats.overflowed == 0, "nothing was dropped");
@@ -349,9 +356,9 @@ int main() {
         }
     }
 
-    std::FILE* f = std::fopen("skinned.ppm", "wb");
+    std::FILE* f = std::fopen("flag.ppm", "wb");
     if (f) {
-        eng::Scene s = demo::MakeScene(assets, 0.75f);
+        eng::Scene s = demo::MakeScene(assets, 0.42f);
         Camera(s);
         draw(s);
         std::fprintf(f, "P6\n%d %d\n255\n", kW, kH);

@@ -1,13 +1,16 @@
-// A skinned tentacle, generated rather than imported.
+// A flag on a pole, waving.
 //
-// Two reasons it is procedural. A checked-in character would be tens of
-// thousands of vertices of content in a repository that has none; and a
-// generated one has a KNOWN answer — every vertex's joint weights are decided
-// by a formula here, so the test can compute where each one should end up
-// rather than trusting the picture.
+// Generated rather than imported, for two reasons. A checked-in character would
+// be tens of thousands of vertices of content in a repository that has none;
+// and a generated mesh has a KNOWN answer — every vertex's joint weights come
+// from a formula here, so the gate can compute where each one should end up
+// instead of trusting the picture.
 //
-// The imported fixture is exercised separately, in the offscreen gate: import
-// and skinning are different things to get wrong.
+// A flag is the honest demonstration of skinning rather than a decorative one.
+// The mesh is a single rigid vertex buffer that never changes; every ripple in
+// it is a chain of joint rotations blended per vertex. The failure modes are
+// legible too: weights that are wrong tear the flag at the pole, and a stale
+// palette leaves it hanging flat.
 #pragma once
 
 #include <cmath>
@@ -21,192 +24,213 @@
 
 namespace demo {
 
-inline constexpr int kJoints = 8;
-inline constexpr float kSegmentLength = 0.62f;
-inline constexpr int kRingsPerSegment = 3;
-inline constexpr int kRingVerts = 12;
+inline constexpr int kJoints = 10;         // bones from the hoist to the fly
+inline constexpr float kFlagWidth = 3.0f;  // pole to trailing edge
+inline constexpr float kFlagHeight = 1.85f;
+inline constexpr int kSpanCols = 40;  // grid resolution along the wave
+inline constexpr int kSpanRows = 14;
+inline constexpr float kPoleHeight = 4.0f;
+inline constexpr float kFlagTop = 3.7f;
 
-struct Tentacle {
+inline constexpr float Spacing() { return kFlagWidth / float(kJoints - 1); }
+
+struct Flag {
     eng::Mesh mesh;
     std::vector<eng::anim::SkinVertex> skin;
     eng::anim::Skeleton skeleton;
     eng::anim::Clip clip;
 };
 
-// A tube along +x, jointed every kSegmentLength.
+// A grid in the local xy plane, x running from the hoist (0) to the fly
+// (kFlagWidth), jointed every Spacing() along x.
 //
-// Weights come from the distance along the tube, so every ring between two
-// joints is a smooth blend of the pair. That is what makes the bend look like
-// a bend rather than a hinge, and it is also the case that exposes a palette
-// built in the wrong order — a rigid one-joint-per-vertex mesh does not.
-inline Tentacle MakeTentacle() {
-    Tentacle t;
+// Built as TWO sheets a hair apart with opposite winding and opposite normals,
+// rather than one sheet drawn two-sided. A single sheet lit from behind has a
+// normal pointing away from the light and comes out black — and a flag spends
+// half of every wave with its back to the sun.
+inline Flag MakeFlag() {
+    Flag f;
 
     for (int j = 0; j < kJoints; ++j) {
         eng::anim::Joint joint;
         joint.name = "bone" + std::to_string(j);
         joint.parent = j == 0 ? -1 : j - 1;
-        // Local: each bone sits one segment along its parent. The root sits at
-        // the origin, so the whole chain runs from x = 0.
-        joint.rest.translation =
-            eng::Vec3{j == 0 ? 0.0f : kSegmentLength, 0.0f, 0.0f};
-        // Bind pose = rest pose, so the inverse bind is a translation back to
-        // the origin by however far along the tube the joint sits.
+        joint.rest.translation = eng::Vec3{j == 0 ? 0.0f : Spacing(), 0.0f, 0.0f};
+        // Bind pose = rest pose, so the inverse bind is the walk back along the
+        // chain to the origin.
         joint.inverse_bind =
-            eng::Mat4::Translation(eng::Vec3{-kSegmentLength * float(j), 0, 0});
-        t.skeleton.joints.push_back(joint);
+            eng::Mat4::Translation(eng::Vec3{-Spacing() * float(j), 0.0f, 0.0f});
+        f.skeleton.joints.push_back(joint);
     }
-    t.skeleton.Finalize();
+    f.skeleton.Finalize();
 
-    const int rings = (kJoints - 1) * kRingsPerSegment + 1;
-    for (int r = 0; r < rings; ++r) {
-        const float along = float(r) / float(kRingsPerSegment);  // in joint units
-        const float x = along * kSegmentLength;
-        // Tapered, so the far end is visibly thinner and the silhouette says
-        // which way round the tentacle is.
-        const float radius = 0.30f * (1.0f - 0.55f * float(r) / float(rings - 1));
+    const int verts_per_sheet = (kSpanCols + 1) * (kSpanRows + 1);
+    for (int side = 0; side < 2; ++side) {
+        const float z = side == 0 ? 0.008f : -0.008f;
+        const float nz = side == 0 ? 1.0f : -1.0f;
+        for (int r = 0; r <= kSpanRows; ++r) {
+            for (int c = 0; c <= kSpanCols; ++c) {
+                const float u = float(c) / float(kSpanCols);
+                const float v = float(r) / float(kSpanRows);
+                const float x = u * kFlagWidth;
 
-        const int lo = std::min(int(along), kJoints - 1);
-        const int hi = std::min(lo + 1, kJoints - 1);
-        const float frac = along - float(lo);
+                VertexIn vert{};
+                vert.position = eng::Vec4{x, (v - 0.5f) * kFlagHeight, z, 0.0f};
+                vert.normal = eng::Vec4{0.0f, 0.0f, nz, 0.0f};
+                // Vertical bars, so the travelling wave is legible: they
+                // compress and stretch as it passes. A plain colour would leave
+                // the flag looking like a sheet of paper flexing.
+                const bool bar = int(u * 6.0f) % 2 == 0;
+                vert.color = bar ? eng::Vec4{0.92f, 0.30f, 0.26f, 1.0f}
+                                 : eng::Vec4{0.97f, 0.95f, 0.90f, 1.0f};
+                vert.uv = eng::Vec4{u, 1.0f - v, 0.0f, 0.0f};
+                f.mesh.vertices.push_back(vert);
 
-        for (int k = 0; k < kRingVerts; ++k) {
-            const float a = float(k) / float(kRingVerts) * 6.2831853f;
-            VertexIn v{};
-            v.position = eng::Vec4{x, std::cos(a) * radius, std::sin(a) * radius, 0};
-            v.normal = eng::Vec4{0.0f, std::cos(a), std::sin(a), 0.0f};
-            // Two shades around the ring, so a rotating tentacle does not look
-            // frozen — the same reason the rolling balls are chequered.
-            v.color = (k % 2) ? eng::Vec4{1, 1, 1, 1} : eng::Vec4{0.62f, 0.66f, 0.72f, 1};
-            v.uv = eng::Vec4{float(k) / float(kRingVerts), along, 0, 0};
-            t.mesh.vertices.push_back(v);
-
-            eng::anim::SkinVertex sv;
-            sv.joints[0] = std::uint16_t(lo);
-            sv.joints[1] = std::uint16_t(hi);
-            sv.weights[0] = 1.0f - frac;
-            sv.weights[1] = frac;
-            eng::anim::NormalizeWeights(&sv);
-            t.skin.push_back(sv);
+                // Weights from the position along x: every column between two
+                // bones is a blend of the pair, which is what makes the wave
+                // smooth rather than a row of hinges.
+                const float along = x / Spacing();
+                const int lo = std::min(int(along), kJoints - 1);
+                const int hi = std::min(lo + 1, kJoints - 1);
+                eng::anim::SkinVertex sv;
+                sv.joints[0] = std::uint16_t(lo);
+                sv.joints[1] = std::uint16_t(hi);
+                sv.weights[0] = 1.0f - (along - float(lo));
+                sv.weights[1] = along - float(lo);
+                eng::anim::NormalizeWeights(&sv);
+                f.skin.push_back(sv);
+            }
+        }
+        const int base = side * verts_per_sheet;
+        for (int r = 0; r < kSpanRows; ++r) {
+            for (int c = 0; c < kSpanCols; ++c) {
+                const auto a = std::uint16_t(base + r * (kSpanCols + 1) + c);
+                const auto b = std::uint16_t(a + 1);
+                const auto d = std::uint16_t(a + kSpanCols + 1);
+                const auto e = std::uint16_t(d + 1);
+                // a->e->d is counter-clockwise seen from +z: the cross product
+                // of (e-a) and (d-a) is +z, which is what side 0's vertex
+                // normal claims. Wound the other way the sheet whose normal
+                // faces the light is the one back-face culling throws away, and
+                // the flag renders as its own unlit reverse — dark, plausible,
+                // and nothing to do with the skinning.
+                if (side == 0)
+                    f.mesh.indices.insert(f.mesh.indices.end(), {a, e, d, a, b, e});
+                else
+                    f.mesh.indices.insert(f.mesh.indices.end(), {a, d, e, a, e, b});
+            }
         }
     }
-    for (int r = 0; r + 1 < rings; ++r) {
-        for (int k = 0; k < kRingVerts; ++k) {
-            const auto a = std::uint16_t(r * kRingVerts + k);
-            const auto b = std::uint16_t(r * kRingVerts + (k + 1) % kRingVerts);
-            const auto c = std::uint16_t((r + 1) * kRingVerts + k);
-            const auto d = std::uint16_t((r + 1) * kRingVerts + (k + 1) % kRingVerts);
-            t.mesh.indices.insert(t.mesh.indices.end(), {a, c, d, a, d, b});
-        }
-    }
-    // End caps. An open tube shows its own unlit interior down the barrel,
-    // which reads as a black hole at the base.
-    {
-        const auto first_centre = std::uint16_t(t.mesh.vertices.size());
-        VertexIn c{};
-        c.position = eng::Vec4{0, 0, 0, 0};
-        c.normal = eng::Vec4{-1, 0, 0, 0};
-        c.color = eng::Vec4{1, 1, 1, 1};
-        t.mesh.vertices.push_back(c);
-        t.skin.push_back(t.skin[0]);
-        for (int k = 0; k < kRingVerts; ++k)
-            t.mesh.indices.insert(t.mesh.indices.end(),
-                                  {first_centre, std::uint16_t((k + 1) % kRingVerts),
-                                   std::uint16_t(k)});
 
-        const int last_ring = (rings - 1) * kRingVerts;
-        const auto last_centre = std::uint16_t(t.mesh.vertices.size());
-        VertexIn e{};
-        e.position = eng::Vec4{float(rings - 1) / float(kRingsPerSegment) *
-                                   kSegmentLength, 0, 0, 0};
-        e.normal = eng::Vec4{1, 0, 0, 0};
-        e.color = eng::Vec4{1, 1, 1, 1};
-        t.mesh.vertices.push_back(e);
-        t.skin.push_back(t.skin[std::size_t(last_ring)]);
-        for (int k = 0; k < kRingVerts; ++k)
-            t.mesh.indices.insert(
-                t.mesh.indices.end(),
-                {last_centre, std::uint16_t(last_ring + k),
-                 std::uint16_t(last_ring + (k + 1) % kRingVerts)});
-    }
+    // Bounds cover the BIND pose. A waving flag reaches outside them, so they
+    // are padded — the renderer culls on these, and a flag that vanishes as it
+    // ripples toward the screen edge is worse than one drawn a frame too long.
+    f.mesh.bounds.center = eng::Vec3{kFlagWidth * 0.5f, 0.0f, 0.0f};
+    f.mesh.bounds.radius = kFlagWidth;
 
-    // Bounds cover the BIND pose only. A posed tentacle reaches outside them,
-    // which is why the renderer must not frustum-cull a skinned mesh on them —
-    // see the note in the offscreen gate.
-    t.mesh.bounds.center = eng::Vec3{kSegmentLength * float(kJoints - 1) * 0.5f, 0, 0};
-    t.mesh.bounds.radius = kSegmentLength * float(kJoints);
-
-    // The clip: every joint after the root sways, each a little later than the
-    // one before, which is what makes it read as a travelling wave rather than
-    // the whole thing rotating at once.
-    t.clip.name = "wave";
-    t.clip.duration = 2.0f;
+    // The wave. Each bone turns about the flag's vertical axis a little later
+    // than the one before, which is what sends a ripple down the flag instead
+    // of swinging the whole thing at once.
+    //
+    // Bone 0 is left alone: it is the hoist, lashed to the pole. Animating it
+    // would swing the flag off its own pole, which is the most obvious way for
+    // a flag to look wrong.
+    f.clip.name = "wave";
+    f.clip.duration = 1.6f;
+    constexpr int kKeys = 24;
     for (int j = 1; j < kJoints; ++j) {
         eng::anim::Channel ch;
         ch.joint = j;
         ch.path = eng::anim::Path::Rotation;
         ch.interp = eng::anim::Interp::Linear;
-        const float phase = float(j) * 0.55f;
-        const float amplitude = 0.38f;
-        for (int k = 0; k <= 8; ++k) {
-            const float time = float(k) / 8.0f * t.clip.duration;
+        // Rotations COMPOUND down the chain, so a constant per-bone angle
+        // already gives a tip that swings far. The ramp only stops the first
+        // couple of bones from snapping at the hoist.
+        const float ramp = std::min(1.0f, float(j) / 3.0f);
+        const float amplitude = 0.42f * ramp;
+        const float phase = float(j) * 0.92f;
+        for (int k = 0; k <= kKeys; ++k) {
+            const float time = float(k) / float(kKeys) * f.clip.duration;
             ch.times.push_back(time);
-            const float angle =
-                std::sin(time / t.clip.duration * 6.2831853f - phase) * amplitude;
-            const eng::Quat q = eng::QuatFromAxisAngle(eng::Vec3{0, 0, 1}, angle);
+            const float theta = time / f.clip.duration * 6.2831853f;
+            const eng::Quat yaw = eng::QuatFromAxisAngle(
+                eng::Vec3{0, 1, 0}, std::sin(theta - phase) * amplitude);
+            // A little roll as well, at half the rate, so the fly edge lifts
+            // and drops instead of staying dead flat.
+            const eng::Quat roll = eng::QuatFromAxisAngle(
+                eng::Vec3{1, 0, 0}, std::sin(theta * 0.5f - phase) * amplitude * 0.5f);
+            const eng::Quat q = yaw * roll;
             ch.values.insert(ch.values.end(), {q.x, q.y, q.z, q.w});
         }
-        t.clip.channels.push_back(std::move(ch));
+        f.clip.channels.push_back(std::move(ch));
     }
-    return t;
+    return f;
 }
 
 struct Assets {
-    Tentacle tentacle;
+    Flag flag;
     eng::MeshHandle mesh;
+    eng::MeshHandle pole;
+    eng::MeshHandle finial;
     eng::MeshHandle ground;
-    eng::MaterialHandle skin_mat, ground_mat;
+    eng::MaterialHandle flag_mat, pole_mat, finial_mat, ground_mat;
     bool ok = false;
 };
 
 inline Assets Build(eng::Renderer& r, std::string& error) {
     Assets a;
-    a.tentacle = MakeTentacle();
-    a.mesh = r.UploadSkinnedMesh(a.tentacle.mesh, a.tentacle.skin, kJoints);
+    a.flag = MakeFlag();
+    a.mesh = r.UploadSkinnedMesh(a.flag.mesh, a.flag.skin, kJoints);
+    a.pole = r.UploadMesh(eng::MakeBox(eng::Vec3{0.045f, kPoleHeight * 0.5f, 0.045f},
+                                       eng::Vec4{1, 1, 1, 1}));
+    a.finial = r.UploadMesh(eng::MakeUVSphere(0.10f, 16, 24, eng::Vec4{1, 1, 1, 1},
+                                              eng::Vec4{1, 1, 1, 1}));
     a.ground = r.UploadMesh(
-        eng::MakeBox(eng::Vec3{6.0f, 0.25f, 6.0f}, eng::Vec4{1, 1, 1, 1}));
+        eng::MakeBox(eng::Vec3{7.0f, 0.25f, 7.0f}, eng::Vec4{1, 1, 1, 1}));
 
     eng::MaterialDesc md;
-    md.base_color = eng::Vec4{0.85f, 0.45f, 0.30f, 1.0f};
-    md.roughness = 0.42f;
-    a.skin_mat = r.CreateMaterial(md, error);
+    // The bars come from vertex colour, so the material stays white and lets
+    // them through.
+    md.base_color = eng::Vec4{1.0f, 1.0f, 1.0f, 1.0f};
+    md.roughness = 0.62f;
+    a.flag_mat = r.CreateMaterial(md, error);
 
-    md.base_color = eng::Vec4{0.52f, 0.54f, 0.57f, 1.0f};
-    md.roughness = 0.85f;
+    md.base_color = eng::Vec4{0.34f, 0.35f, 0.38f, 1.0f};
+    md.roughness = 0.35f;
+    md.metallic = 0.7f;
+    a.pole_mat = r.CreateMaterial(md, error);
+
+    md.base_color = eng::Vec4{0.85f, 0.68f, 0.24f, 1.0f};
+    md.roughness = 0.22f;
+    md.metallic = 1.0f;
+    a.finial_mat = r.CreateMaterial(md, error);
+
+    md = eng::MaterialDesc{};
+    md.base_color = eng::Vec4{0.38f, 0.50f, 0.32f, 1.0f};
+    md.roughness = 0.9f;
     a.ground_mat = r.CreateMaterial(md, error);
 
-    a.ok = error.empty() && Valid(a.mesh) && Valid(a.ground);
+    a.ok = error.empty() && Valid(a.mesh) && Valid(a.pole) && Valid(a.ground);
     return a;
 }
 
-// The tentacle stands upright: the chain is modelled along +x, so a quarter
-// turn about -z points it at the sky.
-inline eng::Mat4 TentacleModel() {
-    return eng::Mat4::Translation(eng::Vec3{0.0f, 0.0f, 0.0f}) *
-           QuatToMat4(eng::QuatFromAxisAngle(eng::Vec3{0, 0, 1}, 1.5707963f));
+// The flag hangs from the top of the pole, its hoist a whisker clear of it.
+inline eng::Mat4 FlagModel() {
+    return eng::Mat4::Translation(
+        eng::Vec3{0.06f, kFlagTop - kFlagHeight * 0.5f, 0.0f});
 }
 
 inline eng::Scene MakeScene(const Assets& a, float time) {
     eng::Scene s;
-    s.lightDir = eng::Vec4{-0.38f, 0.80f, -0.46f, 0.0f};
-    s.lightColor = eng::Vec4{4.2f, 4.1f, 3.9f, 1.0f};
-    s.shadowExtent = 7.0f;
+    s.lightDir = eng::Vec4{-0.44f, 0.72f, 0.53f, 0.0f};
+    s.lightColor = eng::Vec4{4.0f, 3.9f, 3.7f, 1.0f};
+    s.shadowExtent = 6.5f;
 
     eng::anim::Pose pose;
-    a.tentacle.clip.Sample(time, a.tentacle.skeleton, &pose);
-    // The palette goes into the scene, not the renderer: the scene describes
+    a.flag.clip.Sample(time, a.flag.skeleton, &pose);
+    // The palette lives in the scene, not in the renderer: a scene describes
     // what to draw, and a pose is part of that description.
-    eng::anim::ComputeJointMatrices(a.tentacle.skeleton, pose, &s.joint_matrices);
+    eng::anim::ComputeJointMatrices(a.flag.skeleton, pose, &s.joint_matrices);
 
     eng::Instance ground;
     ground.mesh = a.ground;
@@ -214,12 +238,24 @@ inline eng::Scene MakeScene(const Assets& a, float time) {
     ground.model = eng::Mat4::Translation(eng::Vec3{0.0f, -0.25f, 0.0f});
     s.instances.push_back(ground);
 
-    eng::Instance tentacle;
-    tentacle.mesh = a.mesh;
-    tentacle.material = a.skin_mat;
-    tentacle.model = TentacleModel();
-    tentacle.palette = 0;  // offset into s.joint_matrices
-    s.instances.push_back(tentacle);
+    eng::Instance pole;
+    pole.mesh = a.pole;
+    pole.material = a.pole_mat;
+    pole.model = eng::Mat4::Translation(eng::Vec3{0.0f, kPoleHeight * 0.5f, 0.0f});
+    s.instances.push_back(pole);
+
+    eng::Instance finial;
+    finial.mesh = a.finial;
+    finial.material = a.finial_mat;
+    finial.model = eng::Mat4::Translation(eng::Vec3{0.0f, kPoleHeight + 0.06f, 0.0f});
+    s.instances.push_back(finial);
+
+    eng::Instance flag;
+    flag.mesh = a.mesh;
+    flag.material = a.flag_mat;
+    flag.model = FlagModel();
+    flag.palette = 0;  // offset into s.joint_matrices
+    s.instances.push_back(flag);
     return s;
 }
 
