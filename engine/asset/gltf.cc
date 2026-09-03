@@ -1,5 +1,7 @@
 #include "engine/asset/gltf.h"
 
+#include "engine/asset/jpeg.h"
+
 #include "engine/asset/png.h"
 
 #include <algorithm>
@@ -435,7 +437,11 @@ Document ParseGltf(std::string_view json_text, const std::vector<std::uint8_t>& 
             Texture2D decoded;
             if (!view.empty()) {
                 std::string ignored;
-                decoded = png::Decode(view, ignored);
+                // Sniffed from the BYTES, not from the declared mimeType. glTF
+                // makes mimeType optional for a bufferView image and exporters
+                // get it wrong when it is present; the magic number never lies.
+                decoded = jpeg::IsJpeg(view) ? jpeg::Decode(view, ignored)
+                                             : png::Decode(view, ignored);
             }
             doc.images.push_back(std::move(decoded));
             doc.image_uris.emplace_back();
@@ -910,6 +916,27 @@ Document ParseGlb(std::span<const std::uint8_t> bytes, std::string& error) {
     return ParseGltf(json, bin, error);
 }
 
+namespace {
+
+// One file, either format, chosen by its first bytes. The extension is not
+// consulted: a .png that is really a jpeg is common enough in asset pipelines
+// that trusting the name means a black texture and no error.
+Texture2D DecodeImageFile(const std::string& path, std::string& error) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        error = "image: cannot open " + path;
+        return {};
+    }
+    // Braces, not parens: with parens this is the most vexing parse and
+    // declares a function taking two iterators.
+    const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(f),
+                                          std::istreambuf_iterator<char>()};
+    return jpeg::IsJpeg(bytes) ? jpeg::Decode(bytes, error)
+                               : png::Decode(bytes, error);
+}
+
+}  // namespace
+
 Document LoadGltfFile(const std::string& path, std::string& error) {
     Document doc;
     std::ifstream in(path, std::ios::binary);
@@ -954,7 +981,7 @@ Document LoadGltfFile(const std::string& path, std::string& error) {
     for (std::size_t i = 0; i < doc2.image_uris.size(); ++i) {
         if (doc2.image_uris[i].empty()) continue;
         std::string ignored;
-        doc2.images[i] = png::DecodeFile(dir + doc2.image_uris[i], ignored);
+        doc2.images[i] = DecodeImageFile(dir + doc2.image_uris[i], ignored);
     }
     return doc2;
 }

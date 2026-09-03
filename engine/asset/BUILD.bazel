@@ -21,12 +21,31 @@ cc_library(
     deps = ["//engine/texture"],
 )
 
+# Baseline JPEG. Separate from :png for the same reason :png is separate from
+# :asset -- a texture loader may want one, the other, or both.
+cc_library(
+    name = "jpeg",
+    srcs = ["jpeg.cc"],
+    hdrs = ["jpeg.h"],
+    deps = [":png"],
+)
+
+cc_test(
+    name = "jpeg_test",
+    srcs = [
+        "jpeg_test.cc",
+        "testdata_jpeg.inc",
+    ],
+    deps = [":jpeg"],
+)
+
 cc_library(
     name = "asset",
     srcs = ["gltf.cc"],
     hdrs = ["gltf.h"],
     deps = [
         ":json",
+        ":jpeg",
         ":png",
         "//engine/anim",
         "//engine/core",
