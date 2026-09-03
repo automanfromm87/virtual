@@ -53,6 +53,23 @@ class RenderGraph {
         bool load = false;
         float clear_depth = 0.0f;             // reversed-Z far value
         bool keep_depth = false;              // true for a shadow map
+        // A target this pass BLENDS INTO rather than replaces: fog over the
+        // scene, decals over a G-buffer, reflections added to the lit image.
+        //
+        // Distinct from `color` because such a pass is both a reader and a
+        // writer of the same texture, and the single-writer rule exists to
+        // reject exactly that -- two passes writing one target have no defined
+        // order. A modification does have one: it comes after whoever produced
+        // the texture, and before whoever reads it next, and if several passes
+        // modify the same target they run in DECLARATION order.
+        //
+        // That is a restricted form of the resource versioning a full frame
+        // graph does, and it is the restriction that makes it a dozen lines
+        // instead of a rewrite: a chain of modifications is a total order, so
+        // no version numbers are needed to name which one a reader wants.
+        //
+        // Implies `load` -- there is nothing to blend into otherwise.
+        rhi::TextureId modifies;
         // Resources this pass writes that are NOT attachments. A compute pass
         // has no attachments at all, so this is the only thing that can order
         // it against the passes that read what it produced -- an environment

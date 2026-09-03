@@ -53,6 +53,10 @@ bool RenderGraph::Compile(std::string& error) {
         // depth-only shadow pass writes depth instead, and a compute pass
         // writes whatever it declared.
         if (!Valid(passes_[i].color)) {
+            // A modification's target is handled below, after every producer is
+            // known -- it has to be, because it takes over as the producer of a
+            // texture some other pass wrote.
+            if (Valid(passes_[i].modifies)) continue;
             if (!Valid(passes_[i].depth) && passes_[i].writes.empty()) {
                 error = "pass '" + passes_[i].name +
                         "' writes neither colour nor depth nor any declared "
@@ -117,6 +121,39 @@ bool RenderGraph::Compile(std::string& error) {
     for (const auto& [tex, pass_index] : depth_writer)
         producer.emplace(tex, pass_index);
 
+    // MODIFICATIONS, in declaration order. Each takes over as the producer of
+    // its target, so a later reader depends on the last modification rather
+    // than on the pass that first wrote it -- which is the whole point: a pass
+    // reading the scene after the fog has to see the fog.
+    //
+    // Resolved here, after every ordinary producer is known, because a
+    // modification by definition follows one.
+    // Braces: with parens, `std::size_t(n)` reads as a parameter declaration
+    // and this becomes a function declaration. The same most-vexing-parse trap
+    // as `std::vector<T> v(std::size_t(count))`, and the error it produces --
+    // "subscript of pointer to function type" -- names the symptom rather than
+    // the cause.
+    std::vector<std::vector<int>> modify_after{std::size_t(n), std::vector<int>{}};
+    for (int i = 0; i < n; ++i) {
+        if (!Valid(passes_[i].modifies)) continue;
+        auto it = producer.find(passes_[i].modifies.v);
+        if (it == producer.end()) {
+            const bool imported =
+                std::find_if(imported_.begin(), imported_.end(), [&](rhi::TextureId t) {
+                    return t.v == passes_[i].modifies.v;
+                }) != imported_.end();
+            if (!imported) {
+                error = "pass '" + passes_[i].name +
+                        "' modifies a texture no pass in this graph writes and no "
+                        "Import() declares";
+                return false;
+            }
+        } else {
+            modify_after[std::size_t(i)].push_back(it->second);
+        }
+        producer[passes_[i].modifies.v] = i;
+    }
+
     // Edge producer -> consumer for every read.
     std::vector<std::vector<int>> out(n);
     std::vector<int> indegree(n, 0);
@@ -149,6 +186,12 @@ bool RenderGraph::Compile(std::string& error) {
             ++indegree[i];
         }
     }
+
+    for (int i = 0; i < n; ++i)
+        for (int from : modify_after[std::size_t(i)]) {
+            out[std::size_t(from)].push_back(i);
+            ++indegree[std::size_t(i)];
+        }
 
     // Kahn. Ties break on insertion order so the result is deterministic —
     // a graph that shuffles equivalent passes run to run is untestable.
@@ -190,13 +233,14 @@ void RenderGraph::Execute(rhi::Device& dev) {
 
         rhi::PassDesc desc;
         desc.timer = p.timer;
-        desc.color = p.color;
+        // A modification IS the colour attachment, loaded rather than cleared.
+        desc.color = Valid(p.modifies) ? p.modifies : p.color;
+        desc.load = p.load || Valid(p.modifies);
         desc.resolve = p.resolve;
         desc.extra_colors = p.extra_colors;
         desc.depth = p.depth;
         for (int c = 0; c < 4; ++c) desc.clear_color[c] = p.clear_color[c];
         desc.clear_depth = p.clear_depth;
-        desc.load = p.load;
         desc.keep_depth = p.keep_depth;
 
         rhi::Encoder enc = dev.BeginPass(desc);

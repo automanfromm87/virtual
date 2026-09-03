@@ -7,11 +7,13 @@ repository, and the only outside code is Apple's own frameworks — Metal for th
 GPU, CoreText for glyph outlines, AudioToolbox for the speaker and for decoding
 compressed audio.
 
-Around 25,000 lines, 36 test targets, everything built with Bazel.
+Around 52,000 lines, 52 test targets, everything built with Bazel.
 
 ## Running it
 
 ```
+bazel run -c opt //apps/world2     # terrain + navmesh pathing + sky + fog
+bazel run -c opt //apps/sky        # image-based lighting, drag the sun
 bazel run -c opt //apps/iso        # isometric game: click to walk, collect coins
 bazel run -c opt //apps/walk       # first person, raycast crosshair
 bazel run -c opt //apps/gallery:viewer   # the rendering showcase
@@ -36,22 +38,66 @@ maps for point lights, and hardware ray-traced as an alternative. GPU-driven
 drawing — instancing, a compute culling pass, indirect draws — which takes 6000
 objects from 3428 draw calls at 3.38 ms to 3 draws at 0.98 ms.
 
+**Image-based lighting.** A physically based sky — Rayleigh and Mie scattering
+integrated along the view ray — baked into a radiance cube, then convolved into
+a diffuse probe and a prefiltered specular chain with a BRDF table. The sun's
+colour comes out of the same model, so a sunset cannot have a white key light.
+Checked with a white furnace: a uniform environment of 1.0 comes back as 1.0
+from every stage.
+
+**Post-processing.** Auto-exposure from a GPU luminance histogram, height fog
+integrated analytically along the ray, depth of field, motion blur, temporal
+antialiasing with a YCoCg variance clamp, screen-space reflections, and a
+parametric colour grade whose defaults are bit-for-bit a no-op.
+
+**Scale.** Levels of detail from a quadric-error simplifier, selected on the GPU
+by screen radius; Hi-Z occlusion culling against a min-reduced depth pyramid
+(144 objects behind a wall go from 145 survivors to 1); projected decals; and
+chunked terrain with skirts, whose height query, mesh and raycast agree to a
+ten-thousandth of a metre.
+
 **Compute.** GPU skinning written back to a buffer (so skinned meshes can cast
 ray-traced shadows), a 60,000-particle system, and an SPH fluid.
 
 **Physics.** Rigid bodies with angular dynamics, sphere/box/capsule/convex-hull
-shapes, GJK and EPA, a convex hull builder, joints, sleeping islands, continuous
-collision, raycasts and overlap queries, trigger volumes, and a kinematic
-capsule character controller.
+and height-field shapes, GJK and EPA, a convex hull builder, joints, sleeping
+islands, continuous collision, raycasts and overlap queries, trigger volumes,
+and a kinematic capsule character controller. A BVH broadphase, rebuilt per
+step, keeps the pairs tested at about ten per body whether there are 125 bodies
+or 1728 — brute force goes from 62 to 864.
+
+**Animation.** Skeletal animation with a middle layer that makes it usable:
+crossfades that do not jump when interrupted, masked layers, additive poses, a
+blend space that synchronises phase across clips of different lengths, root
+motion, two-bone IK with a pole vector, foot placement, and look-at.
+
+**Navigation.** A navmesh built by voxelising level geometry into solid spans,
+filtering by slope and headroom and ledge, eroding by the agent's radius, and
+merging into convex polygons with portals; then A* and a funnel string-pull. A
+wall with a three-metre doorway routes 16.58 m against a 10 m direct line, and
+an unobstructed path is two points and exactly the straight-line length.
+
+**Networking.** UDP with sequence numbers, an ack bitfield, round-trip
+estimation and opt-in reliability; snapshot replication with delta compression
+against the tick the client confirmed; client-side interpolation and prediction
+with reconciliation. Tested against a deterministic network simulator that
+loses, delays, jitters, duplicates and reorders on purpose — which is where
+three of its bugs were found.
 
 **Assets.** PNG (including Adam7 and sub-8-bit depths) and baseline JPEG, both
 hand-written; glTF 2.0 with `.glb`, skins, animations, morph targets and sparse
 accessors; WAV; and anything else the OS can decode.
 
+**Tooling.** A baked asset package that loads without parsing — the vertex block
+in it is byte-identical to what goes into a GPU buffer — and hot reload that
+waits for a file to stop changing before firing, so an editor's save produces
+one event rather than five and never a half-written file.
+
 **The rest.** An ECS with a transform hierarchy, scene serialisation, a render
-graph, an immediate-mode UI over a CoreText-rasterised font atlas, and an audio
+graph, an immediate-mode UI over a CoreText-rasterised font atlas, an audio
 mixer with equal-power panning and distance attenuation behind a lock-free
-queue.
+queue, a job system that gets 10.9x on sixteen threads, per-pass GPU timings,
+and gamepad support with a radial deadzone.
 
 ## How it is tested
 

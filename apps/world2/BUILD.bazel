@@ -1,0 +1,21 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# Everything at once. The other demos each show one system; the interesting
+# failures are BETWEEN systems -- the navmesh and the collider disagreeing about
+# where the ground is, the sky and the fog disagreeing about the distance -- and
+# none of those is visible in a demo that has only one of the two.
+cc_binary(
+    name = "world2",
+    srcs = ["viewer.cpp"],
+    deps = [
+        "//engine/app",
+        "//engine/geometry",
+        "//engine/nav",
+        "//engine/physics",
+        "//engine/platform",
+        "//engine/render",
+        "//engine/text:ui",
+    ],
+)
