@@ -98,3 +98,31 @@ cc_test(
     ],
     deps = [":asset"],
 )
+
+# The baked package format, and the file watcher an editor loop needs.
+#
+# Separate from :asset because they are the opposite half of the pipeline: the
+# importers turn interchange formats into engine data, and this turns engine
+# data into something that loads without parsing.
+cc_library(
+    name = "pack",
+    srcs = [
+        "hotreload.cc",
+        "pack.cc",
+    ],
+    hdrs = [
+        "hotreload.h",
+        "pack.h",
+    ],
+    deps = [
+        "//engine/core",
+        "//engine/geometry",
+        "//engine/shaders",
+    ],
+)
+
+cc_test(
+    name = "pack_test",
+    srcs = ["pack_test.cc"],
+    deps = [":pack"],
+)
