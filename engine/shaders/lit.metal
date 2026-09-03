@@ -178,8 +178,50 @@ static inline float ShadowFactor(float4 lightClip, depth2d<float> shadowMap,
     return lit * (1.0f / 9.0f);
 }
 
+// The BRDF for ONE light direction, without the radiance or the cosine term —
+// those belong to the light, and factoring them out is what lets the sun and a
+// spot lamp share the same surface response instead of drifting apart.
+static inline float3 Brdf(float3 N, float3 V, float3 L, float3 albedo,
+                          float roughness, float metallic)
+{
+    const float3 H = normalize(L + V);
+    const float NdotV = saturate(dot(N, V)) + 1e-5f;
+    const float NdotL = saturate(dot(N, L));
+    const float NdotH = saturate(dot(N, H));
+    const float VdotH = saturate(dot(V, H));
+
+    // Perceptual roughness squared. Artists author "roughness"; the BRDF wants
+    // alpha, and the square is what makes the slider feel linear.
+    const float a = max(roughness * roughness, 1e-3f);
+    // Dielectrics reflect ~4% white; metals reflect their own colour and have
+    // no diffuse at all.
+    const float3 f0 = mix(float3(0.04f), albedo, metallic);
+    const float3 F = F_Schlick(VdotH, f0);
+    const float3 specular = F * (D_GGX(NdotH, a) * V_SmithGGX(NdotV, NdotL, a));
+    // Energy conservation: whatever is reflected specularly cannot also be
+    // diffused. Lambert's 1/pi is folded in.
+    const float3 diffuse = (1.0f - F) * albedo * (1.0f - metallic) *
+                           (1.0f / 3.14159265f);
+    return diffuse + specular;
+}
+
+// Inverse-square falloff, windowed so it actually reaches zero at `range`.
+//
+// Pure 1/d² is the physical answer and never gets to zero, so a light would
+// have to be evaluated for every fragment in the scene forever. The window is
+// what makes a light have an extent you can cull against, and it is shaped to
+// leave the near field — where the light is actually bright — untouched.
+static inline float Falloff(float distance, float range)
+{
+    const float d2 = distance * distance;
+    const float ratio = saturate(d2 / max(range * range, 1e-4f));
+    const float window = saturate(1.0f - ratio * ratio);
+    return window * window / max(d2, 1e-4f);
+}
+
 fragment float4 fs_lit(VSOut in [[stage_in]],
                        constant FrameUniforms& u [[buffer(1)]],
+                       device const GpuLight* lights [[buffer(2)]],
                        texture2d<float> albedoMap    [[texture(0)]],
                        texture2d<float> roughnessMap [[texture(1)]],
                        depth2d<float>   shadowMap    [[texture(2)]],
@@ -201,54 +243,83 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
     // Renormalize per fragment: interpolating unit vectors across a triangle
     // does not preserve length, and the error is worst mid-face.
     const float3 N = normalize(in.normalW);
-    const float3 L = normalize(u.lightDir.xyz);
     const float3 V = normalize(u.eyePos.xyz - in.worldPos);
-    const float3 H = normalize(L + V);
 
-    const float NdotL = saturate(dot(N, L));
-    const float NdotV = saturate(dot(N, V)) + 1e-5f;
-    const float NdotH = saturate(dot(N, H));
-    const float VdotH = saturate(dot(V, H));
-
-    // Perceptual roughness squared. Artists author "roughness"; the BRDF wants
-    // alpha, and the square is what makes the slider feel linear.
-    const float a = max(roughness * roughness, 1e-3f);
-
-    // Dielectrics reflect ~4% white; metals reflect their own colour and have
-    // no diffuse at all.
-    const float3 f0 = mix(float3(0.04f), albedo, metallic);
-    const float3 diffuseColor = albedo * (1.0f - metallic);
-
-    const float3 F = F_Schlick(VdotH, f0);
-    const float3 specular = F * (D_GGX(NdotH, a) * V_SmithGGX(NdotV, NdotL, a));
-
-    // Energy conservation: whatever is reflected specularly cannot also be
-    // diffused. Lambert's 1/pi is folded in.
-    const float3 kD = (1.0f - F);
-    const float3 diffuse = kD * diffuseColor * (1.0f / 3.14159265f);
-
+    // --- the key light: directional, and the only one with a shadow map ------
+    const float3 Lsun = normalize(u.lightDir.xyz);
     const float shadow = ShadowFactor(in.lightClip, shadowMap, smp, u.surface.z);
-    const float3 direct =
-        (diffuse + specular) * u.lightColor.rgb * NdotL * shadow;
+    float3 direct = Brdf(N, V, Lsun, albedo, roughness, metallic) *
+                    u.lightColor.rgb * saturate(dot(N, Lsun)) * shadow;
 
-    // HEMISPHERE AMBIENT: cool light from the sky above, dim warm bounce from
-    // the ground below, blended by which way the normal points.
+    // --- local lights --------------------------------------------------------
+    const uint light_count = min(uint(u.lighting.x), uint(ENG_MAX_LIGHTS));
+    for (uint i = 0; i < light_count; ++i) {
+        const GpuLight lt = lights[i];
+        const float3 to_light = lt.position.xyz - in.worldPos;
+        const float dist = length(to_light);
+        if (dist > lt.direction.w) continue;  // outside its range entirely
+        const float3 L = to_light / max(dist, 1e-4f);
+
+        float attenuation = Falloff(dist, lt.direction.w);
+        if (lt.position.w > 0.5f) {
+            // Spot. The cone is measured against the direction the lamp SHINES,
+            // so the fragment's bearing from the lamp is -L.
+            const float cosine = dot(lt.direction.xyz, -L);
+            // Smoothed between the two cosines rather than a hard cut, or the
+            // cone edge is a jagged line that crawls as the light moves.
+            const float t = saturate((cosine - lt.cone.y) /
+                                     max(lt.cone.x - lt.cone.y, 1e-4f));
+            attenuation *= t * t;
+        }
+        const float ndotl = saturate(dot(N, L));
+        if (attenuation * ndotl <= 0.0f) continue;
+        direct += Brdf(N, V, L, albedo, roughness, metallic) * lt.color.rgb *
+                  ndotl * attenuation;
+    }
+
+    // AMBIENT, split the same way the direct term is: a diffuse part and a
+    // specular part.
     //
-    // This replaces a single constant, and the difference is not subtle. A
-    // constant ambient lights the underside of an object exactly as brightly as
-    // its top, which erases the one cue that says "this thing is sitting on
-    // something". It is the cheapest useful approximation of image-based
-    // lighting — a real IBL swaps these two colours for a prefiltered
-    // environment probe and gains reflections as well.
-    const float3 kSkyColor = float3(0.13f, 0.16f, 0.24f);
-    const float3 kGroundColor = float3(0.055f, 0.045f, 0.035f);
+    // Multiplying one hemisphere colour by the albedo was wrong twice over. A
+    // metal has NO diffuse lobe, so that term should vanish for it — and then a
+    // gold sphere in a dark room renders pure black, which is physically
+    // correct and completely useless, because what a metal actually shows is
+    // the room reflected in it. The specular half below is that reflection: the
+    // same two-colour hemisphere, sampled in the mirror direction instead of
+    // along the normal.
+    //
+    // This is image-based lighting with an environment of exactly two colours.
+    // A real IBL swaps the hemisphere for a prefiltered probe and gains actual
+    // reflections; the shape of the calculation does not change.
+    const float3 f0amb = mix(float3(0.04f), albedo, metallic);
     const float hemi = N.y * 0.5f + 0.5f;
-    const float3 ambient = albedo * mix(kGroundColor, kSkyColor, hemi);
+    const float3 skyAtN = mix(u.ambientGround.rgb, u.ambientSky.rgb, hemi);
 
-    // Reinhard tone map then gamma. Without these, a physically-scaled light
-    // blows out to white and the whole point of the BRDF is invisible.
+    const float3 R = reflect(-V, N);
+    const float hemiR = R.y * 0.5f + 0.5f;
+    const float3 skyAtR = mix(u.ambientGround.rgb, u.ambientSky.rgb, hemiR);
+
+    // Fresnel with a roughness-aware ceiling. Plain Schlick goes to white at
+    // grazing angles even for a rough surface, which puts a bright rim on
+    // everything; clamping it to (1 - roughness) is the standard cheap fix.
+    const float NdotVamb = saturate(dot(N, V));
+    const float3 Famb =
+        f0amb + (max(float3(1.0f - roughness), f0amb) - f0amb) *
+                    pow(1.0f - NdotVamb, 5.0f);
+
+    const float3 ambient =
+        albedo * (1.0f - metallic) * skyAtN * (1.0f - Famb) + skyAtR * Famb;
+
+    // ACES filmic, then gamma.
+    //
+    // Reinhard was here first and it is why every earlier picture looked hazy:
+    // x/(1+x) starts compressing at zero, so it lifts the blacks and pulls all
+    // three channels toward each other, which desaturates exactly the coloured
+    // lights that were worth having. This curve leaves the toe alone and rolls
+    // the highlights off instead.
     float3 color = direct + ambient;
-    color = color / (1.0f + color);
+    const float a1 = 2.51f, b1 = 0.03f, c1 = 2.43f, d1 = 0.59f, e1 = 0.14f;
+    color = saturate((color * (a1 * color + b1)) / (color * (c1 * color + d1) + e1));
     color = pow(color, 1.0f / 2.2f);
 
     return float4(color, in.color.a);

@@ -201,8 +201,13 @@ int main() {
     Check(identical == 0, "all five materials are visually distinguishable");
 
     // Roughness spreads the highlight: the polished sphere concentrates its
-    // energy into fewer, brighter pixels than the brushed one beside it.
-    Check(stats[0].peak > stats[1].peak, "polished metal peaks brighter than brushed");
+    // energy into FEWER pixels than the brushed one beside it.
+    //
+    // The other half of that sentence -- "and brighter ones" -- is not asserted,
+    // because it cannot be read off an 8-bit image. Both highlights are past
+    // the tone curve's shoulder and both report within two codes of each other,
+    // so the comparison measures rounding. The pixel count is the half that
+    // survives the mapping, and it is the half that says "lobe width".
     Check(stats[1].bright > stats[0].bright, "brushed metal has the wider highlight");
     // NOT asserted here: that metal is darker than dielectric. That only holds
     // at a FIXED base colour, and these five deliberately differ — gold's base
@@ -210,10 +215,17 @@ int main() {
     // the colours rather than the BRDF. apps/materials tests it properly, on a
     // grid that varies metallic with everything else held constant.
     //
-    // What does hold here: a surface this rough cannot concentrate a highlight
-    // at all, whatever its colour.
-    Check(stats[3].bright == 0, "matte paint has no concentrated highlight");
-    Check(stats[0].bright > 0, "polished metal does");
+    // What does hold here: a surface this rough never reaches a specular
+    // blowout, whatever its colour.
+    //
+    // Counting pixels over a fixed luminance used to say this and no longer
+    // does. A filmic curve lifts the mid-tones, so a broad, evenly lit matte
+    // sphere now puts a thousand pixels over the threshold without having a
+    // highlight at all -- the count measures how bright the surface is, not how
+    // concentrated. Peak is the right question: a rough surface cannot get
+    // near white, and a polished one gets there in a handful of pixels.
+    Check(stats[3].peak < 220.0, "matte paint never reaches a specular blowout");
+    Check(stats[0].peak > 225.0, "polished metal does");
 
     // INTERACTION. Moving the light has to change the image — if it did not,
     // the controls would be decorative.

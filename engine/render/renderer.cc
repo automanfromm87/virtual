@@ -39,7 +39,8 @@ constexpr char kSsaoSrc[] = {
     , 0};
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
-static_assert(sizeof(FrameUniforms) == 304, "FrameUniforms layout drifted");
+static_assert(sizeof(FrameUniforms) == 352, "FrameUniforms layout drifted");
+static_assert(sizeof(GpuLight) == 64, "GpuLight must pack to four float4s");
 static_assert(sizeof(VertexIn) == 64, "VertexIn layout drifted");
 static_assert(offsetof(VertexIn, normal) == 16, "GPU float3 occupies 16 bytes");
 static_assert(offsetof(VertexIn, color) == 32, "GPU float3 occupies 16 bytes");
@@ -57,6 +58,7 @@ constexpr int kVertexSlot = 0;
 constexpr int kUniformSlot = 1;
 constexpr int kSkinSlot = 2;     // per-vertex joints and weights
 constexpr int kPaletteSlot = 3;  // this instance's joint matrices
+constexpr int kLightSlot = 2;    // FRAGMENT stage: the scene's local lights
 
 // Ring capacity per frame slot. Exceeding it drops draws rather than
 // corrupting the frame — see the clamp in DrawScene.
@@ -144,6 +146,13 @@ struct Renderer::Impl {
     // A SECOND ring, for joint matrices. Not folded into FrameUniforms: sixty-
     // four matrices is four kilobytes, and every unskinned draw in the scene
     // would pay for it.
+    // The scene's local lights. One buffer per frame slot, not per draw: the
+    // list is a property of the scene and every fragment of every object reads
+    // the same one.
+    rhi::BufferId lights;
+    std::uint8_t* light_map = nullptr;
+    std::size_t light_slot_bytes = 0;
+
     rhi::BufferId palettes;
     std::uint8_t* palette_map = nullptr;
     std::size_t palette_stride = 0;
@@ -456,6 +465,16 @@ std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
     r->impl_->slot_bytes = r->impl_->uniform_stride * kMaxInstancesPerFrame;
     r->impl_->uniforms =
         dev.CreateDynamicBuffer(r->impl_->slot_bytes * rhi::kFramesInFlight);
+    r->impl_->light_slot_bytes =
+        AlignUp(sizeof(GpuLight) * ENG_MAX_LIGHTS, dev.UniformAlignment());
+    r->impl_->lights =
+        dev.CreateDynamicBuffer(r->impl_->light_slot_bytes * rhi::kFramesInFlight);
+    r->impl_->light_map = static_cast<std::uint8_t*>(dev.MapBuffer(r->impl_->lights));
+    if (!Valid(r->impl_->lights) || !r->impl_->light_map) {
+        error = "failed to allocate the light buffer";
+        return nullptr;
+    }
+
     // Joint palettes get their own ring, sized for kMaxSkinnedPerFrame draws.
     r->impl_->palette_stride =
         AlignUp(sizeof(Mat4) * kMaxJoints, dev.UniformAlignment());
@@ -566,6 +585,34 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
     const bool pass_depth = impl_->dev->CurrentPassHasDepth();
 
     const Mat4 viewProj = scene.camera.ViewProj(float(width) / float(height));
+    // The light list, uploaded once for the whole pass. Anything past the
+    // budget is DROPPED rather than wrapped: silently lighting a scene with a
+    // different subset every frame would flicker.
+    const std::size_t light_offset =
+        std::size_t(impl_->dev->FrameSlot()) * impl_->light_slot_bytes;
+    const int light_count =
+        std::min(int(scene.lights.size()), int(ENG_MAX_LIGHTS));
+    {
+        auto* dst = reinterpret_cast<GpuLight*>(impl_->light_map + light_offset);
+        for (int i = 0; i < light_count; ++i) {
+            const Light& l = scene.lights[std::size_t(i)];
+            GpuLight g{};
+            g.position = Vec4{l.position.x, l.position.y, l.position.z,
+                              l.type == LightType::Spot ? 1.0f : 0.0f};
+            const Vec3 dir = Normalize(l.direction);
+            g.direction = Vec4{dir.x, dir.y, dir.z, l.range};
+            g.color = Vec4{l.color.x, l.color.y, l.color.z, 0.0f};
+            // Cosines, not degrees: the shader compares against a dot product,
+            // and converting per fragment would be an acos in the inner loop.
+            const float inner = std::cos(l.inner_degrees * 3.14159265f / 180.0f);
+            const float outer = std::cos(l.outer_degrees * 3.14159265f / 180.0f);
+            // Guarded: an inner cone wider than the outer one divides by a
+            // negative and inverts the falloff.
+            g.cone = Vec4{std::max(inner, outer + 1e-3f), outer, 0.0f, 0.0f};
+            dst[i] = g;
+        }
+    }
+
     const bool shadows = scene.shadowExtent > 0.0f && Valid(shadow_map);
     const Mat4 lightViewProj = shadows ? scene.LightViewProj() : Mat4::Identity();
     const rhi::TextureId shadow_tex = shadows ? shadow_map : impl_->dummy_shadow;
@@ -692,6 +739,11 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
                          scene.clipY};
         u.eyePos = Vec4{scene.camera.eye.x, scene.camera.eye.y,
                         scene.camera.eye.z, 1.0f};
+        u.lighting = Vec4{float(light_count), 0.0f, 0.0f, 0.0f};
+        u.ambientSky = Vec4{scene.ambientSky.x, scene.ambientSky.y,
+                            scene.ambientSky.z, 0.0f};
+        u.ambientGround = Vec4{scene.ambientGround.x, scene.ambientGround.y,
+                               scene.ambientGround.z, 0.0f};
 
         // Sub-allocate out of this frame's slot instead of a per-draw setBytes.
         std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
@@ -699,6 +751,7 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
         enc.SetVertexBuffer(gm.vb, 0, kVertexSlot);
         enc.SetVertexBuffer(impl_->uniforms, offset, kUniformSlot);
         enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
+        enc.SetFragmentBuffer(impl_->lights, light_offset, kLightSlot);
         enc.SetFragmentTexture(mat.albedo, 0);
         enc.SetFragmentTexture(mat.roughness_map, 1);
         enc.SetFragmentTexture(shadow_tex, 2);

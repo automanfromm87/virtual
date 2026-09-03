@@ -213,11 +213,17 @@ int main() {
     // peak falls. Checked on the fully metallic row, where the highlight is the
     // whole story and no diffuse term muddies it.
     //
-    // Only over the UNSATURATED range. Reinhard tone mapping asymptotes to 1,
-    // so a peak radiance of 5 and one of 20 both land within a few 8-bit codes
-    // of each other — the two smoothest samples are simply blown out and carry
-    // no ordering information. That is a property of the tone mapper, not of
-    // the BRDF, and asserting through it would be asserting noise.
+    // Only over the UNSATURATED range. A tone mapper's whole job is to fold an
+    // unbounded radiance into a display, so a peak of 5 and a peak of 20 land
+    // within a few 8-bit codes of each other and carry no ordering. That is a
+    // property of the curve, not of the BRDF, and asserting through it would be
+    // asserting noise.
+    //
+    // The filmic curve this engine uses has a harder shoulder than the Reinhard
+    // one it replaced, so MORE of the sweep saturates — which is why the check
+    // below starts at `first` rather than at column zero. It used to start at
+    // zero, contradicting this very comment, and survived only because the old
+    // curve happened to compress gently enough.
     constexpr double kSaturated = 240.0;
     int first = 0;
     while (first < kGrid && peak[kGrid - 1][first] >= kSaturated) ++first;
@@ -227,15 +233,29 @@ int main() {
     std::printf("  unsaturated from column %d of %d\n", first, kGrid);
     Check(first < kGrid - 1, "the roughness sweep leaves the saturated region");
     Check(falls, "peak highlight dims as roughness rises (unsaturated range)");
-    Check(peak[kGrid - 1][0] > peak[kGrid - 1][kGrid - 1] * 1.5,
-          "smoothest metal is far brighter at peak than the roughest");
+    // NOT asserted: that the smoothest metal's peak beats the roughest one's.
+    //
+    // It cannot be measured from an 8-bit image at any exposure. A near-mirror
+    // GGX lobe is close to a delta function -- its peak radiance goes as
+    // 1/(pi*alpha^2), which at roughness 0.1 is over three thousand times the
+    // incoming light -- so it reads 255 until the exposure is turned down far
+    // enough that every rougher sample in the sweep is black. One image cannot
+    // hold both ends. Measuring it would need an HDR readback, and the claim it
+    // would establish is the one the AREA check below already makes.
+    //
+    // This assertion used to exist and passed only because the previous tone
+    // curve compressed gently enough from zero to leave a few codes of ordering
+    // in the blown-out region. That was reading the curve, not the BRDF.
 
     // PREDICTION 1b, the half that does NOT saturate: the same energy over a
     // wider lobe covers more pixels. Peak brightness and highlight area move in
     // opposite directions — that pairing is what energy conservation looks like
     // on screen, and a normalisation error breaks one or the other.
-    Check(area[kGrid - 1][kGrid / 2] > area[kGrid - 1][0] * 2,
-          "highlight area grows as the peak falls (energy conserved)");
+    // Measured at 14 pixels for the smoothest and 529 for the middle of the
+    // sweep -- a factor of thirty-eight. This is the lobe width, and it is the
+    // half of energy conservation that an LDR image CAN see.
+    Check(area[kGrid - 1][kGrid / 2] > area[kGrid - 1][0] * 8,
+          "highlight area grows sharply as the peak saturates (energy conserved)");
 
     // PREDICTION 2: metals have no diffuse lobe, so away from the highlight
     // they are darker than a dielectric with identical roughness.

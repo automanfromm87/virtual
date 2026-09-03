@@ -61,6 +61,32 @@ struct OrbitController {
     void Apply(Camera& cam) const;
 };
 
+enum class LightType : std::uint8_t { Point, Spot };
+
+// A local light: one that has a POSITION, and therefore falls off with distance.
+struct Light {
+    LightType type = LightType::Point;
+    Vec3 position{0.0f, 0.0f, 0.0f};
+    // The direction the cone points, from the lamp INTO the scene. Only a spot
+    // uses it.
+    //
+    // Deliberately the opposite sense to Scene::lightDir. A directional light
+    // has no position, so the only thing worth recording is where it IS; a spot
+    // has a position, so the only thing worth recording is where it AIMS. One
+    // convention that means two things would be worse than two that are named.
+    Vec3 direction{0.0f, -1.0f, 0.0f};
+    // Radiance at one metre. Not a 0..1 colour: the shader tone maps, and a
+    // lamp you can stand next to has to be able to blow out.
+    Vec3 color{1.0f, 1.0f, 1.0f};
+    // Distance at which it reaches exactly zero. Physical falloff is 1/d² and
+    // never gets there, so a cutoff is what makes a light cullable at all.
+    float range = 10.0f;
+    // Full brightness inside the inner cone, nothing outside the outer one, a
+    // smooth edge between. Ignored by a point light.
+    float inner_degrees = 22.0f;
+    float outer_degrees = 34.0f;
+};
+
 // One drawable placement: which mesh, where, what colour. The scene refers to
 // the mesh by HANDLE and never sees a vertex buffer — that is what keeps this
 // layer independent of the renderer.
@@ -93,6 +119,17 @@ struct Scene {
     // what cascaded shadow maps exist to fix.
     float shadowExtent = 0.0f;
 
+    // Hemisphere ambient: cool from the sky, dim warm bounce from the ground,
+    // blended by which way a normal points. The cheapest useful stand-in for
+    // image-based lighting, and the thing that stops the underside of an object
+    // being as bright as its top.
+    //
+    // A DIAL, not a constant. These defaults suit an outdoor scene; a room lit
+    // by lamps needs them an order of magnitude lower, and leaving them high
+    // there means the ambient does the lighting and the lamps are decoration.
+    Vec3 ambientSky{0.13f, 0.16f, 0.24f};
+    Vec3 ambientGround{0.055f, 0.045f, 0.035f};
+
     // SECTION CUT. Fragments above this world Y are discarded, which is how you
     // see into a building without deleting its roof. Storeys stack, so cutting
     // by height is also how you show one floor at a time.
@@ -101,6 +138,14 @@ struct Scene {
     // World -> the light's clip space, for the shadow pass and the lookup.
     [[nodiscard]] Mat4 LightViewProj() const;
     std::vector<Instance> instances;
+
+    // Local lights, on top of the directional key light above.
+    //
+    // The split is a real limitation, not a taxonomy: the directional light is
+    // the one with a shadow map, and everything in here is unshadowed. Giving a
+    // point light shadows means a cube map per light and a pass per face, which
+    // is the next thing this wants.
+    std::vector<Light> lights;
 
     // Joint matrices for every skinned instance this frame, concatenated.
     // Already world-relative: palette[j] = jointWorld * inverseBind, so the

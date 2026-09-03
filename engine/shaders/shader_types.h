@@ -50,7 +50,40 @@ struct FrameUniforms {
     // Depth reconstruction for the SSAO pass: .x nearZ, .y 1/tan(fovY/2),
     // .z aspect, .w sample radius in world metres.
     ENG_VEC4 ssao;
+    // .x how many entries of the light buffer are live. The rest is reserved.
+    ENG_VEC4 lighting;
+    // Hemisphere ambient: sky above, bounce below. Scene-controlled, because
+    // the right value differs by an order of magnitude between a daylit
+    // exterior and a room lit by lamps — and when it is wrong the wrong way,
+    // it does the lighting and every actual light in the scene stops mattering.
+    ENG_VEC4 ambientSky;
+    ENG_VEC4 ambientGround;
 };
+
+// A local light. Sixteen bytes times four, so the array packs with no padding
+// and the C++ and MSL views cannot drift.
+//
+// The directional key light is NOT in here — it lives in FrameUniforms because
+// it is the one that casts the shadow map, and it needs a matrix rather than a
+// position. See the note on Scene::lights.
+struct GpuLight {
+    // .xyz world position, .w the type: 0 point, 1 spot.
+    ENG_VEC4 position;
+    // .xyz the direction the light SHINES, from the lamp into the scene, which
+    // is the opposite of Scene::lightDir. A directional light has no position,
+    // so the only useful thing to record is where it is; a spot has one, so the
+    // only useful thing to record is where it aims. .w is the range in metres.
+    ENG_VEC4 direction;
+    ENG_VEC4 color;  // .rgb radiance at one metre
+    // .x cos(inner cone), .y cos(outer cone). Equal for a point light, where
+    // they are ignored.
+    ENG_VEC4 cone;
+};
+
+// Lights the fragment stage can read in one pass. A forward renderer pays for
+// every light on every fragment, so this is a budget rather than a limit of the
+// format — past a few dozen the answer is to cluster them, not to raise this.
+#define ENG_MAX_LIGHTS 32
 
 // Skinning attributes, in their OWN buffer rather than inside VertexIn. A
 // static mesh vastly outnumbers a skinned one in most scenes, and adding this

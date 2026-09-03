@@ -275,8 +275,12 @@ int main() {
         int ground_pixels = 0;
         for (std::size_t i = 0; i < pixels.size(); i += 4) {
             const int r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
-            // The ground is desaturated green: g above both, and not bright.
-            if (g > r + 3 && g > b + 3 && g < 190 && g > 50) ++ground_pixels;
+            // Green-dominant, and not a blowout. The upper bound used to be
+            // 190, which the filmic tone curve lifted the lit ground straight
+            // past -- it reads 193/207/186 now. Bounding on DOMINANCE and
+            // leaving the brightness alone is what makes this a test of "the
+            // ground is still there" rather than of the exposure.
+            if (g > r + 3 && g > b + 3 && g < 250 && g > 50) ++ground_pixels;
         }
         Check(ground_pixels > 20000, "the static ground still drew, undeformed");
         Check(stats.invalid == 0 && stats.overflowed == 0, "nothing was dropped");
