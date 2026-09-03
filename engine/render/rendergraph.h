@@ -35,6 +35,10 @@ class RenderGraph {
         // reading the resolve target depends on this one, and the graph would
         // otherwise reject it as reading a texture nobody writes.
         rhi::TextureId resolve;
+        // Additional colour attachments, 1..n. A deferred G-buffer pass writes
+        // several targets at once; each counts as WRITTEN, so a later pass may
+        // read any of them.
+        std::vector<rhi::TextureId> extra_colors;
         rhi::TextureId depth;                 // written; null = no depth
         std::vector<rhi::TextureId> reads;    // sampled inputs
         float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -44,6 +48,17 @@ class RenderGraph {
     };
 
     void AddPass(Pass p) { passes_.push_back(std::move(p)); }
+
+    // Declares a texture that already holds what this graph needs, written
+    // before it -- last frame, or at load time. Without it the graph rejects
+    // any read it cannot trace to a pass, which is the right default: that
+    // check is what catches a pass wired to a target nobody filled.
+    //
+    // So an import is an ASSERTION by the caller, not a way around the check.
+    // Re-lighting a G-buffer from an earlier frame is the case that needs one,
+    // and a static lookup table loaded once is another.
+    void Import(rhi::TextureId t) { imported_.push_back(t); }
+
     void Clear();
 
     // Topologically orders the passes. Fails on a dependency cycle, or on a
@@ -59,6 +74,7 @@ class RenderGraph {
     [[nodiscard]] const std::vector<std::string>& Order() const { return order_names_; }
 
   private:
+    std::vector<rhi::TextureId> imported_;
     std::vector<Pass> passes_;
     std::vector<int> order_;
     std::vector<std::string> order_names_;

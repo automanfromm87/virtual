@@ -1,10 +1,13 @@
 #include "engine/render/rendergraph.h"
 
+#include <algorithm>
+
 #include <unordered_map>
 
 namespace eng {
 
 void RenderGraph::Clear() {
+    imported_.clear();
     passes_.clear();
     order_.clear();
     order_names_.clear();
@@ -58,6 +61,19 @@ bool RenderGraph::Compile(std::string& error) {
                 return false;
             }
         }
+        // The G-buffer's extra attachments, on the same footing as the first:
+        // a lighting pass reads all of them, and leaving them out of the map
+        // would have the graph reject it for reading a texture nobody writes.
+        for (const rhi::TextureId& extra : passes_[i].extra_colors) {
+            if (!Valid(extra)) continue;
+            auto [eit, eok] = producer.emplace(extra.v, i);
+            if (!eok) {
+                error = "passes '" + passes_[eit->second].name + "' and '" +
+                        passes_[i].name +
+                        "' both write the same colour attachment";
+                return false;
+            }
+        }
     }
 
     // Same rule for depth. Two passes sharing a depth buffer are ordered only
@@ -87,8 +103,16 @@ bool RenderGraph::Compile(std::string& error) {
         for (rhi::TextureId r : passes_[i].reads) {
             auto it = producer.find(r.v);
             if (it == producer.end()) {
+                // An IMPORTED texture was filled before this graph ran, so it
+                // has no producer here and needs no edge. Anything else is a
+                // pass wired to a target nobody writes.
+                if (std::find_if(imported_.begin(), imported_.end(),
+                                 [&](rhi::TextureId t) { return t.v == r.v; }) !=
+                    imported_.end())
+                    continue;
                 error = "pass '" + passes_[i].name +
-                        "' reads a texture no pass in this graph writes";
+                        "' reads a texture no pass in this graph writes and no "
+                        "Import() declares";
                 return false;
             }
             if (it->second == i) {
@@ -139,6 +163,7 @@ void RenderGraph::Execute(rhi::Device& dev) {
         rhi::PassDesc desc;
         desc.color = p.color;
         desc.resolve = p.resolve;
+        desc.extra_colors = p.extra_colors;
         desc.depth = p.depth;
         for (int c = 0; c < 4; ++c) desc.clear_color[c] = p.clear_color[c];
         desc.clear_depth = p.clear_depth;

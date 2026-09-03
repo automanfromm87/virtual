@@ -15,6 +15,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace eng::rhi {
 
@@ -64,6 +65,14 @@ struct PipelineDesc {
     std::string vertex_fn;
     std::string fragment_fn;
     Format color = Format::BGRA8Unorm;
+    // MULTIPLE RENDER TARGETS. `color` is attachment 0; these are 1..n, and an
+    // empty list is the ordinary single-target case. A deferred G-buffer is the
+    // reason they exist: writing albedo, normal and material in one pass over
+    // the geometry rather than three.
+    //
+    // The formats must match the pass's attachments exactly. Metal validates
+    // that -- one of the few format errors it does not let through silently.
+    std::vector<Format> extra_colors;
     bool depth = false;  // attach + test depth
     // Depth-only: no fragment shader and no colour attachment. That is the
     // whole shadow pass — position out, depth written, nothing shaded.
@@ -81,6 +90,11 @@ struct PipelineDesc {
 
 struct PassDesc {
     TextureId color;
+    // Attachments 1..n, paired with PipelineDesc::extra_colors. All are
+    // cleared to `clear_color` -- a G-buffer wants every channel cleared to a
+    // known value anyway, and a per-attachment clear colour would be four more
+    // fields for one call site.
+    std::vector<TextureId> extra_colors;
     // Where a multisample colour attachment is averaged down to. Ignored when
     // `color` has one sample.
     //

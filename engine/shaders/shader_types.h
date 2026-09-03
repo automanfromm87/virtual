@@ -29,6 +29,11 @@ struct FrameUniforms {
     // World -> the light's clip space. Orthographic, because a directional
     // light's rays are parallel and have no vanishing point.
     ENG_MAT4 lightViewProj;
+    // Clip -> world, for reconstructing a world position from a depth buffer.
+    // Deferred shading needs it; nothing else does, and it is here rather than
+    // in its own block because a fullscreen lighting pass already binds this
+    // one and a second block would be a second binding for one matrix.
+    ENG_MAT4 invViewProj;
     ENG_VEC4 tint;   // per-instance colour multiplier
     // Unit vector pointing FROM the surface TOWARD the light, in world space.
     // Named for where the light IS, not where its photons go — the other

@@ -40,6 +40,11 @@ enum class Shading : std::uint8_t {
     Ssao,        // fullscreen, depth in and an occlusion factor out
     BloomBright, // fullscreen, keeps what is above a threshold
     BloomBlur,   // fullscreen, one axis of a separable gaussian
+    // DEFERRED. GBuffer writes the surface into two colour targets plus depth;
+    // DeferredLight is the fullscreen pass that reads them back and lights each
+    // pixel once, however many lights there are.
+    GBuffer,
+    DeferredLight,
 };
 
 // What a surface looks like and how it is rasterised.
@@ -191,6 +196,33 @@ class Renderer {
     // no shadows.
     void DrawScene(rhi::Encoder&, const Scene&, int width, int height,
                    rhi::TextureId shadow_map = {});
+
+    // --- deferred ------------------------------------------------------------
+    //
+    // Two passes instead of one. DrawGBuffer rasterises the geometry and writes
+    // what each surface IS -- albedo and roughness into attachment 0, world
+    // normal and metallic into attachment 1 -- and DrawDeferredLight reads that
+    // back with the depth buffer and lights every pixel exactly once.
+    //
+    // The point is that the cost of lighting stops depending on the geometry.
+    // Forward shades every fragment it rasterises, including the ones a later
+    // triangle covers, and runs the whole light loop for each; deferred runs it
+    // once per pixel that survived.
+    //
+    // Both paths call the same ShadeSurface in the shader, so the two produce
+    // the same picture by construction rather than by agreement.
+    //
+    // It is not free. There is no transparency here (a G-buffer holds one
+    // surface per pixel; glass needs two, so transparent geometry is drawn
+    // forward afterwards) and no MSAA (storing and lighting every sample costs
+    // four times the memory and four times the lighting, which is the thing
+    // deferring was for).
+    void DrawGBuffer(rhi::Encoder&, const Scene&, int width, int height);
+
+    // `depth` must be the SAMPLEABLE depth target the G-buffer pass wrote.
+    void DrawDeferredLight(rhi::Encoder&, const Scene&, int width, int height,
+                           rhi::TextureId albedo_rough, rhi::TextureId normal_metal,
+                           rhi::TextureId depth, rhi::TextureId shadow_map = {});
     void DrawTriangle(rhi::Encoder&, int width, int height);
 
     // Fullscreen pass that samples `src` (a colour target written earlier this

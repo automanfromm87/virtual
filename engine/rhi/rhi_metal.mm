@@ -347,6 +347,9 @@ PipelineId Device::CreatePipeline(const PipelineDesc& desc, std::string& error) 
     // pass will not provide is a pipeline/pass mismatch.
     pd.colorAttachments[0].pixelFormat =
         desc.depth_only ? MTLPixelFormatInvalid : ToMTL(desc.color);
+    if (!desc.depth_only)
+        for (std::size_t i = 0; i < desc.extra_colors.size(); ++i)
+            pd.colorAttachments[i + 1].pixelFormat = ToMTL(desc.extra_colors[i]);
     // Without this the depth attachment is silently ignored at draw time.
     if (desc.depth) pd.depthAttachmentPixelFormat = ToMTL(Format::Depth32Float);
     // Has to match the attachments exactly. Metal rejects a mismatch here,
@@ -470,6 +473,16 @@ Encoder Device::BeginPass(const PassDesc& desc) { @autoreleasepool {
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         }
         rp.colorAttachments[0].clearColor =
+            MTLClearColorMake(desc.clear_color[0], desc.clear_color[1],
+                              desc.clear_color[2], desc.clear_color[3]);
+    }
+    for (std::size_t i = 0; i < desc.extra_colors.size(); ++i) {
+        if (!Valid(desc.extra_colors[i])) continue;
+        const NSUInteger at = i + 1;
+        rp.colorAttachments[at].texture = impl_->textures[desc.extra_colors[i].v];
+        rp.colorAttachments[at].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[at].storeAction = MTLStoreActionStore;
+        rp.colorAttachments[at].clearColor =
             MTLClearColorMake(desc.clear_color[0], desc.clear_color[1],
                               desc.clear_color[2], desc.clear_color[3]);
     }

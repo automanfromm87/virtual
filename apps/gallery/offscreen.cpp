@@ -836,6 +836,356 @@ int main() {
         std::fclose(f);
     }
 
+    // --- deferred against forward --------------------------------------------
+    //
+    // The claim deferred shading makes is that it produces the SAME picture as
+    // forward, more cheaply when there are many lights. That is a claim the
+    // renderer can check on itself, and this scene is the right place: several
+    // lights, three of them shadow-casting.
+    //
+    // Both paths call one ShadeSurface in the shader rather than two copies of
+    // the lighting model, so agreement there is structural. The plumbing around
+    // it is not shared at all: reconstructing a world position from depth,
+    // round-tripping a normal through a texture, uploading the light list from
+    // a second call site. Each is a chance to be a few percent wrong in a way
+    // that only shows when the two are put side by side.
+    {
+        std::printf("\ndeferred shading\n");
+        // Deferred cannot multisample -- storing and lighting every sample is
+        // four times the memory and four times the lighting, which is the thing
+        // deferring was for. So the comparison runs forward at ONE sample too,
+        // or it would be measuring MSAA instead.
+        std::string derr;
+        auto plain = eng::Renderer::Create(*dev, kFmt, derr, 1);
+        if (!plain) { std::fprintf(stderr, "FAIL: %s\n", derr.c_str()); return 1; }
+        const gallery::Assets da = gallery::Build(*dev, *plain, derr);
+        Check(da.ok, "a single-sampled renderer builds the same scene");
+
+        const eng::rhi::TextureId dshadow = dev->CreateShadowMap(2048);
+        const eng::rhi::TextureId gb0 =
+            dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
+        const eng::rhi::TextureId gb1 =
+            dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
+        // SAMPLEABLE: the lighting pass reads it back to rebuild the world
+        // position. An ordinary depth target is memoryless and cannot be read.
+        const eng::rhi::TextureId gdepth = dev->CreateDepthTarget(kW, kH, true);
+        // The forward comparison gets its OWN depth. Sharing gdepth was the
+        // obvious saving and it silently destroys the G-buffer's depth: a
+        // colour pass does not keep its depth attachment, so the forward run
+        // leaves it undefined and the relight below reads nothing.
+        const eng::rhi::TextureId fdepth = dev->CreateDepthTarget(kW, kH);
+        const eng::rhi::TextureId lit_hdr =
+            dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
+        const eng::rhi::TextureId dout = dev->CreateRenderTarget(kW, kH, kFmt, true);
+        Check(Valid(gb0) && Valid(gb1) && Valid(gdepth) && Valid(lit_hdr) &&
+                  Valid(dout),
+              "the g-buffer targets were created");
+
+        eng::Scene s = gallery::MakeScene(da, 0.0f);
+        s.camera.eye = kEye;
+        s.camera.target = kTarget;
+        // The visible bulbs are Shading::Flat -- unlit, deliberately, so they
+        // read as the light source rather than as small balls near one. A
+        // G-buffer has no way to express "do not light this": every pixel in it
+        // goes through the same BRDF. In a full pipeline they would be drawn
+        // FORWARD after the lighting pass, alongside the transparent geometry.
+        //
+        // They are dropped from BOTH renders here, because leaving them in
+        // would make this measure that known gap rather than the thing under
+        // test -- whether the deferred plumbing reproduces the lit surfaces.
+        const std::size_t all_instances = s.instances.size();
+        s.instances.erase(
+            std::remove_if(s.instances.begin(), s.instances.end(),
+                           [&](const eng::Instance& i) {
+                               return i.material.v == da.lamp_mat.v;
+                           }),
+            s.instances.end());
+        std::printf("    %zu instances, %zu of them lit\n", all_instances,
+                    s.instances.size());
+        Check(s.instances.size() + 3 == all_instances,
+              "the three unlit bulbs were set aside");
+
+        std::vector<std::uint8_t> fwd_px, def_px;
+        eng::RenderStats fwd_stats, def_stats;
+
+        const auto shadow_passes = [&](eng::RenderGraph& g) {
+            eng::RenderGraph::Pass a;
+            a.name = "spot shadows";
+            a.depth = plain->ShadowAtlas();
+            a.clear_depth = 0.0f;
+            a.keep_depth = true;
+            a.execute = [&](eng::rhi::Encoder& e) { plain->DrawLightShadows(e, s); };
+            g.AddPass(std::move(a));
+            eng::RenderGraph::Pass b;
+            b.name = "shadow";
+            b.depth = dshadow;
+            b.clear_depth = 0.0f;
+            b.keep_depth = true;
+            b.execute = [&](eng::rhi::Encoder& e) { plain->DrawShadow(e, s); };
+            g.AddPass(std::move(b));
+        };
+
+        // Run the whole comparison TWICE, once with a single shadow box and
+        // once with cascades. The cascade block is a second uniform binding
+        // that the deferred lighting pass has to fill for itself, and with a
+        // single box the shader never reads it -- so a version that forgot to
+        // upload it would pass every check here and fail the moment a scene
+        // turned cascades on. An interior room does not need cascades; this
+        // turns them on to exercise the path, not because the scene wants them.
+        const auto compare = [&](const char* label) {
+            // DEFERRED FIRST, and the order is not arbitrary. Both paths upload
+            // the light list and the cascade block into the same per-frame ring
+            // buffer. Running forward first leaves that data in place, and a
+            // deferred pass that forgot to upload its own would read the forward
+            // pass's and look perfectly correct -- while a deferred-only
+            // application rendered a black screen. Running deferred first means it
+            // can only see what it uploaded itself.
+            {   // deferred
+                eng::RenderGraph g;
+                shadow_passes(g);
+                eng::RenderGraph::Pass p;
+                p.name = "gbuffer";
+                p.color = gb0;
+                p.extra_colors = {gb1};
+                p.depth = gdepth;
+                // Cleared to zero, normals included. The lighting pass skips those
+                // pixels on depth, so what is in them never reaches the screen --
+                // but a NaN here would survive the skip and poison the bloom chain,
+                // which is a bug this project has already had once.
+                p.clear_color[0] = 0.0f; p.clear_color[1] = 0.0f;
+                p.clear_color[2] = 0.0f; p.clear_color[3] = 0.0f;
+                p.clear_depth = 0.0f;
+                // KEEP the depth. A depth buffer is normally transient and thrown
+                // away at end of pass, and here it is an input to the next one --
+                // without this the lighting pass reads zeros, decides every pixel
+                // is background, and outputs a black frame with no error anywhere.
+                p.keep_depth = true;
+                p.execute = [&](eng::rhi::Encoder& e) {
+                    plain->DrawGBuffer(e, s, kW, kH);
+                };
+                g.AddPass(std::move(p));
+
+                eng::RenderGraph::Pass l;
+                l.name = "deferred light";
+                l.color = lit_hdr;
+                l.reads = {gb0, gb1, gdepth, dshadow, plain->ShadowAtlas()};
+                l.clear_color[0] = 0.018f; l.clear_color[1] = 0.020f;
+                l.clear_color[2] = 0.028f; l.clear_color[3] = 1.0f;
+                l.execute = [&](eng::rhi::Encoder& e) {
+                    plain->DrawDeferredLight(e, s, kW, kH, gb0, gb1, gdepth, dshadow);
+                };
+                g.AddPass(std::move(l));
+
+                eng::RenderGraph::Pass c;
+                c.name = "composite";
+                c.color = dout;
+                c.reads = {lit_hdr};
+                c.execute = [&](eng::rhi::Encoder& e) {
+                    plain->DrawComposite(e, lit_hdr, {}, {}, 0.0f, 0.0f);
+                };
+                g.AddPass(std::move(c));
+                std::string e;
+                Check(g.Compile(e), "the deferred graph compiles");
+                dev->BeginFrame();
+                g.Execute(*dev);
+                std::string w;
+                Check(dev->CommitAndWait(w), "the deferred frame submits");
+                def_stats = plain->LastStats();
+                def_px.assign(std::size_t(kW) * kH * 4, 0);
+                Check(dev->ReadPixels(dout, kW, kH, def_px),
+                      "the deferred frame reads back");
+            }
+
+            {   // forward, one sample
+                eng::RenderGraph g;
+                shadow_passes(g);
+                eng::RenderGraph::Pass p;
+                p.name = "scene";
+                p.color = lit_hdr;
+                p.depth = fdepth;
+                p.clear_color[0] = 0.018f; p.clear_color[1] = 0.020f;
+                p.clear_color[2] = 0.028f; p.clear_color[3] = 1.0f;
+                p.clear_depth = 0.0f;
+                p.reads = {dshadow, plain->ShadowAtlas()};
+                p.execute = [&](eng::rhi::Encoder& e) {
+                    plain->DrawScene(e, s, kW, kH, dshadow);
+                };
+                g.AddPass(std::move(p));
+                eng::RenderGraph::Pass c;
+                c.name = "composite";
+                c.color = dout;
+                c.reads = {lit_hdr};
+                c.execute = [&](eng::rhi::Encoder& e) {
+                    plain->DrawComposite(e, lit_hdr, {}, {}, 0.0f, 0.0f);
+                };
+                g.AddPass(std::move(c));
+                std::string e;
+                Check(g.Compile(e), "the forward graph compiles");
+                dev->BeginFrame();
+                g.Execute(*dev);
+                std::string w;
+                Check(dev->CommitAndWait(w), "the forward frame submits");
+                fwd_stats = plain->LastStats();
+                fwd_px.assign(std::size_t(kW) * kH * 4, 0);
+                Check(dev->ReadPixels(dout, kW, kH, fwd_px),
+                      "the forward frame reads back");
+            }
+
+            // THE LIGHTING PASS ON ITS OWN. Re-light the G-buffer already in
+            // memory, in a later frame, without re-running the geometry pass.
+            //
+            // This is what shows DrawDeferredLight is self-sufficient. Within one
+            // frame it cannot be shown: the G-buffer pass uploads the light list
+            // and the cascade block to the same per-frame slot, so a lighting pass
+            // that uploaded nothing would read that and look perfect. A later frame
+            // is a different slot, and there is nothing there to inherit.
+            //
+            // It is also a real thing to want -- re-lighting a G-buffer without
+            // re-rasterising is the whole basis of light-count scaling.
+            {
+                eng::RenderGraph g;
+                // Written last frame, not this one.
+                g.Import(gb0);
+                g.Import(gb1);
+                g.Import(gdepth);
+                g.Import(dshadow);
+                g.Import(plain->ShadowAtlas());
+                eng::RenderGraph::Pass l;
+                l.name = "relight";
+                // Into the HDR target and THEN through the composite, exactly as
+                // the deferred render did. Writing the lighting result straight
+                // into the 8-bit output would skip the tone map, and linear
+                // radiance clipped to a display range is not a dimmer version of
+                // the right picture -- it is a different one.
+                l.color = lit_hdr;
+                l.reads = {gb0, gb1, gdepth, dshadow, plain->ShadowAtlas()};
+                l.clear_color[0] = 0.018f; l.clear_color[1] = 0.020f;
+                l.clear_color[2] = 0.028f; l.clear_color[3] = 1.0f;
+                l.execute = [&](eng::rhi::Encoder& e) {
+                    plain->DrawDeferredLight(e, s, kW, kH, gb0, gb1, gdepth, dshadow);
+                };
+                g.AddPass(std::move(l));
+                eng::RenderGraph::Pass rc;
+                rc.name = "composite";
+                rc.color = dout;
+                rc.reads = {lit_hdr};
+                rc.execute = [&](eng::rhi::Encoder& e) {
+                    plain->DrawComposite(e, lit_hdr, {}, {}, 0.0f, 0.0f);
+                };
+                g.AddPass(std::move(rc));
+                std::string e;
+                Check(g.Compile(e), "the relight graph compiles");
+                // ONE frame on, and the count matters. The uniform ring has
+                // kFramesInFlight slots and cycles: the deferred render took the
+                // first, the forward render the second, so the next frame is the
+                // third -- one this renderer has never written. Running TWO frames
+                // instead wraps straight back onto the deferred render's slot and
+                // the pass inherits its upload again, which is exactly the thing
+                // this is here to rule out. It was two, and it proved nothing.
+                static_assert(eng::rhi::kFramesInFlight == 3,
+                              "the frame count below assumes a three-slot ring");
+                dev->BeginFrame();
+                g.Execute(*dev);
+                std::string w;
+                Check(dev->CommitAndWait(w), "the relight frame submits");
+                std::vector<std::uint8_t> re_px(std::size_t(kW) * kH * 4, 0);
+                Check(dev->ReadPixels(dout, kW, kH, re_px), "the relight frame reads back");
+                long long re_sum = 0;
+                int re_worst = 0;
+                for (std::size_t i = 0; i + 3 < re_px.size(); i += 4) {
+                    for (int c = 0; c < 3; ++c) {
+                        re_sum += re_px[i + std::size_t(c)];
+                        re_worst = std::max(re_worst,
+                                            std::abs(int(re_px[i + std::size_t(c)]) -
+                                                     int(def_px[i + std::size_t(c)])));
+                    }
+                }
+                std::printf("    relit from the same g-buffer two frames later: "
+                            "worst channel differs by %d\n", re_worst);
+                Check(re_worst == 0, "the lighting pass needs nothing from the geometry pass");
+                Check(re_sum > 4000000, "and the relit image is still lit");
+            }
+
+            std::printf("    forward drew %d instances, the g-buffer pass %d\n",
+                        fwd_stats.draws, def_stats.draws);
+            Check(def_stats.draws > 0, "the g-buffer pass drew something");
+            Check(def_stats.draws == fwd_stats.draws,
+                  "both paths drew the same geometry");
+
+            // The comparison. Two paths cannot be bit-identical here and it would
+            // be wrong to demand it: the normal makes a round trip through a
+            // half-float texture, and the world position is REBUILT from a depth
+            // buffer rather than interpolated across a triangle. Both cost a
+            // fraction of a level almost everywhere.
+            //
+            // So the bound is the same shape as the one the jpeg tests use: the
+            // MEAN must be small, and every large difference must sit on an EDGE.
+            // A large difference in a flat region is not reconstruction error --
+            // it is a light applied twice, a shadow sampled from the wrong place,
+            // or a normal decoded wrong, and those are exactly the bugs a loose
+            // worst-case bound would hide.
+            const auto at_edge = [&](int x, int y) {
+                const std::size_t here = (std::size_t(y) * kW + x) * 4;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int nx = x + dx, ny = y + dy;
+                        if (nx < 0 || ny < 0 || nx >= kW || ny >= kH) continue;
+                        const std::size_t q = (std::size_t(ny) * kW + nx) * 4;
+                        for (int c = 0; c < 3; ++c)
+                            if (std::abs(int(fwd_px[q + std::size_t(c)]) -
+                                         int(fwd_px[here + std::size_t(c)])) > 40)
+                                return true;
+                    }
+                return false;
+            };
+
+            long long sum = 0, fwd_sum = 0, def_sum = 0;
+            int worst = 0, large = 0, large_in_flat = 0, lit_pixels = 0, flat = 0;
+            for (int y = 0; y < kH; ++y)
+                for (int x = 0; x < kW; ++x) {
+                    const std::size_t i = (std::size_t(y) * kW + x) * 4;
+                    int here = 0;
+                    for (int c = 0; c < 3; ++c)
+                        here = std::max(here,
+                                        std::abs(int(fwd_px[i + std::size_t(c)]) -
+                                                 int(def_px[i + std::size_t(c)])));
+                    sum += here;
+                    worst = std::max(worst, here);
+                    const bool edge = at_edge(x, y);
+                    if (!edge) ++flat;
+                    if (here > 8) {
+                        ++large;
+                        if (!edge) ++large_in_flat;
+                    }
+                    const int b = fwd_px[i] + fwd_px[i + 1] + fwd_px[i + 2];
+                    if (b > 24) ++lit_pixels;
+                    fwd_sum += b;
+                    def_sum += def_px[i] + def_px[i + 1] + def_px[i + 2];
+                }
+            const double mean = double(sum) / (double(kW) * kH);
+            std::printf("    [%s] forward vs deferred: mean %.3f, worst %d, "
+                        "%d pixels over 8 and %d of those in flat regions\n",
+                        label, mean, worst, large, large_in_flat);
+            std::printf("    %d%% of the image is flat, %d pixels are lit\n",
+                        100 * flat / (kW * kH), lit_pixels);
+            std::printf("    total brightness: forward %lld, deferred %lld (%.2f%%)\n",
+                        fwd_sum, def_sum, 100.0 * double(def_sum) / double(fwd_sum));
+            Check(mean < 0.2, "deferred matches forward on average");
+            Check(large_in_flat == 0, "every large difference is on an edge");
+            // Without these two the whole comparison would pass on a pair of black
+            // images, or on a pair where both paths lost the same light.
+            Check(lit_pixels > 100000, "the comparison was made on a lit image");
+            Check(flat > (kW * kH) / 2, "and most of it is flat, so the edge rule bites");
+            // Without this the whole comparison would pass on two black images.
+            Check(fwd_sum > 4000000 && def_sum > 4000000, "both images are lit");
+        };
+
+        compare("one shadow box");
+        s.shadowCascades = 3;
+        s.shadowDistance = 22.0f;
+        compare("three cascades");
+    }
+
     std::printf(g_failures == 0 ? "\ngallery_test: all checks passed\n"
                                 : "\ngallery_test: %d FAILED\n", g_failures);
     return g_failures == 0 ? 0 : 1;

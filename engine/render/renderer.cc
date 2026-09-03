@@ -40,9 +40,17 @@ constexpr char kSsaoSrc[] = {
 constexpr char kBloomSrc[] = {
 #embed "engine/shaders/bloom.metal"
     , 0};
+// Prepended to every shader that lights a surface, so the forward and deferred
+// paths run the same code rather than two copies of it.
+constexpr char kShadingSrc[] = {
+#embed "engine/shaders/shading.metal"
+    , 0};
+constexpr char kDeferredSrc[] = {
+#embed "engine/shaders/deferred.metal"
+    , 0};
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
-static_assert(sizeof(FrameUniforms) == 352, "FrameUniforms layout drifted");
+static_assert(sizeof(FrameUniforms) == 416, "FrameUniforms layout drifted");
 static_assert(sizeof(GpuLight) == 144, "GpuLight layout drifted");
 static_assert(sizeof(GpuCascades) == 288, "GpuCascades layout drifted");
 static_assert(sizeof(VertexIn) == 64, "VertexIn layout drifted");
@@ -75,6 +83,13 @@ std::string ShaderSource(const char* body) {
     return std::string(kShaderTypesSrc) + "\n" + body;
 }
 
+// For anything that lights a surface. The shading library goes in between, so
+// the forward and deferred fragment shaders call the SAME ShadeSurface rather
+// than each carrying a copy that drifts.
+std::string ShadingSource(const char* body) {
+    return std::string(kShaderTypesSrc) + "\n" + kShadingSrc + "\n" + body;
+}
+
 }  // namespace
 
 // One entry of the mesh registry: the GPU buffers plus the CPU-side bounds
@@ -96,6 +111,13 @@ struct GpuMaterial {
     // rather than on first use, so a skinned draw never fails at frame time for
     // a reason a material could have reported at creation.
     rhi::PipelineId skinned_pipeline;
+    // The same material compiled for the DEFERRED geometry pass. Built for
+    // every opaque lit material whether or not the deferred path is used --
+    // the alternative is a pipeline compile in the middle of the first frame
+    // that switches to it, which is a visible hitch at exactly the moment
+    // someone is looking for a difference between the two paths.
+    rhi::PipelineId gbuffer_pipeline;
+    rhi::PipelineId gbuffer_skinned_pipeline;
     rhi::Cull cull = rhi::Cull::Back;
     bool depth_test = true;
     bool transparent = false;
@@ -136,6 +158,7 @@ struct Renderer::Impl {
 
     rhi::BufferId triangle_vb;
     rhi::PipelineId composite;
+    rhi::PipelineId deferred_light;
     rhi::PipelineId shadow;
     rhi::PipelineId shadow_skinned;
     rhi::TextureId shadow_atlas;
@@ -148,6 +171,7 @@ struct Renderer::Impl {
     // frustum the camera will actually use. The shadow pass runs first and has
     // no width or height of its own.
     float last_aspect = 0.0f;
+    Mat4 inv_view_proj = Mat4::Identity();
     rhi::PipelineId ssao;
     rhi::TextureId dummy_shadow;  // bound when shadows are off
     // 1x1 opaque white. Standing in for an absent map keeps the shader
@@ -239,6 +263,10 @@ struct Renderer::Impl {
         return off;
     }
 
+    void DrawGeometry(rhi::Encoder&, const Scene&, int width, int height,
+                      rhi::TextureId shadow_map, bool gbuffer);
+    void UploadLights(const Scene&, std::size_t light_offset, int light_count);
+    void UploadCascades(const Scene&, std::size_t cascade_offset, float aspect);
     [[nodiscard]] rhi::Format FormatFor(Shading) const;
     // Fullscreen passes read a resolved texture and write a single-sampled one.
     [[nodiscard]] int SamplesFor(Shading shading) const {
@@ -281,6 +309,13 @@ rhi::Format Renderer::Impl::FormatFor(Shading shading) const {
         case Shading::Flat:
         case Shading::BloomBright:
         case Shading::BloomBlur:
+        // The G-buffer is half-float for the same reason the scene is: an
+        // emissive albedo can be far above 1, and an 8-bit target clips it to
+        // white and takes the colour with it. The normal needs the precision
+        // too -- an 8-bit normal quantises to about a degree, which shows as
+        // banding across every smooth curve.
+        case Shading::GBuffer:
+        case Shading::DeferredLight:
             return Renderer::kSceneFormat;
         // The composite is the pass that brings it down to a display.
         default:
@@ -312,9 +347,21 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
 
     rhi::PipelineDesc desc;
     if (shading == Shading::Lit) {
-        desc.source = ShaderSource(kLitSrc);
+        desc.source = ShadingSource(kLitSrc);
         desc.vertex_fn = skinned ? "vs_skinned" : "vs_lit";
         desc.fragment_fn = "fs_lit";
+    } else if (shading == Shading::GBuffer) {
+        // The G-buffer pass reuses the LIT vertex shader verbatim: the geometry
+        // side of forward and deferred is identical, and only what the fragment
+        // stage does with it differs.
+        desc.source = ShadingSource(std::string(kLitSrc).append(kDeferredSrc).c_str());
+        desc.vertex_fn = skinned ? "vs_skinned" : "vs_lit";
+        desc.fragment_fn = "fs_gbuffer";
+        desc.extra_colors = {kSceneFormat};  // attachment 1: normal + metallic
+    } else if (shading == Shading::DeferredLight) {
+        desc.source = ShadingSource(std::string(kLitSrc).append(kDeferredSrc).c_str());
+        desc.vertex_fn = "vs_deferred";
+        desc.fragment_fn = "fs_deferred";
     } else if (shading == Shading::Composite) {
         desc.source = ShaderSource(kCompositeSrc);
         desc.vertex_fn = "vs_composite";
@@ -446,6 +493,18 @@ MaterialHandle Renderer::CreateMaterial(const MaterialDesc& desc,
         m.skinned_pipeline = impl_->GetOrCreatePipeline(
             desc.shading, desc.depth_test, desc.transparent, error, /*skinned=*/true);
         if (!Valid(m.skinned_pipeline)) return {};
+        // A TRANSPARENT material has no G-buffer form, and that is not an
+        // oversight: a G-buffer holds one surface per pixel and glass needs
+        // the one behind it too. Transparent geometry is drawn forward, after
+        // the deferred lighting pass.
+        if (!desc.transparent && desc.depth_test) {
+            m.gbuffer_pipeline = impl_->GetOrCreatePipeline(
+                Shading::GBuffer, desc.depth_test, false, error);
+            if (!Valid(m.gbuffer_pipeline)) return {};
+            m.gbuffer_skinned_pipeline = impl_->GetOrCreatePipeline(
+                Shading::GBuffer, desc.depth_test, false, error, /*skinned=*/true);
+            if (!Valid(m.gbuffer_skinned_pipeline)) return {};
+        }
     }
     m.cull = desc.cull;
     m.depth_test = desc.depth_test;
@@ -547,6 +606,12 @@ std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
     r->impl_->shadow_skinned = r->impl_->GetOrCreatePipeline(
         Shading::ShadowDepth, true, false, error, /*skinned=*/true);
     if (!Valid(r->impl_->shadow_skinned)) return nullptr;
+    // No depth test: the lighting pass covers the screen and decides what is
+    // background by reading the depth buffer as a TEXTURE, which it could not
+    // do if the same buffer were attached for testing.
+    r->impl_->deferred_light = r->impl_->GetOrCreatePipeline(
+        Shading::DeferredLight, false, false, error);
+    if (!Valid(r->impl_->deferred_light)) return nullptr;
 
     // Something has to be bound at the shadow slot even when shadows are off;
     // the shader guards on a flag rather than reading it, so 1x1 is plenty.
@@ -853,26 +918,26 @@ void Renderer::DrawSceneDepth(rhi::Encoder& enc, const Scene& scene, int width,
 
 void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
                          int height, rhi::TextureId shadow_map) {
-    impl_->stats = RenderStats{};
-    impl_->stats.submitted = int(scene.instances.size());
-    impl_->draw_order.clear();
-    if (width <= 0 || height <= 0 || scene.instances.empty()) return;
+    impl_->DrawGeometry(enc, scene, width, height, shadow_map, /*gbuffer=*/false);
+}
 
-    // A pipeline built without depth cannot run in a pass that has one, and
-    // vice versa — Metal rejects the draw outright. Rather than let the caller
-    // find out as a validation abort, skip and count.
-    const bool pass_depth = impl_->dev->CurrentPassHasDepth();
+void Renderer::DrawGBuffer(rhi::Encoder& enc, const Scene& scene, int width,
+                           int height) {
+    // No shadow map: the G-buffer pass does not light anything, so it has no
+    // use for one. Shadows are sampled by the lighting pass that follows.
+    impl_->DrawGeometry(enc, scene, width, height, {}, /*gbuffer=*/true);
+}
 
-    const Mat4 viewProj = scene.camera.ViewProj(float(width) / float(height));
-    // The light list, uploaded once for the whole pass. Anything past the
-    // budget is DROPPED rather than wrapped: silently lighting a scene with a
-    // different subset every frame would flicker.
-    const std::size_t light_offset =
-        std::size_t(impl_->dev->FrameSlot()) * impl_->light_slot_bytes;
-    const int light_count =
-        std::min(int(scene.lights.size()), int(ENG_MAX_LIGHTS));
-    {
-        auto* dst = reinterpret_cast<GpuLight*>(impl_->light_map + light_offset);
+// The light list and the cascade block, uploaded once per pass.
+//
+// Extracted so the forward and deferred paths share them rather than each
+// filling the buffer its own way. They are read by the same shader function, so
+// a difference here would be a difference in the picture -- and one that only
+// appears when the renderer is switched between paths, which is the hardest
+// kind to notice.
+void Renderer::Impl::UploadLights(const Scene& scene, std::size_t light_offset,
+                                  int light_count) {
+        auto* dst = reinterpret_cast<GpuLight*>(light_map + light_offset);
         for (int i = 0; i < light_count; ++i) {
             const Light& l = scene.lights[std::size_t(i)];
             GpuLight g{};
@@ -890,8 +955,8 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
             g.cone = Vec4{std::max(inner, outer + 1e-3f), outer, 0.0f, 0.0f};
 
             // Where its depth map sits, if DrawLightShadows gave it one.
-            const int tile = std::size_t(i) < impl_->shadow_tile_of_light.size()
-                                 ? impl_->shadow_tile_of_light[std::size_t(i)]
+            const int tile = std::size_t(i) < shadow_tile_of_light.size()
+                                 ? shadow_tile_of_light[std::size_t(i)]
                                  : -1;
             if (tile >= 0) {
                 // A spot carries its projection; a point light does not need
@@ -905,17 +970,13 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
         }
     }
 
-    impl_->last_aspect = float(width) / float(height);
-    const bool shadows = scene.shadowExtent > 0.0f && Valid(shadow_map);
-
-    const std::size_t cascade_offset =
-        std::size_t(impl_->dev->FrameSlot()) * impl_->cascade_slot_bytes;
-    {
+void Renderer::Impl::UploadCascades(const Scene& scene,
+                                    std::size_t cascade_offset, float aspect) {
         const int n = std::clamp(scene.shadowCascades, 1, 4);
-        auto* dst = reinterpret_cast<GpuCascades*>(impl_->cascade_map + cascade_offset);
+        auto* dst = reinterpret_cast<GpuCascades*>(cascade_map + cascade_offset);
         GpuCascades g{};
         for (int i = 0; i < n; ++i) {
-            g.viewProj[i] = n > 1 ? scene.CascadeViewProj(i, impl_->last_aspect)
+            g.viewProj[i] = n > 1 ? scene.CascadeViewProj(i, aspect)
                                   : scene.LightViewProj();
             (&g.splits.x)[i] = scene.CascadeSplit(i + 1);
         }
@@ -925,8 +986,42 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
         g.info = Vec4{float(n), float(n > 1 ? 2 : 1), n > 1 ? 0.5f : 1.0f, 0.0f};
         *dst = g;
     }
+
+void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
+                                  int width, int height,
+                                  rhi::TextureId shadow_map, bool gbuffer) {
+    stats = RenderStats{};
+    stats.submitted = int(scene.instances.size());
+    draw_order.clear();
+    if (width <= 0 || height <= 0 || scene.instances.empty()) return;
+
+    // A pipeline built without depth cannot run in a pass that has one, and
+    // vice versa — Metal rejects the draw outright. Rather than let the caller
+    // find out as a validation abort, skip and count.
+    const bool pass_depth = dev->CurrentPassHasDepth();
+
+    const Mat4 viewProj = scene.camera.ViewProj(float(width) / float(height));
+    // The light list, uploaded once for the whole pass. Anything past the
+    // budget is DROPPED rather than wrapped: silently lighting a scene with a
+    // different subset every frame would flicker.
+    const std::size_t light_offset =
+        std::size_t(dev->FrameSlot()) * light_slot_bytes;
+    const int light_count =
+        std::min(int(scene.lights.size()), int(ENG_MAX_LIGHTS));
+    UploadLights(scene, light_offset, light_count);
+
+    last_aspect = float(width) / float(height);
+    // Kept for the deferred lighting pass, which reconstructs a world position
+    // from the depth buffer and has no vertex to have carried one.
+    inv_view_proj = Inverse(viewProj);
+    const bool shadows = scene.shadowExtent > 0.0f && Valid(shadow_map);
+
+    const std::size_t cascade_offset =
+        std::size_t(dev->FrameSlot()) * cascade_slot_bytes;
+    UploadCascades(scene, cascade_offset, last_aspect);
+
     const Mat4 lightViewProj = shadows ? scene.LightViewProj() : Mat4::Identity();
-    const rhi::TextureId shadow_tex = shadows ? shadow_map : impl_->dummy_shadow;
+    const rhi::TextureId shadow_tex = shadows ? shadow_map : dummy_shadow;
 
     // --- cull ----------------------------------------------------------------
     // Reject before touching the GPU at all. A culled object costs one plane
@@ -934,20 +1029,20 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
     const Frustum frustum = Frustum::FromViewProj(viewProj);
     const Vec3 eye = scene.camera.eye;
 
-    impl_->visible.clear();
+    visible.clear();
     for (int idx = 0; idx < int(scene.instances.size()); ++idx) {
         const Instance& inst = scene.instances[idx];
-        if (!Valid(inst.mesh) || inst.mesh.v >= impl_->meshes.size() ||
-            !Valid(inst.material) || inst.material.v >= impl_->materials.size()) {
-            ++impl_->stats.invalid;
+        if (!Valid(inst.mesh) || inst.mesh.v >= meshes.size() ||
+            !Valid(inst.material) || inst.material.v >= materials.size()) {
+            ++stats.invalid;
             continue;
         }
-        if (impl_->materials[inst.material.v].depth_test != pass_depth) {
-            ++impl_->stats.incompatible;
+        if (materials[inst.material.v].depth_test != pass_depth) {
+            ++stats.incompatible;
             continue;
         }
 
-        const GpuMesh& gm = impl_->meshes[inst.mesh.v];
+        const GpuMesh& gm = meshes[inst.mesh.v];
         // Object-space bounds pushed out to world space. A sphere only needs
         // its centre moved and its radius scaled — no re-fitting, which is
         // exactly why the bounds are a sphere and not a box.
@@ -957,17 +1052,17 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
         const float world_radius = gm.bounds.radius * MaxScale(inst.model);
 
         if (!frustum.IntersectsSphere(world_center, world_radius)) {
-            ++impl_->stats.culled;
+            ++stats.culled;
             continue;
         }
 
         DrawItem item;
         item.inst = &inst;
         item.index = idx;
-        item.pipeline = impl_->materials[inst.material.v].pipeline.v;
+        item.pipeline = materials[inst.material.v].pipeline.v;
         item.depth = Length(world_center - eye);
-        item.transparent = impl_->materials[inst.material.v].transparent;
-        impl_->visible.push_back(item);
+        item.transparent = materials[inst.material.v].transparent;
+        visible.push_back(item);
     }
 
     // --- sort ----------------------------------------------------------------
@@ -980,7 +1075,7 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
     //  * Transparent: strictly BACK-TO-FRONT, and only after every opaque
     //    object. Blending is not commutative, so here the order IS the result —
     //    and with depth writes off there is nothing else to sort it out.
-    std::sort(impl_->visible.begin(), impl_->visible.end(),
+    std::sort(visible.begin(), visible.end(),
               [](const DrawItem& a, const DrawItem& b) {
                   if (a.transparent != b.transparent) return b.transparent;
                   if (a.transparent) return a.depth > b.depth;  // far first
@@ -995,41 +1090,48 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
     rhi::Cull bound_cull = rhi::Cull::None;
     bool cull_set = false;
 
-    for (const DrawItem& item : impl_->visible) {
+    for (const DrawItem& item : visible) {
         const Instance& inst = *item.inst;
-        const std::size_t offset = impl_->AllocUniform();
+        const std::size_t offset = AllocUniform();
         if (offset == Impl::kNoSpace) {
             // Ring slot full. Drop the rest rather than overrun, and SAY so —
             // a silently short frame is the worst possible failure here.
-            impl_->stats.overflowed =
-                int(impl_->visible.size()) - impl_->stats.draws;
+            stats.overflowed =
+                int(visible.size()) - stats.draws;
             break;
         }
 
-        const GpuMesh& gm = impl_->meshes[inst.mesh.v];
-        const GpuMaterial& mat = impl_->materials[inst.material.v];
+        const GpuMesh& gm = meshes[inst.mesh.v];
+        const GpuMaterial& mat = materials[inst.material.v];
 
         const bool skinned = IsSkinned(gm, *item.inst, scene);
         std::size_t palette_offset = Impl::kNoSpace;
         if (skinned) {
-            palette_offset = impl_->AllocPalette();
+            palette_offset = AllocPalette();
             if (palette_offset == Impl::kNoSpace) {
-                ++impl_->stats.overflowed;
+                ++stats.overflowed;
                 continue;
             }
-            std::memcpy(impl_->palette_map + palette_offset,
+            std::memcpy(palette_map + palette_offset,
                         scene.joint_matrices.data() + item.inst->palette,
                         sizeof(Mat4) * std::size_t(gm.joint_count));
         }
-        const rhi::PipelineId want = skinned ? mat.skinned_pipeline : mat.pipeline;
+        // In the deferred geometry pass a material without a G-buffer form is
+        // SKIPPED, not drawn forward: it is transparent, and drawing it here
+        // would write its surface into the buffer as if it were opaque and
+        // erase whatever is behind it.
+        const rhi::PipelineId want =
+            gbuffer ? (skinned ? mat.gbuffer_skinned_pipeline : mat.gbuffer_pipeline)
+                    : (skinned ? mat.skinned_pipeline : mat.pipeline);
         if (!Valid(want)) {
-            ++impl_->stats.invalid;
+            if (gbuffer) ++stats.incompatible;
+            else ++stats.invalid;
             continue;
         }
         if (want.v != bound_pipeline.v) {
             enc.SetPipeline(want);
             bound_pipeline = want;
-            ++impl_->stats.pipeline_switches;
+            ++stats.pipeline_switches;
         }
         if (!cull_set || mat.cull != bound_cull) {
             // The mesh generators guarantee CCW-from-outside.
@@ -1050,6 +1152,7 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
                          scene.clipY};
         u.eyePos = Vec4{scene.camera.eye.x, scene.camera.eye.y,
                         scene.camera.eye.z, 1.0f};
+        u.invViewProj = inv_view_proj;
         u.lighting = Vec4{float(light_count), 0.0f, 0.0f, 0.0f};
         u.ambientSky = Vec4{scene.ambientSky.x, scene.ambientSky.y,
                             scene.ambientSky.z, 0.0f};
@@ -1057,13 +1160,13 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
                                scene.ambientGround.z, 0.0f};
 
         // Sub-allocate out of this frame's slot instead of a per-draw setBytes.
-        std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
+        std::memcpy(uniform_map + offset, &u, sizeof(u));
 
         enc.SetVertexBuffer(gm.vb, 0, kVertexSlot);
-        enc.SetVertexBuffer(impl_->uniforms, offset, kUniformSlot);
-        enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
-        enc.SetFragmentBuffer(impl_->lights, light_offset, kLightSlot);
-        enc.SetFragmentBuffer(impl_->cascades, cascade_offset, kCascadeSlot);
+        enc.SetVertexBuffer(uniforms, offset, kUniformSlot);
+        enc.SetFragmentBuffer(uniforms, offset, kUniformSlot);
+        enc.SetFragmentBuffer(lights, light_offset, kLightSlot);
+        enc.SetFragmentBuffer(cascades, cascade_offset, kCascadeSlot);
         enc.SetFragmentTexture(mat.albedo, 0);
         enc.SetFragmentTexture(mat.roughness_map, 1);
         enc.SetFragmentTexture(shadow_tex, 2);
@@ -1071,16 +1174,16 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
         // has a tile, so the placeholder stands in — the shader guards on the
         // per-light flag rather than on the texture.
         enc.SetFragmentTexture(
-            Valid(impl_->shadow_atlas) ? impl_->shadow_atlas : impl_->dummy_shadow, 3);
-        enc.SetFragmentSampler(impl_->sampler, 0);
+            Valid(shadow_atlas) ? shadow_atlas : dummy_shadow, 3);
+        enc.SetFragmentSampler(sampler, 0);
         if (skinned) {
             enc.SetVertexBuffer(gm.skin_vb, 0, kSkinSlot);
-            enc.SetVertexBuffer(impl_->palettes, palette_offset, kPaletteSlot);
+            enc.SetVertexBuffer(palettes, palette_offset, kPaletteSlot);
         }
         enc.DrawIndexedU16(gm.ib, gm.index_count);
-        impl_->draw_order.push_back(item.index);
-        ++impl_->stats.draws;
-        if (item.transparent) ++impl_->stats.transparent_draws;
+        draw_order.push_back(item.index);
+        ++stats.draws;
+        if (item.transparent) ++stats.transparent_draws;
     }
 }
 
@@ -1129,6 +1232,73 @@ void Renderer::DrawComposite(rhi::Encoder& enc, rhi::TextureId src,
     enc.SetFragmentTexture(Valid(bloom) ? bloom : impl_->black, 2);
     enc.SetFragmentSampler(impl_->sampler, 0);
     enc.Draw(3);  // one oversized triangle, generated from the vertex id
+}
+
+void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
+                                 int width, int height,
+                                 rhi::TextureId albedo_rough,
+                                 rhi::TextureId normal_metal,
+                                 rhi::TextureId depth,
+                                 rhi::TextureId shadow_map) {
+    if (width <= 0 || height <= 0) return;
+    if (!Valid(albedo_rough) || !Valid(normal_metal) || !Valid(depth)) return;
+
+    // The light list and the cascade block, exactly as the forward path builds
+    // them -- the same buffers, the same layout, because the shader reading
+    // them is the same shader.
+    const std::size_t light_offset =
+        std::size_t(impl_->dev->FrameSlot()) * impl_->light_slot_bytes;
+    const int light_count =
+        std::min(int(scene.lights.size()), int(ENG_MAX_LIGHTS));
+    impl_->UploadLights(scene, light_offset, light_count);
+
+    const std::size_t cascade_offset =
+        std::size_t(impl_->dev->FrameSlot()) * impl_->cascade_slot_bytes;
+    const float aspect = float(width) / float(height);
+    impl_->UploadCascades(scene, cascade_offset, aspect);
+
+    const bool shadows = scene.shadowExtent > 0.0f && Valid(shadow_map);
+    const Mat4 viewProj = scene.camera.ViewProj(aspect);
+
+    FrameUniforms u{};
+    u.viewProj = viewProj;
+    u.invViewProj = Inverse(viewProj);
+    u.model = Mat4::Identity();
+    u.tint = Vec4{1, 1, 1, 1};
+    u.lightDir = scene.lightDir;
+    u.lightColor = scene.lightColor;
+    u.baseColor = Vec4{1, 1, 1, 1};
+    u.lightViewProj = shadows ? scene.LightViewProj() : Mat4::Identity();
+    // Roughness and metallic come from the G-buffer, not from here. The two
+    // slots that still matter are the shadow flag and the section cut -- and
+    // the cut has ALREADY been applied, by the G-buffer pass discarding those
+    // fragments, so applying it again here would do nothing but cost a branch.
+    u.surface = Vec4{1.0f, 0.0f, shadows ? 1.0f : 0.0f, 1e30f};
+    u.eyePos = Vec4{scene.camera.eye.x, scene.camera.eye.y, scene.camera.eye.z,
+                    1.0f};
+    u.lighting = Vec4{float(light_count), 0.0f, 0.0f, 0.0f};
+    u.ambientSky = Vec4{scene.ambientSky.x, scene.ambientSky.y,
+                        scene.ambientSky.z, 0.0f};
+    u.ambientGround = Vec4{scene.ambientGround.x, scene.ambientGround.y,
+                           scene.ambientGround.z, 0.0f};
+
+    const std::size_t offset = impl_->AllocUniform();
+    if (offset == Impl::kNoSpace) return;
+    std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
+
+    enc.SetPipeline(impl_->deferred_light);
+    enc.SetCull(rhi::Cull::None, rhi::Winding::CounterClockwise);
+    enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
+    enc.SetFragmentBuffer(impl_->lights, light_offset, kLightSlot);
+    enc.SetFragmentBuffer(impl_->cascades, cascade_offset, kCascadeSlot);
+    enc.SetFragmentTexture(albedo_rough, 0);
+    enc.SetFragmentTexture(normal_metal, 1);
+    enc.SetFragmentTexture(shadows ? shadow_map : impl_->dummy_shadow, 2);
+    enc.SetFragmentTexture(
+        Valid(impl_->shadow_atlas) ? impl_->shadow_atlas : impl_->dummy_shadow, 3);
+    enc.SetFragmentTexture(depth, 4);
+    enc.SetFragmentSampler(impl_->sampler, 0);
+    enc.Draw(3);
 }
 
 void Renderer::DrawBloomBright(rhi::Encoder& enc, rhi::TextureId src,
