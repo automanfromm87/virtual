@@ -7,7 +7,7 @@ repository, and the only outside code is Apple's own frameworks — Metal for th
 GPU, CoreText for glyph outlines, AudioToolbox for the speaker and for decoding
 compressed audio.
 
-Around 52,000 lines, 52 test targets, everything built with Bazel.
+Around 63,000 lines, 65 test targets, everything built with Bazel.
 
 ## Running it
 
@@ -21,6 +21,7 @@ bazel run -c opt //apps/particles:viewer # 60k GPU particles
 bazel run -c opt //apps/fluid:viewer     # SPH fluid, dam break
 bazel run -c opt //apps/skinned:viewer   # skeletal animation
 bazel run -c opt //apps/world:viewer     # physics + ECS + glTF
+bazel run -c opt //apps/shot -- --studio /tmp/a.png  # one frame, straight to a PNG
 
 bazel test //...
 ```
@@ -32,11 +33,53 @@ an audio file to give the isometric demo a soundtrack.
 ## What is in it
 
 **Rendering.** Forward and deferred paths that produce the same image from one
-shared shading function. Cook-Torrance PBR, HDR with a tone map at the end,
-bloom, SSAO, 4× MSAA. Shadows: cascaded for the sun, perspective for spots, cube
-maps for point lights, and hardware ray-traced as an alternative. GPU-driven
-drawing — instancing, a compute culling pass, indirect draws — which takes 6000
-objects from 3428 draw calls at 3.38 ms to 3 draws at 0.98 ms.
+shared shading function. Cook-Torrance PBR with multiple-scattering
+compensation — a white metal in a white furnace stays at 231/255 across every
+roughness, where single scattering falls to 178. HDR with a tone map at the
+end, bloom, SSAO, 4× MSAA. Shadows: cascaded for the sun, perspective for
+spots, cube maps for point lights, and hardware ray-traced as an alternative.
+GPU-driven drawing — instancing, a compute culling pass, indirect draws — which
+takes 6000 objects from 3428 draw calls at 3.38 ms to 3 draws at 0.98 ms.
+
+**Surfaces.** Tangents on every vertex and tangent-space normal maps, with
+metallic, emissive and baked-occlusion maps beside them. Mip chains built on
+upload and 16× anisotropic filtering: the aliasing on a receding checkerboard
+floor drops to 4.9% of its unfiltered value, and anisotropy keeps 14.0 of
+contrast in the band where an isotropic mip keeps 8.1. Block compression —
+BC1, BC3 and BC5 with the encoder — at 8:1 against RGBA8, and BC5 holds a
+normal map to 1.52/255 where BC1 manages 17.75. Indices are 32-bit, so a mesh
+has no vertex ceiling.
+
+**Lighting at scale.** Clustered lighting over a 16×9×24 frustum grid with a
+CPU frustum pre-cull: 256 lights render pixel-identically to the brute-force
+loop, 12.4× faster, and the curve is flat because the bins are byte-identical
+whatever the total. Baked irradiance volumes for indirect light, path-traced on
+the CPU with real bounces — a red wall turns the floor beside it red and
+nothing nine metres away. Froxel volumetrics for shafts, glow and fog a shadow
+darkens.
+
+**Mesh shaders.** Meshlets of 64 vertices and 124 triangles with bounding
+spheres and normal cones, culled by an object stage that launches zero or one
+mesh threadgroups. Bit-identical to the vertex path while rejecting 19 of 101
+meshlets — so those nineteen were provably invisible.
+
+**Transparency.** Weighted-blended order-independent transparency. Three
+intersecting panes give the same pixels in any submission order to within one
+level, where the back-to-front sort differs by 78 because their depths tie.
+
+**Display.** SDR, extended-range linear and Rec.2100 PQ. The PQ path matches
+SMPTE ST 2084 to 0.0004 — a tenth of a 10-bit code step — and the HDR modes
+are the identity below the roll-off, so an SDR-looking image does not wash out.
+
+**Stereo.** Both eyes from one pass by vertex amplification, into a two-layer
+target. Each slice is bit-identical to its own single-eye pass, at 0.075 ms
+against 0.103 for two, and a 64 mm eye offset moves the image by exactly what
+a 64 mm object offset does.
+
+**Streaming.** Residency by angular size under a byte budget, loaded on worker
+threads and evicted with hysteresis: 200 frames stepping across a level
+boundary cause zero loads and zero evictions, and four threads reach
+byte-identical residency to the synchronous path.
 
 **Image-based lighting.** A physically based sky — Rayleigh and Mie scattering
 integrated along the view ray — baked into a radiance cube, then convolved into
@@ -47,14 +90,16 @@ from every stage.
 
 **Post-processing.** Auto-exposure from a GPU luminance histogram, height fog
 integrated analytically along the ray, depth of field, motion blur, temporal
-antialiasing with a YCoCg variance clamp, screen-space reflections, and a
-parametric colour grade whose defaults are bit-for-bit a no-op.
+antialiasing with a YCoCg variance clamp, screen-space reflections,
+parallax-corrected reflection probes, and a parametric colour grade whose
+defaults are bit-for-bit a no-op.
 
 **Scale.** Levels of detail from a quadric-error simplifier, selected on the GPU
 by screen radius; Hi-Z occlusion culling against a min-reduced depth pyramid
 (144 objects behind a wall go from 145 survivors to 1); projected decals; and
 chunked terrain with skirts, whose height query, mesh and raycast agree to a
-ten-thousandth of a metre.
+ten-thousandth of a metre; and a dithered crossfade between levels of detail
+whose two halves cover every pixel exactly once — no holes and no doubling.
 
 **Compute.** GPU skinning written back to a buffer (so skinned meshes can cast
 ray-traced shadows), a 60,000-particle system, and an SPH fluid.
