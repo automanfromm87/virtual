@@ -21,6 +21,7 @@ bazel run -c opt //apps/particles:viewer # 60k GPU particles
 bazel run -c opt //apps/fluid:viewer     # SPH fluid, dam break
 bazel run -c opt //apps/skinned:viewer   # skeletal animation
 bazel run -c opt //apps/world:viewer     # physics + ECS + glTF
+bazel run -c opt //apps/lights:viewer    # 256 point lights, clustering on a key
 bazel run -c opt //apps/shot -- --studio /tmp/a.png  # one frame, straight to a PNG
 
 bazel test //...
