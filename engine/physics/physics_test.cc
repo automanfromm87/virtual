@@ -405,6 +405,171 @@ int main() {
         CHECK(box > sphere * 0.5f);
     }
 
+    // --- sleeping ---------------------------------------------------------------
+    {
+        World w;
+        w.Add(Floor(0.0f));
+        const int ball = w.Add(Ball(Vec3{0, 2.0f, 0}, 0.4f, 0.1f));
+
+        // It has to actually settle first: a body still bouncing is not still.
+        for (int i = 0; i < 600; ++i) w.StepFixed();
+        CHECK(w.SleepingCount() == 1);
+        CHECK(w[ball].sleeping);
+
+        // And once asleep it stops moving AT ALL — not "moves very slowly".
+        // The residual jitter of a resting contact is exactly what this is for.
+        const Vec3 where = w[ball].position;
+        for (int i = 0; i < 600; ++i) w.StepFixed();
+        CHECK(Length(w[ball].position - where) == 0.0f);
+
+        // A moving body wakes it. Without this a ball rolls into a settled
+        // crate and passes through where it should have hit: the crate is
+        // still solid, but nothing ever hands it an impulse.
+        Body hit = Ball(Vec3{-3.0f, 0.4f, 0}, 0.4f, 0.1f);
+        hit.velocity = Vec3{6.0f, 0.0f, 0.0f};
+        w.Add(hit);
+        for (int i = 0; i < 200; ++i) w.StepFixed();
+        CHECK(!w[ball].sleeping);
+        CHECK(Length(w[ball].position - where) > 0.05f);
+    }
+
+    // --- sleeping can be switched off, and then nothing sleeps -------------------
+    {
+        World w;
+        w.sleep_after = 0.0f;
+        w.Add(Floor(0.0f));
+        w.Add(Ball(Vec3{0, 2.0f, 0}, 0.4f, 0.1f));
+        for (int i = 0; i < 900; ++i) w.StepFixed();
+        CHECK(w.SleepingCount() == 0);
+    }
+
+    // --- a body IN CONTACT with an awake one cannot sleep ------------------------
+    {
+        // The bottom of a stack must not freeze while the top is still settling
+        // onto it, or the top lands on something that has stopped responding.
+        //
+        // Note what this does NOT claim: a still body with nothing touching it
+        // sleeps regardless of what else is falling elsewhere in the scene, and
+        // is woken by the contact when it arrives. That is the first test above.
+        World w;
+        w.Add(Floor(0.0f));
+        const int lower = w.Add(Ball(Vec3{0, 0.4f, 0}, 0.4f, 0.0f));
+        const int upper = w.Add(Ball(Vec3{0, 1.19f, 0}, 0.4f, 0.0f));
+
+        // The upper ball is held awake and jostled, so it stays in contact and
+        // stays moving. The lower one is doing nothing at all.
+        for (int i = 0; i < 400; ++i) {
+            w[upper].velocity = Vec3{0.0f, -0.4f, 0.0f};
+            w.Wake(upper);
+            w.StepFixed();
+            if (w[lower].sleeping) {
+                Fail("the bottom of the stack slept under a moving neighbour",
+                     __LINE__);
+                break;
+            }
+        }
+        // ...and once the neighbour stops being jostled, it settles normally.
+        for (int i = 0; i < 900; ++i) w.StepFixed();
+        CHECK(w[lower].sleeping && w[upper].sleeping);
+    }
+
+    // --- joints ------------------------------------------------------------------
+    {
+        // A pendulum: one static anchor, one free bob, held a metre apart.
+        World w;
+        Body anchor;
+        anchor.shape = Shape::MakeSphere(0.1f);
+        anchor.position = Vec3{0, 5.0f, 0};
+        anchor.SetMass(0.0f);
+        const int top = w.Add(anchor);
+
+        Body bob = Ball(Vec3{1.0f, 5.0f, 0}, 0.2f, 0.0f);
+        const int swing = w.Add(bob);
+        w.sleep_after = 0.0f;  // a pendulum that falls asleep at the bottom is not one
+
+        Joint j;
+        j.a = top;
+        j.b = swing;
+        j.distance = 1.0f;
+        j.stiffness = 1.0f;
+        w.AddJoint(j);
+        CHECK(w.JointCount() == 1);
+
+        for (int i = 0; i < 1200; ++i) {
+            w.StepFixed();
+            // The constraint has to hold at EVERY step, not just at the end.
+            // A joint that is only correct once things settle is a spring.
+            const float d = Length(w[swing].position - w[top].position);
+            if (std::fabs(d - 1.0f) > 0.06f) {
+                Fail("joint length drifted mid-swing", __LINE__);
+                break;
+            }
+        }
+        // And it actually swung rather than hanging where it started.
+        CHECK(w[swing].position.y < 4.6f);
+    }
+
+    // --- a rope pulls but does not push -------------------------------------------
+    {
+        World w;
+        w.gravity = Vec3{0, 0, 0};
+        w.sleep_after = 0.0f;
+        Body anchor;
+        anchor.shape = Shape::MakeSphere(0.1f);
+        anchor.SetMass(0.0f);
+        const int top = w.Add(anchor);
+        const int bob = w.Add(Ball(Vec3{0.3f, 0, 0}, 0.1f, 0.0f));
+
+        Joint j;
+        j.a = top;
+        j.b = bob;
+        j.distance = 1.0f;
+        j.rope = true;
+        j.stiffness = 1.0f;
+        w.AddJoint(j);
+
+        // Slack: a rod would yank it out to a metre, a rope leaves it alone.
+        for (int i = 0; i < 300; ++i) w.StepFixed();
+        CHECK(Length(w[bob].position - w[top].position) < 0.35f);
+
+        // Now stretched past its length: it must be pulled back.
+        w[bob].position = Vec3{3.0f, 0, 0};
+        w.Wake(bob);
+        for (int i = 0; i < 600; ++i) w.StepFixed();
+        CHECK(Length(w[bob].position - w[top].position) < 1.05f);
+    }
+
+    // --- a ball socket is a joint of zero length -----------------------------------
+    {
+        World w;
+        w.gravity = Vec3{0, -9.81f, 0};
+        w.sleep_after = 0.0f;
+        Body anchor;
+        anchor.shape = Shape::MakeBox(Vec3{0.2f, 0.2f, 0.2f});
+        anchor.position = Vec3{0, 3.0f, 0};
+        anchor.SetMass(0.0f);
+        const int top = w.Add(anchor);
+        const int arm = w.Add(Ball(Vec3{0, 2.4f, 0}, 0.3f, 0.0f));
+
+        Joint j;
+        j.a = top;
+        j.b = arm;
+        // Anchors in each body's OWN frame: the socket sits below the anchor
+        // and at the top of the arm, so the two points coincide.
+        j.anchor_a = Vec3{0.0f, -0.3f, 0.0f};
+        j.anchor_b = Vec3{0.0f, 0.3f, 0.0f};
+        j.distance = 0.0f;
+        j.stiffness = 1.0f;
+        w.AddJoint(j);
+
+        for (int i = 0; i < 1200; ++i) w.StepFixed();
+        const Vec3 pa = w[top].position + Rotate(w[top].orientation, j.anchor_a);
+        const Vec3 pb = w[arm].position + Rotate(w[arm].orientation, j.anchor_b);
+        CHECK(Length(pb - pa) < 0.05f);
+        // Gravity is still pulling on it, so it hangs rather than floating.
+        CHECK(w[arm].position.y < 2.75f);
+    }
+
     if (g_failures == 0) std::printf("physics_test: all checks passed\n");
     return g_failures == 0 ? 0 : 1;
 }

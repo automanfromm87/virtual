@@ -283,6 +283,31 @@ bool CollideBoxBox(const Body& a, const Body& b, Contact* out) {
     return true;
 }
 
+int World::AddJoint(const Joint& j) {
+    joints_.push_back(j);
+    return int(joints_.size()) - 1;
+}
+
+void World::Wake(int i) {
+    if (i < 0 || std::size_t(i) >= bodies_.size()) return;
+    bodies_[std::size_t(i)].sleeping = false;
+    bodies_[std::size_t(i)].still_for = 0.0f;
+}
+
+void World::WakeAll() {
+    for (Body& b : bodies_) {
+        b.sleeping = false;
+        b.still_for = 0.0f;
+    }
+}
+
+int World::SleepingCount() const {
+    int n = 0;
+    for (const Body& b : bodies_)
+        if (b.sleeping) ++n;
+    return n;
+}
+
 int World::Add(const Body& b) {
     bodies_.push_back(b);
     Body& added = bodies_.back();
@@ -297,6 +322,7 @@ int World::Add(const Body& b) {
 
 void World::Clear() {
     bodies_.clear();
+    joints_.clear();
     contacts_.clear();
     stats_ = WorldStats{};
     accumulator_ = 0.0f;
@@ -350,9 +376,18 @@ void World::Collide() {
         for (int j = i + 1; j < int(bodies_.size()); ++j) {
             const Body& a = bodies_[std::size_t(i)];
             const Body& b = bodies_[std::size_t(j)];
-            // Two static bodies can never move, so a contact between them has
-            // nothing to resolve.
-            if (a.IsStatic() && b.IsStatic()) continue;
+            // Nothing that could move: two static bodies, two sleeping ones, or
+            // one of each. A contact between them has nothing to resolve, and
+            // skipping the narrowphase here is what makes sleeping cost less
+            // rather than merely look calmer — without it the broadphase still
+            // tests every pair in a settled scene and dominates the step.
+            //
+            // Safe because waking is contact-driven from the OTHER side: a
+            // moving body still generates a contact against a sleeping one, and
+            // that is what wakes it.
+            const bool a_inert = a.IsStatic() || a.sleeping;
+            const bool b_inert = b.IsStatic() || b.sleeping;
+            if (a_inert && b_inert) continue;
             ++stats_.pairs_tested;
 
             Contact c;
@@ -495,10 +530,134 @@ void World::Resolve() {
         if (inv_sum <= 0.0f) continue;
         const float excess = std::max(c.depth - penetration_slop, 0.0f);
         const Vec3 push = c.normal * (excess * penetration_correction / inv_sum);
+        if (a.sleeping && b.sleeping) continue;
         const float share_a = 1.0f / float(std::max(touches_[std::size_t(c.a)], 1));
         const float share_b = 1.0f / float(std::max(touches_[std::size_t(c.b)], 1));
         a.position = a.position - push * (a.inverse_mass * share_a);
         b.position = b.position + push * (b.inverse_mass * share_b);
+    }
+}
+
+void World::SolveJoints() {
+    // Same shape as a contact: find how far the constraint is violated along a
+    // direction, work out the effective mass along it, and apply an impulse.
+    // A joint differs only in being two-sided — it pulls as readily as it
+    // pushes, where a contact can only push.
+    for (int iter = 0; iter < solver_iterations; ++iter) {
+        for (const Joint& j : joints_) {
+            if (j.a < 0 || j.b < 0 || std::size_t(j.a) >= bodies_.size() ||
+                std::size_t(j.b) >= bodies_.size())
+                continue;
+            Body& a = bodies_[std::size_t(j.a)];
+            Body& b = bodies_[std::size_t(j.b)];
+            if (a.IsStatic() && b.IsStatic()) continue;
+
+            const Vec3 ra = Rotate(a.orientation, j.anchor_a);
+            const Vec3 rb = Rotate(b.orientation, j.anchor_b);
+            const Vec3 pa = a.position + ra;
+            const Vec3 pb = b.position + rb;
+            const Vec3 d = pb - pa;
+            const float len = Length(d);
+            // Coincident anchors on a ball socket: any direction is as good as
+            // another, and normalising zero hands the solver a NaN.
+            const Vec3 n = len > 1e-6f ? d * (1.0f / len) : Vec3{0.0f, 1.0f, 0.0f};
+            const float error = len - j.distance;
+            // A rope only resists being stretched.
+            if (j.rope && error <= 0.0f) continue;
+
+            const float inv_sum =
+                a.inverse_mass + b.inverse_mass +
+                Dot(n, Cross(a.ApplyInverseInertia(Cross(ra, n)), ra)) +
+                Dot(n, Cross(b.ApplyInverseInertia(Cross(rb, n)), rb));
+            if (inv_sum <= 0.0f) continue;
+
+            // Velocity first: cancel the relative motion ALONG the constraint,
+            // so the joint stops being violated rather than being repeatedly
+            // pulled back into place.
+            const Vec3 rel = b.PointVelocity(pb) - a.PointVelocity(pa);
+            const float along = Dot(rel, n);
+            const Vec3 impulse = n * (-along / inv_sum);
+            ApplyImpulse(a, impulse * -1.0f, ra);
+            ApplyImpulse(b, impulse, rb);
+
+            // Then position, at a fraction of the error. Correcting all of it
+            // makes the joint rigid enough to fight the contact solver, and a
+            // body held by both squirms.
+            const Vec3 push = n * (error * j.stiffness / inv_sum);
+            a.position = a.position + push * a.inverse_mass;
+            b.position = b.position - push * b.inverse_mass;
+        }
+    }
+}
+
+void World::UpdateSleep() {
+    if (sleep_after <= 0.0f) {
+        for (Body& b : bodies_) b.sleeping = false;
+        return;
+    }
+
+    // Every body's own stillness timer first.
+    for (Body& b : bodies_) {
+        if (b.IsStatic()) continue;
+        const bool still = Length(b.velocity) < sleep_linear &&
+                           Length(b.angular_velocity) < sleep_angular;
+        b.still_for = still ? b.still_for + fixed_dt : 0.0f;
+    }
+
+    // ISLANDS. Bodies connected by contacts sleep together or not at all.
+    //
+    // The obvious rule — "do not sleep while touching something awake" — is a
+    // deadlock. Two balls resting on each other are both awake and both still,
+    // and each holds the other up forever, so a settled stack never stops being
+    // simulated, which is the one thing sleeping exists to prevent. Refining it
+    // to "touching something MOVING" fails the other way: contact resolution
+    // has already cancelled the velocity of the body landing on the stack by
+    // the time this runs, so the thing arriving looks stationary.
+    //
+    // Union-find over the contact graph, with static bodies left out — the
+    // floor touches everything, and putting it in one island would mean the
+    // whole scene sleeps together or never.
+    const std::size_t n = bodies_.size();
+    islands_.resize(n);
+    for (std::size_t i = 0; i < n; ++i) islands_[i] = int(i);
+    // Path-halving find: no recursion, and it flattens as it goes.
+    auto find = [&](int x) {
+        while (islands_[std::size_t(x)] != x) {
+            islands_[std::size_t(x)] = islands_[std::size_t(islands_[std::size_t(x)])];
+            x = islands_[std::size_t(x)];
+        }
+        return x;
+    };
+    for (const Contact& c : contacts_) {
+        if (bodies_[std::size_t(c.a)].IsStatic() ||
+            bodies_[std::size_t(c.b)].IsStatic())
+            continue;
+        const int ra = find(c.a), rb = find(c.b);
+        if (ra != rb) islands_[std::size_t(ra)] = rb;
+    }
+
+    // An island sleeps when its LEAST settled member has been still long
+    // enough. Waking one body therefore wakes everything it is resting on,
+    // which is what Wake() being called on an arriving body has to mean.
+    std::vector<float> island_min(n, 1e30f);
+    for (std::size_t i = 0; i < n; ++i) {
+        if (bodies_[i].IsStatic()) continue;
+        const std::size_t root = std::size_t(find(int(i)));
+        island_min[root] = std::min(island_min[root], bodies_[i].still_for);
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+        Body& b = bodies_[i];
+        if (b.IsStatic()) continue;
+        const std::size_t root = std::size_t(find(int(i)));
+        if (island_min[root] >= sleep_after) {
+            b.sleeping = true;
+            // Zeroed rather than left as they are: a body that sleeps with a
+            // millimetre per second on it wakes up having drifted.
+            b.velocity = Vec3{0.0f, 0.0f, 0.0f};
+            b.angular_velocity = Vec3{0.0f, 0.0f, 0.0f};
+        } else {
+            b.sleeping = false;
+        }
     }
 }
 
@@ -507,18 +666,30 @@ void World::StepFixed() {
     // velocity. Explicit Euler (position from the old velocity) pumps energy
     // into every orbit and bounce, and no amount of solver tuning hides it.
     for (Body& b : bodies_) {
-        if (b.IsStatic()) continue;
+        if (b.IsStatic() || b.sleeping) continue;
         b.velocity = b.velocity + gravity * fixed_dt;
     }
     Collide();
+    // A contact with a sleeping body wakes it. Without this a ball rolls into
+    // a settled crate and passes through the place it should have hit — the
+    // crate is still solid, but nothing ever gives it the impulse.
+    for (const Contact& c : contacts_) {
+        Body& a = bodies_[std::size_t(c.a)];
+        Body& b = bodies_[std::size_t(c.b)];
+        const bool a_moving = !a.sleeping && !a.IsStatic();
+        const bool b_moving = !b.sleeping && !b.IsStatic();
+        if (a_moving && b.sleeping) Wake(c.b);
+        if (b_moving && a.sleeping) Wake(c.a);
+    }
     Resolve();
+    SolveJoints();
     // Damping AFTER the solve, so it never fights the contact impulses — a
     // body damped before resolution needs a bigger impulse to hold it up, and
     // the two chase each other into jitter.
     const float lin = 1.0f / (1.0f + linear_damping * fixed_dt);
     const float ang = 1.0f / (1.0f + angular_damping * fixed_dt);
     for (Body& b : bodies_) {
-        if (b.IsStatic()) continue;
+        if (b.IsStatic() || b.sleeping) continue;
         if (linear_damping > 0.0f) b.velocity = b.velocity * lin;
         if (angular_damping > 0.0f) b.angular_velocity = b.angular_velocity * ang;
         b.position = b.position + b.velocity * fixed_dt;
@@ -535,6 +706,7 @@ void World::StepFixed() {
                                        b.orientation.z + spin.z * half,
                                        b.orientation.w + spin.w * half});
     }
+    UpdateSleep();
     ++stats_.steps;
 }
 

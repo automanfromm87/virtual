@@ -10,8 +10,10 @@
 //     sliding.
 //   * Linear and ANGULAR motion. Semi-implicit Euler at a FIXED timestep,
 //     decoupled from the frame rate.
+//   * Distance and ball-socket joints.
+//   * Sleeping, so a settled pile stops costing anything.
 //   * Brute-force broadphase.
-// Not here: convex hulls, joints, continuous collision, sleeping.
+// Not here: convex hulls, continuous collision.
 #pragma once
 
 #include <cstdint>
@@ -60,6 +62,16 @@ struct Body {
 
     float restitution = 0.35f;  // 0 = dead drop, 1 = never loses energy
     float friction = 0.5f;
+
+    // SLEEPING. A body that has been nearly still for long enough stops being
+    // integrated at all. Not only a saving: a resting stack never settles
+    // exactly, and the residual jitter is what makes a pile of crates shiver
+    // forever. Freezing it is how that stops looking wrong.
+    //
+    // Woken by any contact with a moving body, and by anything that moves it
+    // from outside — see World::Wake.
+    bool sleeping = false;
+    float still_for = 0.0f;  // seconds below the threshold
     // Opaque to the physics; the caller uses it to find its own object again.
     std::uint32_t user = 0;
 
@@ -94,6 +106,25 @@ struct WorldStats {
     int pairs_tested = 0;
 };
 
+// A constraint between two bodies, solved alongside the contacts.
+//
+// Distance and ball-socket only. Both are the same equation — hold two anchor
+// points a fixed distance apart — with a ball socket being the case where that
+// distance is zero, which is why they are one type rather than two.
+struct Joint {
+    int a = -1, b = -1;
+    // Anchors in each body's OWN frame, so they follow it as it turns.
+    Vec3 anchor_a{0.0f, 0.0f, 0.0f};
+    Vec3 anchor_b{0.0f, 0.0f, 0.0f};
+    // Distance to hold. Zero is a ball socket: the two anchors coincide.
+    float distance = 0.0f;
+    // A rope rather than a rod: pulls when stretched, does nothing when slack.
+    bool rope = false;
+    // Fraction of the remaining positional error corrected per step. Below 1
+    // the joint is springy; at 1 it is rigid and fights the contact solver.
+    float stiffness = 0.4f;
+};
+
 class World {
   public:
     // Gravity in metres per second squared, and the fixed step the solver runs
@@ -124,11 +155,28 @@ class World {
     float linear_damping = 0.0f;
     float angular_damping = 0.0f;
 
+    // Below these speeds a body counts as still. After `sleep_after` seconds of
+    // that, it sleeps. Zero disables sleeping entirely, which is what the
+    // conservation tests want: a sleeping body stops conserving anything.
+    float sleep_linear = 0.06f;
+    float sleep_angular = 0.12f;
+    float sleep_after = 0.6f;
+
     int Add(const Body& b);
+    // Wakes a body and resets its stillness timer. Anything that moves a body
+    // from outside the solver — teleporting it, hitting it, changing gravity —
+    // has to call this, or it stays frozen where it was.
+    void Wake(int i);
+    void WakeAll();
+    [[nodiscard]] int SleepingCount() const;
     [[nodiscard]] Body& operator[](int i) { return bodies_[std::size_t(i)]; }
     [[nodiscard]] const Body& operator[](int i) const { return bodies_[std::size_t(i)]; }
     [[nodiscard]] int Count() const { return int(bodies_.size()); }
     void Clear();
+
+    int AddJoint(const Joint& j);
+    [[nodiscard]] int JointCount() const { return int(joints_.size()); }
+    [[nodiscard]] const Joint& GetJoint(int i) const { return joints_[std::size_t(i)]; }
 
     // Advances by `dt` in whole fixed steps, carrying the remainder to the next
     // call. Returns how many steps ran.
@@ -152,11 +200,18 @@ class World {
     void Collide();
     void Resolve();
 
+    void SolveJoints();
+    void UpdateSleep();
+
     std::vector<Body> bodies_;
+    std::vector<Joint> joints_;
     std::vector<Contact> contacts_;
     // Contacts touching each body this step. Kept as a member so a steady-state
     // step allocates nothing.
     std::vector<int> touches_;
+    // Union-find parents for the sleeping islands. A member so a settled scene
+    // allocates nothing per step.
+    std::vector<int> islands_;
     WorldStats stats_;
     float accumulator_ = 0.0f;
 };
