@@ -1,0 +1,26 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Networking. POSIX sockets and nothing else -- no third-party library, which
+# for a UDP protocol is a few hundred lines rather than a dependency.
+cc_library(
+    name = "net",
+    srcs = [
+        "connection.cc",
+        "replication.cc",
+        "transport.cc",
+    ],
+    hdrs = [
+        "connection.h",
+        "replication.h",
+        "transport.h",
+    ],
+    deps = ["//engine/core"],
+)
+
+cc_test(
+    name = "net_test",
+    srcs = ["net_test.cc"],
+    deps = [":net"],
+)
