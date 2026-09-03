@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_test")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -10,5 +10,15 @@ cc_test(
         "//engine/render",
         "//engine/rhi",
         "//engine/scene",
+    ],
+)
+
+cc_binary(
+    name = "viewer",
+    srcs = ["viewer.cpp"],
+    deps = [
+        "//engine/app",
+        "//engine/geometry",
+        "//engine/render",
     ],
 )
