@@ -121,6 +121,35 @@ struct GpuCascades {
 // 32-bit joint indices where 16 would do: an MSL ushort4 is 8 bytes and still
 // forces the float4 that follows onto a 16-byte boundary, so the smaller field
 // buys nothing but a chance to get the padding wrong.
+// One instance of a mesh, for INSTANCED drawing.
+//
+// The per-draw uniform block carries model and tint today, which means one
+// draw call and one uniform slice per object. That is fine at fourteen objects
+// and hopeless at fourteen thousand: the cost is entirely in the submission,
+// not in the triangles. Moving the two things that actually differ per object
+// into a buffer indexed by instance_id turns N draws into one.
+//
+// `bounds` rides along because GPU culling needs it and the vertex stage
+// ignores it: putting it in a second parallel array would mean two buffers
+// kept in step by hand.
+struct GpuInstance {
+    ENG_MAT4 model;
+    ENG_VEC4 tint;
+    ENG_VEC4 bounds;  // xyz = centre in OBJECT space, w = radius
+};
+
+// What a GPU culling pass writes, and what an indirect draw reads. The layout
+// is Metal's MTLDrawIndexedPrimitivesIndirectArguments, field for field --
+// the GPU reads it as that struct, so a mismatch here is not a compile error
+// anywhere, just a draw of the wrong thing.
+struct GpuDrawArgs {
+    unsigned int index_count;
+    unsigned int instance_count;
+    unsigned int index_start;
+    int base_vertex;
+    unsigned int base_instance;
+};
+
 struct SkinIn {
     ENG_UVEC4 joints;
     ENG_VEC4 weights;

@@ -49,6 +49,29 @@ vertex VSOut vs_lit(uint                     vid   [[vertex_id]],
 //
 // The palette is world-relative already: palette[j] = jointWorld * inverseBind,
 // so `model` still applies on top for where the character is standing.
+// The same vertex stage, with model and tint read PER INSTANCE instead of from
+// the per-draw uniform block. Everything else is identical, which is why this
+// is a separate entry point rather than a branch: a branch would cost the
+// non-instanced path a buffer read it never uses, and there is no version of
+// this where the two disagree about lighting.
+vertex VSOut vs_lit_instanced(uint                      vid       [[vertex_id]],
+                              uint                      iid       [[instance_id]],
+                              device const VertexIn*    verts     [[buffer(0)]],
+                              constant FrameUniforms&   u         [[buffer(1)]],
+                              device const GpuInstance* instances [[buffer(4)]])
+{
+    const GpuInstance inst = instances[iid];
+    VSOut o;
+    const float4 worldPos = inst.model * float4(verts[vid].position.xyz, 1.0f);
+    o.position = u.viewProj * worldPos;
+    o.worldPos = worldPos.xyz;
+    o.normalW = (inst.model * float4(verts[vid].normal.xyz, 0.0f)).xyz;
+    o.color = verts[vid].color * inst.tint;
+    o.uv = verts[vid].uv.xy;
+    o.lightClip = u.lightViewProj * worldPos;
+    return o;
+}
+
 vertex VSOut vs_skinned(uint                     vid     [[vertex_id]],
                         device const VertexIn*   verts   [[buffer(0)]],
                         constant FrameUniforms&  u       [[buffer(1)]],

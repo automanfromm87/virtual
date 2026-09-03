@@ -43,6 +43,9 @@ enum class Shading : std::uint8_t {
     // DEFERRED. GBuffer writes the surface into two colour targets plus depth;
     // DeferredLight is the fullscreen pass that reads them back and lights each
     // pixel once, however many lights there are.
+    // Lit, with model and tint read per instance from a buffer rather than
+    // from the per-draw uniform block. One draw for any number of copies.
+    LitInstanced,
     GBuffer,
     DeferredLight,
     // Ray-traced shadows: fullscreen, traces one ray per pixel at the sun and
@@ -226,6 +229,44 @@ class Renderer {
     void DrawDeferredLight(rhi::Encoder&, const Scene&, int width, int height,
                            rhi::TextureId albedo_rough, rhi::TextureId normal_metal,
                            rhi::TextureId depth, rhi::TextureId shadow_map = {});
+
+    // --- GPU-driven drawing ---------------------------------------------------
+    //
+    // The ordinary path submits one draw per object and tests six planes per
+    // object on the CPU. Both scale with the object count and neither has
+    // anything to do with how many triangles reach the screen. This groups the
+    // scene's opaque instances by mesh and material, culls each group on the
+    // GPU, and emits ONE indirect draw per group -- whose instance count comes
+    // from the buffer the cull wrote, so the CPU never learns it and never
+    // stalls to find out.
+    //
+    // CullScene runs in a compute pass and DrawSceneIndirect in the render pass
+    // after it. They are separate calls because a compute pass and a render
+    // pass cannot be open at once.
+    //
+    // Limits, and they are the reason this does not simply replace DrawScene:
+    //   * OPAQUE only. Blending needs back-to-front order and there is none
+    //     here -- the survivors come out in whatever order threads finished.
+    //   * No skinning. A skinned mesh has a joint palette per instance.
+    //   * The CPU cannot know what was drawn, so LastDrawOrder() is empty.
+    [[nodiscard]] int CullScene(rhi::ComputeEncoder&, const Scene&, int width,
+                                int height);
+    void DrawSceneIndirect(rhi::Encoder&, const Scene&, int width, int height,
+                           rhi::TextureId shadow_map = {});
+    // How many instances each batch was given, and how many draws it took.
+    // The pair is the whole point: 5000 and 3.
+    [[nodiscard]] int LastBatchCount() const;
+    [[nodiscard]] int LastInstanceCount() const;
+
+    // How many instances the GPU cull actually kept, summed over the batches.
+    //
+    // This READS BACK a buffer the GPU wrote, so it is only meaningful after
+    // the frame has completed, and calling it every frame gives up the thing
+    // indirect drawing was for -- the CPU not having to know. It exists so a
+    // test can check that the cull culls, which is otherwise unobservable:
+    // a cull that keeps everything draws the same picture, because the extra
+    // instances are off screen and rasterise nothing.
+    [[nodiscard]] int VisibleAfterCull() const;
 
     // --- ray tracing ---------------------------------------------------------
     //

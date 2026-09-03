@@ -165,6 +165,18 @@ class Encoder {
     void SetFragmentBytes(const void* data, std::size_t bytes, int slot);
     void Draw(std::size_t vertex_count);
     void DrawIndexedU16(BufferId indices, std::size_t index_count);
+    // One draw, `instance_count` copies. The shader reads instance_id and
+    // looks up whatever differs per copy; nothing else changes.
+    void DrawIndexedInstancedU16(BufferId indices, std::size_t index_count,
+                                 std::size_t instance_count);
+    // The instance count and the index range come from a BUFFER the GPU wrote,
+    // so the CPU never learns them. That is the point: a culling pass on the
+    // GPU can decide how much to draw without a readback, and a readback would
+    // cost a full pipeline stall -- which is more than the culling saves.
+    //
+    // `args` must hold a GpuDrawArgs at `offset`.
+    void DrawIndexedIndirectU16(BufferId indices, BufferId args,
+                                std::size_t offset);
 
   private:
     friend class Device;

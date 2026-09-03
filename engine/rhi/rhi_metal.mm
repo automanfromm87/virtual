@@ -946,4 +946,26 @@ void Encoder::DrawIndexedU16(BufferId indices, std::size_t index_count) {
                              indexBufferOffset:0];
 }
 
+void Encoder::DrawIndexedInstancedU16(BufferId indices, std::size_t index_count,
+                                      std::size_t instance_count) {
+    if (instance_count == 0) return;  // Metal rejects zero outright
+    [device_->impl_->enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                    indexCount:index_count
+                                     indexType:MTLIndexTypeUInt16
+                                   indexBuffer:device_->impl_->buffers[indices.v]
+                             indexBufferOffset:0
+                                 instanceCount:instance_count];
+}
+
+void Encoder::DrawIndexedIndirectU16(BufferId indices, BufferId args,
+                                     std::size_t offset) {
+    if (!Valid(indices) || !Valid(args)) return;
+    [device_->impl_->enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                     indexType:MTLIndexTypeUInt16
+                                   indexBuffer:device_->impl_->buffers[indices.v]
+                             indexBufferOffset:0
+                                indirectBuffer:device_->impl_->buffers[args.v]
+                          indirectBufferOffset:offset];
+}
+
 }  // namespace eng::rhi

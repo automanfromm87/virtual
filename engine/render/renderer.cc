@@ -54,11 +54,18 @@ constexpr char kRaytraceSrc[] = {
 constexpr char kSkinningSrc[] = {
 #embed "engine/shaders/skinning.metal"
     , 0};
+constexpr char kCullSrc[] = {
+#embed "engine/shaders/cull.metal"
+    , 0};
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
 static_assert(sizeof(FrameUniforms) == 416, "FrameUniforms layout drifted");
 static_assert(sizeof(GpuLight) == 144, "GpuLight layout drifted");
 static_assert(sizeof(GpuCascades) == 288, "GpuCascades layout drifted");
+static_assert(sizeof(GpuInstance) == 96, "GpuInstance layout drifted");
+// Metal reads this as MTLDrawIndexedPrimitivesIndirectArguments. A mismatch is
+// not a compile error anywhere -- it is a draw of the wrong thing.
+static_assert(sizeof(GpuDrawArgs) == 20, "GpuDrawArgs must match Metal's layout");
 static_assert(sizeof(VertexIn) == 64, "VertexIn layout drifted");
 static_assert(offsetof(VertexIn, normal) == 16, "GPU float3 occupies 16 bytes");
 static_assert(offsetof(VertexIn, color) == 32, "GPU float3 occupies 16 bytes");
@@ -78,10 +85,27 @@ constexpr int kSkinSlot = 2;     // per-vertex joints and weights
 constexpr int kPaletteSlot = 3;  // this instance's joint matrices
 constexpr int kLightSlot = 2;    // FRAGMENT stage: the scene's local lights
 constexpr int kCascadeSlot = 3;  // FRAGMENT stage: the sun's cascades
+// VERTEX stage: the per-instance model and tint for an instanced draw. 4 and
+// not 2, even though the skin slot is free on this path -- reusing a slot whose
+// name says "skin" is how a future skinned-and-instanced draw gets one of them
+// silently overwritten.
+constexpr int kInstanceSlot = 4;
 
-// Ring capacity per frame slot. Exceeding it drops draws rather than
-// corrupting the frame — see the clamp in DrawScene.
-constexpr std::size_t kMaxInstancesPerFrame = 1024;
+// Ring capacity per frame slot. Exceeding it drops draws rather than corrupting
+// the frame -- see the clamp in DrawScene.
+//
+// It was 1024, and a scene of 6000 objects showed why that is not merely
+// "some objects go missing". The ring is shared by EVERY pass: when the scene
+// pass exhausts it, the composite that follows asks for a slice, gets none, and
+// silently draws nothing. The frame comes out BLACK -- not partially drawn --
+// and the only clue is a stats field nobody reads on a frame that rendered
+// nothing at all.
+//
+// 8192 at 512 bytes a slice is 4 MB per frame slot, 12 MB in flight. That is a
+// real cost and it is the right trade: past 8192 draws in one frame the answer
+// is CullScene and DrawSceneIndirect, which need three slices for six thousand
+// objects instead of six thousand.
+constexpr std::size_t kMaxInstancesPerFrame = 8192;
 
 std::size_t AlignUp(std::size_t v, std::size_t a) { return ((v + a - 1) / a) * a; }
 
@@ -127,6 +151,9 @@ struct GpuMaterial {
     // someone is looking for a difference between the two paths.
     rhi::PipelineId gbuffer_pipeline;
     rhi::PipelineId gbuffer_skinned_pipeline;
+    // Compiled against vs_lit_instanced, which reads model and tint from a
+    // buffer instead of the per-draw uniform block.
+    rhi::PipelineId instanced_pipeline;
     rhi::Cull cull = rhi::Cull::Back;
     bool depth_test = true;
     bool transparent = false;
@@ -186,6 +213,27 @@ struct Renderer::Impl {
     std::vector<rhi::BufferId> posed_pool;
     std::vector<std::size_t> posed_pool_bytes;
     std::size_t posed_used = 0;
+
+    // --- GPU-driven drawing ---
+    rhi::ComputePipelineId cull_pipeline, cull_finish_pipeline;
+    bool cull_tried = false;
+    std::string cull_error;
+    // One batch per (mesh, material). Each owns four buffers: the instances the
+    // CPU uploaded, the compacted survivors, an atomic counter, and the draw
+    // arguments. Pooled, because allocating them per frame would leak.
+    struct Batch {
+        MeshHandle mesh;
+        MaterialHandle material;
+        int count = 0;
+        rhi::BufferId instances;   // dynamic, CPU-written
+        rhi::BufferId visible;     // storage, GPU-written
+        rhi::BufferId counter;     // storage, one uint
+        rhi::BufferId args;        // storage, one GpuDrawArgs
+        std::size_t capacity = 0;  // instances the buffers can hold
+    };
+    std::vector<Batch> batches;
+    int live_batches = 0;
+    int batched_instances = 0;
     // Bottom-level structure per registered mesh, or a null handle for one
     // that has not needed one yet. Indexed by MeshHandle.
     std::vector<rhi::AccelId> mesh_blas;
@@ -304,6 +352,7 @@ struct Renderer::Impl {
         switch (shading) {
             case Shading::Lit:
             case Shading::Flat:
+            case Shading::LitInstanced:
                 return samples;
             // A shadow map is never multisampled: it stores a distance, and
             // averaging two distances across a silhouette gives a value that
@@ -347,6 +396,7 @@ rhi::Format Renderer::Impl::FormatFor(Shading shading) const {
         // banding across every smooth curve.
         case Shading::GBuffer:
         case Shading::DeferredLight:
+        case Shading::LitInstanced:
             return Renderer::kSceneFormat;
         // The composite is the pass that brings it down to a display.
         default:
@@ -380,6 +430,12 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
     if (shading == Shading::Lit) {
         desc.source = ShadingSource(kLitSrc);
         desc.vertex_fn = skinned ? "vs_skinned" : "vs_lit";
+        desc.fragment_fn = "fs_lit";
+    } else if (shading == Shading::LitInstanced) {
+        // Same fragment stage as Lit, so the two agree about shading by
+        // construction; only where the model matrix comes from differs.
+        desc.source = ShadingSource(kLitSrc);
+        desc.vertex_fn = "vs_lit_instanced";
         desc.fragment_fn = "fs_lit";
     } else if (shading == Shading::GBuffer) {
         // The G-buffer pass reuses the LIT vertex shader verbatim: the geometry
@@ -534,6 +590,9 @@ MaterialHandle Renderer::CreateMaterial(const MaterialDesc& desc,
         // the one behind it too. Transparent geometry is drawn forward, after
         // the deferred lighting pass.
         if (!desc.transparent && desc.depth_test) {
+            m.instanced_pipeline = impl_->GetOrCreatePipeline(
+                Shading::LitInstanced, desc.depth_test, false, error);
+            if (!Valid(m.instanced_pipeline)) return {};
             m.gbuffer_pipeline = impl_->GetOrCreatePipeline(
                 Shading::GBuffer, desc.depth_test, false, error);
             if (!Valid(m.gbuffer_pipeline)) return {};
@@ -1335,6 +1394,221 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
     enc.SetFragmentTexture(depth, 4);
     enc.SetFragmentSampler(impl_->sampler, 0);
     enc.Draw(3);
+}
+
+int Renderer::LastBatchCount() const { return impl_->live_batches; }
+int Renderer::LastInstanceCount() const { return impl_->batched_instances; }
+
+int Renderer::VisibleAfterCull() const {
+    int total = 0;
+    for (int i = 0; i < impl_->live_batches; ++i) {
+        const auto* args = static_cast<const GpuDrawArgs*>(
+            impl_->dev->MapBuffer(impl_->batches[std::size_t(i)].args));
+        if (args) total += int(args->instance_count);
+    }
+    return total;
+}
+
+int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
+                        int height) {
+    impl_->live_batches = 0;
+    impl_->batched_instances = 0;
+    if (width <= 0 || height <= 0 || scene.instances.empty()) return 0;
+
+    if (!impl_->cull_tried) {
+        impl_->cull_tried = true;
+        std::string err;
+        impl_->cull_pipeline = impl_->dev->CreateComputePipeline(
+            ShaderSource(kCullSrc), "cs_cull", err);
+        if (!Valid(impl_->cull_pipeline)) impl_->cull_error = err;
+        impl_->cull_finish_pipeline = impl_->dev->CreateComputePipeline(
+            ShaderSource(kCullSrc), "cs_cull_finish", err);
+        if (!Valid(impl_->cull_finish_pipeline) && impl_->cull_error.empty())
+            impl_->cull_error = err;
+    }
+    if (!Valid(impl_->cull_pipeline) || !Valid(impl_->cull_finish_pipeline))
+        return 0;
+
+    // --- group by mesh and material ------------------------------------------
+    // A batch is one draw, so everything in it must share the geometry AND the
+    // pipeline. Skinned and transparent instances are excluded here rather than
+    // filtered later: a skinned mesh needs a palette per instance, and a
+    // transparent one needs an order this path cannot provide.
+    std::vector<std::vector<const Instance*>> groups;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> keys;
+    for (const Instance& inst : scene.instances) {
+        if (!Valid(inst.mesh) || inst.mesh.v >= impl_->meshes.size()) continue;
+        if (!Valid(inst.material) || inst.material.v >= impl_->materials.size())
+            continue;
+        const GpuMesh& gm = impl_->meshes[inst.mesh.v];
+        const GpuMaterial& mat = impl_->materials[inst.material.v];
+        if (gm.joint_count > 0 || mat.transparent || !mat.depth_test) continue;
+
+        const auto key = std::make_pair(inst.mesh.v, inst.material.v);
+        std::size_t at = keys.size();
+        for (std::size_t i = 0; i < keys.size(); ++i)
+            if (keys[i] == key) { at = i; break; }
+        if (at == keys.size()) {
+            keys.push_back(key);
+            groups.emplace_back();
+        }
+        groups[at].push_back(&inst);
+    }
+    if (groups.empty()) return 0;
+
+    const Mat4 viewProj = scene.camera.ViewProj(float(width) / float(height));
+    const Frustum frustum = Frustum::FromViewProj(viewProj);
+    impl_->last_aspect = float(width) / float(height);
+    impl_->inv_view_proj = Inverse(viewProj);
+
+    struct CullParams {
+        Vec4 planes[6];
+        std::uint32_t instance_count = 0;
+        std::uint32_t index_count = 0;
+        std::uint32_t pad0 = 0, pad1 = 0;
+    };
+
+    for (std::size_t g = 0; g < groups.size(); ++g) {
+        if (impl_->batches.size() <= g) impl_->batches.emplace_back();
+        Impl::Batch& b = impl_->batches[g];
+        b.mesh = MeshHandle{keys[g].first};
+        b.material = MaterialHandle{keys[g].second};
+        b.count = int(groups[g].size());
+
+        const std::size_t need = groups[g].size();
+        if (b.capacity < need || !Valid(b.instances)) {
+            // Grown, not resized to fit. A scene whose object count creeps up
+            // by one a frame would otherwise reallocate every frame forever.
+            const std::size_t cap = std::max<std::size_t>(need * 2, 64);
+            b.instances = impl_->dev->CreateDynamicBuffer(sizeof(GpuInstance) * cap);
+            b.visible = impl_->dev->CreateStorageBuffer(sizeof(GpuInstance) * cap);
+            b.counter = impl_->dev->CreateStorageBuffer(sizeof(std::uint32_t) * 4);
+            b.args = impl_->dev->CreateStorageBuffer(sizeof(GpuDrawArgs) * 2);
+            b.capacity = cap;
+            if (!Valid(b.instances) || !Valid(b.visible) || !Valid(b.counter) ||
+                !Valid(b.args))
+                return 0;
+        }
+
+        auto* dst = static_cast<GpuInstance*>(impl_->dev->MapBuffer(b.instances));
+        if (!dst) return 0;
+        const GpuMesh& gm = impl_->meshes[keys[g].first];
+        for (std::size_t i = 0; i < need; ++i) {
+            const Instance& inst = *groups[g][i];
+            dst[i].model = inst.model;
+            dst[i].tint = inst.tint;
+            // OBJECT-space bounds. The kernel transforms them, because the
+            // transform is already there and doing it here would mean the CPU
+            // touching every object for the one number the GPU could derive.
+            dst[i].bounds = Vec4{gm.bounds.center.x, gm.bounds.center.y,
+                                 gm.bounds.center.z, gm.bounds.radius};
+        }
+
+        // The counter must start at zero EVERY frame. It is a storage buffer,
+        // so it holds last frame's total otherwise, and the draw would ask for
+        // twice as many instances as the buffer has.
+        auto* zero = static_cast<std::uint32_t*>(impl_->dev->MapBuffer(b.counter));
+        if (zero) zero[0] = 0;
+
+        CullParams params;
+        for (int i = 0; i < 6; ++i)
+            params.planes[i] = Vec4{frustum.planes[i].n.x, frustum.planes[i].n.y,
+                                    frustum.planes[i].n.z, frustum.planes[i].d};
+        params.instance_count = std::uint32_t(need);
+        params.index_count = std::uint32_t(gm.index_count);
+
+        enc.SetPipeline(impl_->cull_pipeline);
+        enc.SetBuffer(b.instances, 0, 0);
+        enc.SetBytes(&params, sizeof(params), 1);
+        enc.SetBuffer(b.visible, 0, 2);
+        enc.SetBuffer(b.counter, 0, 3);
+        enc.SetBuffer(b.args, 0, 4);
+        enc.Dispatch(int(need));
+
+        // A SECOND dispatch to publish the count. Writing it from inside the
+        // cull kernel would race with the threads still counting -- the last
+        // thread to increment is not the last thread to run.
+        enc.SetPipeline(impl_->cull_finish_pipeline);
+        enc.SetBuffer(b.counter, 0, 0);
+        enc.SetBuffer(b.args, 0, 1);
+        enc.Dispatch(1);
+
+        impl_->batched_instances += int(need);
+    }
+    impl_->live_batches = int(groups.size());
+    return impl_->live_batches;
+}
+
+void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int width,
+                                 int height, rhi::TextureId shadow_map) {
+    impl_->stats = RenderStats{};
+    impl_->stats.submitted = impl_->batched_instances;
+    impl_->draw_order.clear();
+    if (impl_->live_batches == 0) return;
+
+    const std::size_t light_offset =
+        std::size_t(impl_->dev->FrameSlot()) * impl_->light_slot_bytes;
+    const int light_count =
+        std::min(int(scene.lights.size()), int(ENG_MAX_LIGHTS));
+    impl_->UploadLights(scene, light_offset, light_count);
+    const std::size_t cascade_offset =
+        std::size_t(impl_->dev->FrameSlot()) * impl_->cascade_slot_bytes;
+    impl_->UploadCascades(scene, cascade_offset, impl_->last_aspect);
+
+    const bool shadows = scene.shadowExtent > 0.0f && Valid(shadow_map);
+    const rhi::TextureId shadow_tex = shadows ? shadow_map : impl_->dummy_shadow;
+    const Mat4 viewProj = scene.camera.ViewProj(float(width) / float(height));
+
+    for (int i = 0; i < impl_->live_batches; ++i) {
+        const Impl::Batch& b = impl_->batches[std::size_t(i)];
+        const GpuMesh& gm = impl_->meshes[b.mesh.v];
+        const GpuMaterial& mat = impl_->materials[b.material.v];
+        if (!Valid(mat.instanced_pipeline)) { ++impl_->stats.invalid; continue; }
+
+        const std::size_t offset = impl_->AllocUniform();
+        if (offset == Impl::kNoSpace) { ++impl_->stats.overflowed; break; }
+
+        FrameUniforms u{};
+        u.viewProj = viewProj;
+        // model and tint come from the instance buffer; leaving them here would
+        // be two values that look authoritative and are never read.
+        u.model = Mat4::Identity();
+        u.tint = Vec4{1, 1, 1, 1};
+        u.invViewProj = impl_->inv_view_proj;
+        u.lightDir = scene.lightDir;
+        u.lightColor = scene.lightColor;
+        u.baseColor = mat.base_color;
+        u.lightViewProj = shadows ? scene.LightViewProj() : Mat4::Identity();
+        u.surface = Vec4{mat.roughness, mat.metallic, shadows ? 1.0f : 0.0f,
+                         scene.clipY};
+        u.eyePos = Vec4{scene.camera.eye.x, scene.camera.eye.y, scene.camera.eye.z,
+                        1.0f};
+        u.lighting = Vec4{float(light_count), 0.0f, 0.0f, 0.0f};
+        u.ambientSky = Vec4{scene.ambientSky.x, scene.ambientSky.y,
+                            scene.ambientSky.z, 0.0f};
+        u.ambientGround = Vec4{scene.ambientGround.x, scene.ambientGround.y,
+                               scene.ambientGround.z, 0.0f};
+        std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
+
+        enc.SetPipeline(mat.instanced_pipeline);
+        enc.SetCull(mat.cull, rhi::Winding::CounterClockwise);
+        enc.SetVertexBuffer(gm.vb, 0, kVertexSlot);
+        enc.SetVertexBuffer(impl_->uniforms, offset, kUniformSlot);
+        // The SURVIVORS, not the instances that were offered.
+        enc.SetVertexBuffer(b.visible, 0, kInstanceSlot);
+        enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
+        enc.SetFragmentBuffer(impl_->lights, light_offset, kLightSlot);
+        enc.SetFragmentBuffer(impl_->cascades, cascade_offset, kCascadeSlot);
+        enc.SetFragmentTexture(mat.albedo, 0);
+        enc.SetFragmentTexture(mat.roughness_map, 1);
+        enc.SetFragmentTexture(shadow_tex, 2);
+        enc.SetFragmentTexture(
+            Valid(impl_->shadow_atlas) ? impl_->shadow_atlas : impl_->dummy_shadow, 3);
+        enc.SetFragmentSampler(impl_->sampler, 0);
+        enc.DrawIndexedIndirectU16(gm.ib, b.args, 0);
+        ++impl_->stats.draws;
+        ++impl_->stats.pipeline_switches;
+    }
 }
 
 int Renderer::BlasBuilds() const { return impl_->blas_builds; }

@@ -1,0 +1,17 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# GPU-driven drawing, at a scale where the difference is the whole point.
+# Headless: it renders offscreen and measures, so it runs in CI.
+cc_test(
+    name = "manyobjects_test",
+    srcs = ["offscreen.cpp"],
+    deps = [
+        "//engine/app",
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+    ],
+)
