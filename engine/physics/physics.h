@@ -181,6 +181,24 @@ struct Contact {
     float depth = 0.0f;             // positive when overlapping
 };
 
+// A pair of bodies starting, continuing or stopping touching.
+//
+// The transitions are what gameplay wants and what a contact list cannot give:
+// "the player ENTERED the checkpoint" is a different event from "the player is
+// still in the checkpoint", and deriving one from the other means every caller
+// keeping its own record of last frame.
+enum class TouchPhase : std::uint8_t { Begin, Stay, End };
+
+struct TouchEvent {
+    int a = -1, b = -1;
+    TouchPhase phase = TouchPhase::Begin;
+    // Meaningless for End: the bodies are apart, so there is no contact point
+    // to report. Zeroed rather than left stale, because a stale one from two
+    // steps ago is the kind of value that looks usable.
+    Vec3 point{0.0f, 0.0f, 0.0f};
+    Vec3 normal{0.0f, 1.0f, 0.0f};
+};
+
 // Where a ray met a body.
 struct RayHit {
     int body = -1;  // index into the world, or -1 for nothing
@@ -296,7 +314,14 @@ class World {
     // One fixed step. Exposed so tests can drive it deterministically.
     void StepFixed();
 
+    // The contacts the SOLVER will resolve. Trigger pairs are not here: they
+    // are reported through Touches() and never produce an impulse.
     [[nodiscard]] const std::vector<Contact>& Contacts() const { return contacts_; }
+
+    // Every pair that began, continued or stopped touching during the last
+    // step -- triggers and solid contacts alike. A solid collision beginning is
+    // as useful as a trigger being entered: it is when the impact sound plays.
+    [[nodiscard]] const std::vector<TouchEvent>& Touches() const { return touch_events_; }
 
     // --- queries ---------------------------------------------------------------
     //
@@ -341,9 +366,25 @@ class World {
     std::vector<Body> bodies_;
     std::vector<Joint> joints_;
     std::vector<Contact> contacts_;
+    // Trigger pairs, kept apart so the solver cannot see them. Filtering them
+    // out inside Resolve would work until something else iterated contacts_
+    // and forgot to.
+    std::vector<Contact> trigger_contacts_;
+    std::vector<TouchEvent> touch_events_;
+    // Pairs touching as of the last step, packed and sorted, so this step's set
+    // can be differenced against it. Sorted rather than hashed because the
+    // difference is the whole operation and a linear merge is the cheapest way
+    // to do it.
+    std::vector<std::uint64_t> touching_;
+    std::vector<std::uint64_t> touching_next_;
+    void BuildTouchEvents();
     // Contacts touching each body this step. Kept as a member so a steady-state
     // step allocates nothing.
-    std::vector<int> touches_;
+    // How many contacts each body is in this step, so the positional
+    // correction can be divided between them. Named for what it holds:
+    // it sat next to touch_events_ as "touches_" and the two are not
+    // remotely the same thing.
+    std::vector<int> contacts_per_body_;
     // Union-find parents for the sleeping islands. A member so a settled scene
     // allocates nothing per step.
     std::vector<int> islands_;

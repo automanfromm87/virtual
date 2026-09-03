@@ -1239,6 +1239,195 @@ int main() {
         CHECK(found.size() == 2 && found[0] == 0 && found[1] == 4);
     }
 
+    // --- triggers and touch events ----------------------------------------------
+    //
+    // "Is the player in this region" is a question every game asks, and without
+    // triggers the only way to answer it is to test every region against every
+    // body by hand every frame. And the TRANSITION is what gameplay actually
+    // wants: entering a checkpoint is a different event from being in one, and
+    // deriving the first from the second means every caller keeping its own
+    // record of last frame.
+    {
+        std::printf("triggers and touch events\n");
+        World w;
+        w.gravity = Vec3{0, 0, 0};
+
+        Body zone;
+        zone.shape = Shape::MakeBox(Vec3{1, 1, 1});
+        zone.position = Vec3{0, 0, 0};
+        zone.trigger = true;
+        zone.SetMass(0.0f);
+        const int trig = w.Add(zone);
+
+        Body mover = Ball(Vec3{-4, 0, 0}, 0.5f, 0.0f);
+        mover.velocity = Vec3{4, 0, 0};
+        mover.SetMass(1.0f);
+        const int ball = w.Add(mover);
+
+        const auto phase_of = [&](int a, int b) {
+            for (const TouchEvent& e : w.Touches())
+                if ((e.a == a && e.b == b) || (e.a == b && e.b == a))
+                    return int(e.phase);
+            return -1;
+        };
+
+        // Approaching: no events at all.
+        for (int i = 0; i < 60; ++i) w.StepFixed();
+        std::printf("    at x = %.2f: %zu events\n", w[ball].position.x,
+                    w.Touches().size());
+        CHECK(w.Touches().empty());
+
+        // Step until it enters. The FIRST step that overlaps must report Begin,
+        // and exactly once.
+        int begins = 0, stays = 0, ends = 0;
+        for (int i = 0; i < 400; ++i) {
+            w.StepFixed();
+            const int p = phase_of(trig, ball);
+            if (p == int(TouchPhase::Begin)) ++begins;
+            if (p == int(TouchPhase::Stay)) ++stays;
+            if (p == int(TouchPhase::End)) ++ends;
+        }
+        std::printf("    passing through: %d begin, %d stay, %d end\n", begins,
+                    stays, ends);
+        CHECK(begins == 1);
+        CHECK(ends == 1);
+        // It was inside for a while, which is what makes Begin and End
+        // meaningfully different from each other.
+        CHECK(stays > 10);
+
+        // AND IT PASSED THROUGH. A trigger produces no impulse: the ball must
+        // come out the other side at the speed it went in.
+        std::printf("    left at x = %.2f with vx = %.3f (entered at 4.000)\n",
+                    w[ball].position.x, w[ball].velocity.x);
+        CHECK(w[ball].position.x > 2.0f);
+        CHECK(std::fabs(w[ball].velocity.x - 4.0f) < 1e-3f);
+        // ...and the solver never saw it, which is the mechanism rather than
+        // the symptom.
+        CHECK(w.Contacts().empty());
+    }
+
+    // --- a solid collision reports events too ------------------------------------
+    //
+    // Begin is when the impact sound plays, and it must fire once rather than
+    // every step the bodies remain in contact.
+    {
+        World w;
+        Body floor;
+        floor.shape = Shape::MakeBox(Vec3{10, 1, 10});
+        floor.position = Vec3{0, -1, 0};
+        floor.SetMass(0.0f);
+        w.Add(floor);
+        Body ball = Ball(Vec3{0, 3, 0}, 0.5f, 0.0f);
+        ball.SetMass(1.0f);
+        const int b = w.Add(ball);
+
+        int begins = 0, ends = 0, stays = 0;
+        for (int i = 0; i < 400; ++i) {
+            w.StepFixed();
+            for (const TouchEvent& e : w.Touches()) {
+                if (e.a != b && e.b != b) continue;
+                if (e.phase == TouchPhase::Begin) {
+                    ++begins;
+                    // The contact point is on the floor's surface and the
+                    // normal is vertical -- an event carrying a stale point
+                    // from an earlier step would not be.
+                    CHECK(std::fabs(e.point.y) < 0.1f);
+                    CHECK(std::fabs(std::fabs(e.normal.y) - 1.0f) < 0.1f);
+                }
+                if (e.phase == TouchPhase::Stay) ++stays;
+                if (e.phase == TouchPhase::End) ++ends;
+            }
+        }
+        std::printf("    a ball landing: %d begin, %d stay, %d end, asleep = %d\n",
+                    begins, stays, ends, int(w[b].sleeping));
+        // It lands once and stays. A restitution of zero means it should not
+        // bounce back off and re-enter, so Begin fires once.
+        CHECK(begins == 1);
+        CHECK(stays > 30);
+        // And it NEVER reports End, because it never left the floor. It fell
+        // asleep instead -- at which point the broadphase stops testing the
+        // pair, and the naive reading of that is "they stopped touching". The
+        // Stay events stop too, correctly: nothing is happening.
+        CHECK(ends == 0);
+        CHECK(w[b].sleeping);
+    }
+
+    // A trigger must not WAKE a sleeping body either: something asleep inside a
+    // checkpoint is not entering it, and waking it would defeat sleeping in any
+    // scene with a trigger volume over the floor.
+    {
+        World w;
+        Body floor;
+        floor.shape = Shape::MakeBox(Vec3{10, 1, 10});
+        floor.position = Vec3{0, -1, 0};
+        floor.SetMass(0.0f);
+        w.Add(floor);
+        Body zone;
+        zone.shape = Shape::MakeBox(Vec3{5, 5, 5});
+        zone.position = Vec3{0, 0, 0};
+        zone.trigger = true;
+        zone.SetMass(0.0f);
+        w.Add(zone);
+        Body ball = Ball(Vec3{0, 0.6f, 0}, 0.5f, 0.0f);
+        ball.SetMass(1.0f);
+        const int b = w.Add(ball);
+
+        for (int i = 0; i < 1200; ++i) w.StepFixed();
+        std::printf("    a ball resting inside a trigger: sleeping = %d\n",
+                    int(w[b].sleeping));
+        CHECK(w[b].sleeping);
+    }
+
+    // A settled PILE produces no events at all, and every event ever reported
+    // names its pair in a stable order.
+    //
+    // Several bodies rather than one, and settling at different times, because
+    // that is what makes the bookkeeping non-trivial: a pair that goes to sleep
+    // is carried forward while its neighbours are still active, so the record
+    // of what was touching stops being in the order it was built in.
+    {
+        World w;
+        Body floor;
+        floor.shape = Shape::MakeBox(Vec3{10, 1, 10});
+        floor.position = Vec3{0, -1, 0};
+        floor.SetMass(0.0f);
+        w.Add(floor);
+        for (int i = 0; i < 6; ++i) {
+            Body ball = Ball(Vec3{float(i) * 1.4f - 3.5f, 1.0f + float(i) * 0.8f, 0},
+                             0.5f, 0.0f);
+            ball.SetMass(1.0f);
+            w.Add(ball);
+        }
+
+        // Every event, over the whole settling, must name a < b. Callers index
+        // on the pair, and a pair that is sometimes (3,0) and sometimes (0,3)
+        // is two pairs as far as any std::map is concerned.
+        bool ordered = true;
+        for (int i = 0; i < 900; ++i) {
+            w.StepFixed();
+            for (const TouchEvent& e : w.Touches())
+                if (e.a >= e.b) ordered = false;
+        }
+        CHECK(ordered);
+
+        int asleep = 0;
+        for (int i = 1; i <= 6; ++i) asleep += w[i].sleeping ? 1 : 0;
+        std::printf("    six balls dropped: %d asleep after 7.5 s\n", asleep);
+        CHECK(asleep == 6);
+
+        // Now that everything is asleep and nothing is moving, no pair may
+        // begin, end, or churn. A record of what was touching that has fallen
+        // out of order produces exactly that churn -- pairs alternately
+        // vanishing and reappearing as the merge walks past them.
+        int spurious = 0;
+        for (int i = 0; i < 240; ++i) {
+            w.StepFixed();
+            spurious += int(w.Touches().size());
+        }
+        std::printf("    two more seconds asleep: %d events (want 0)\n", spurious);
+        CHECK(spurious == 0);
+    }
+
     if (g_failures == 0) std::printf("physics_test: all checks passed\n");
     return g_failures == 0 ? 0 : 1;
 }

@@ -1201,7 +1201,143 @@ void World::Collide() {
             }
         }
     }
+    // TRIGGERS out of the solver's list, in one pass rather than at each of the
+    // six places a contact is appended -- one of those sits after an early
+    // "continue" and would have been missed.
+    trigger_contacts_.clear();
+    contacts_.erase(
+        std::remove_if(contacts_.begin(), contacts_.end(),
+                       [&](const Contact& c) {
+                           if (!bodies_[std::size_t(c.a)].trigger &&
+                               !bodies_[std::size_t(c.b)].trigger)
+                               return false;
+                           trigger_contacts_.push_back(c);
+                           return true;
+                       }),
+        contacts_.end());
+
     stats_.contacts = int(contacts_.size());
+    BuildTouchEvents();
+}
+
+void World::BuildTouchEvents() {
+    // CLEARED first. Without this the list accumulates for the life of the
+    // world -- which does not look like a bug from the outside, because the
+    // events in it are all real: a caller iterating them sees last frame's
+    // Begin again this frame, and every frame after.
+    touch_events_.clear();
+
+    // Pairs touching NOW, from both lists: a solid collision beginning is as
+    // useful an event as a trigger being entered -- it is when the impact
+    // sound plays.
+    const auto key = [](int a, int b) {
+        const std::uint64_t lo = std::uint64_t(std::min(a, b));
+        const std::uint64_t hi = std::uint64_t(std::max(a, b));
+        // Ordered, so a pair has ONE key however the narrowphase happened to
+        // label it -- the sphere-box path swaps its arguments so the sphere is
+        // always first, which means the same two bodies come back as (3,0) or
+        // (0,3) depending on which is which.
+        //
+        // It also gives callers a guarantee worth having: every event reports
+        // a < b, so a pair can be used as a map key without normalising it at
+        // each of the call sites that does.
+        return (lo << 32) | hi;
+    };
+
+    struct Seen {
+        std::uint64_t k;
+        Vec3 point, normal;
+    };
+    std::vector<Seen> now;
+    now.reserve(contacts_.size() + trigger_contacts_.size());
+    for (const Contact& c : contacts_) now.push_back({key(c.a, c.b), c.point, c.normal});
+    for (const Contact& c : trigger_contacts_)
+        now.push_back({key(c.a, c.b), c.point, c.normal});
+    std::sort(now.begin(), now.end(),
+              [](const Seen& x, const Seen& y) { return x.k < y.k; });
+    now.erase(std::unique(now.begin(), now.end(),
+                          [](const Seen& x, const Seen& y) { return x.k == y.k; }),
+              now.end());
+
+    // Built during the merge below rather than copied from `now`, because a
+    // pair can survive into it without being in `now` -- see the sleeping case.
+    touching_next_.clear();
+    touching_next_.reserve(now.size());
+
+    const auto unpack = [](std::uint64_t k, int* a, int* b) {
+        *a = int(k >> 32);
+        *b = int(k & 0xFFFFFFFFu);
+    };
+
+    // A linear merge over two sorted lists, which is the whole operation: what
+    // is in one and not the other is a transition, and what is in both is not.
+    std::size_t i = 0, j = 0;
+    while (i < now.size() || j < touching_.size()) {
+        const bool have_new = i < now.size();
+        const bool have_old = j < touching_.size();
+        if (have_new && (!have_old || now[i].k < touching_[j])) {
+            TouchEvent e;
+            unpack(now[i].k, &e.a, &e.b);
+            e.phase = TouchPhase::Begin;
+            e.point = now[i].point;
+            e.normal = now[i].normal;
+            touch_events_.push_back(e);
+            touching_next_.push_back(now[i].k);
+            ++i;
+        } else if (have_old && (!have_new || touching_[j] < now[i].k)) {
+            int a = 0, b = 0;
+            unpack(touching_[j], &a, &b);
+            // A pair can vanish from the contact list without stopping
+            // touching: the broadphase skips two bodies that are both static
+            // or asleep, because there is nothing to resolve between them.
+            //
+            // A ball that lands and settles does exactly that, and reporting
+            // End for it says "the ball left the floor" at the moment it
+            // finally came to rest. So a pair whose bodies are all inert is
+            // carried forward as still-touching and produces no event at all;
+            // waking either of them puts it back in the contact list, which
+            // produces a Stay rather than a second Begin.
+            const Body& ba = bodies_[std::size_t(a)];
+            const Body& bb = bodies_[std::size_t(b)];
+            const bool a_inert = ba.IsStatic() || ba.sleeping;
+            const bool b_inert = bb.IsStatic() || bb.sleeping;
+            if (a_inert && b_inert) {
+                touching_next_.push_back(touching_[j]);
+            } else {
+                TouchEvent e;
+                e.a = a;
+                e.b = b;
+                e.phase = TouchPhase::End;
+                // Point and normal stay zeroed: the bodies are apart, and a
+                // position from two steps ago is worse than nothing because it
+                // looks usable.
+                touch_events_.push_back(e);
+            }
+            ++j;
+        } else {
+            TouchEvent e;
+            unpack(now[i].k, &e.a, &e.b);
+            e.phase = TouchPhase::Stay;
+            e.point = now[i].point;
+            e.normal = now[i].normal;
+            touch_events_.push_back(e);
+            touching_next_.push_back(now[i].k);
+            ++i;
+            ++j;
+        }
+    }
+    // The next step's merge is a linear scan that requires both sides sorted,
+    // and nothing else enforces it.
+    //
+    // As written this sort is a NO-OP and measurably so: the merge above always
+    // pushes whichever of the two fronts is smaller, including the carried-over
+    // pairs, so it emits in ascending order by construction. Removing the sort
+    // changes no test. It stays because that property belongs to the merge's
+    // control flow rather than to anything declared, and the failure if it ever
+    // stops holding is pairs churning between Begin and End forever -- with no
+    // symptom until something goes to sleep.
+    std::sort(touching_next_.begin(), touching_next_.end());
+    touching_.swap(touching_next_);
 }
 
 void World::Resolve() {
@@ -1280,10 +1416,10 @@ void World::Resolve() {
     // measured at 0.312 of lift for 0.2 of overlap, so the box is ejected
     // upward and lands again next step. A sphere has a single contact and never
     // showed it.
-    touches_.assign(bodies_.size(), 0);
+    contacts_per_body_.assign(bodies_.size(), 0);
     for (const Contact& c : contacts_) {
-        ++touches_[std::size_t(c.a)];
-        ++touches_[std::size_t(c.b)];
+        ++contacts_per_body_[std::size_t(c.a)];
+        ++contacts_per_body_[std::size_t(c.b)];
     }
     for (const Contact& c : contacts_) {
         Body& a = bodies_[std::size_t(c.a)];
@@ -1293,8 +1429,8 @@ void World::Resolve() {
         const float excess = std::max(c.depth - penetration_slop, 0.0f);
         const Vec3 push = c.normal * (excess * penetration_correction / inv_sum);
         if (a.sleeping && b.sleeping) continue;
-        const float share_a = 1.0f / float(std::max(touches_[std::size_t(c.a)], 1));
-        const float share_b = 1.0f / float(std::max(touches_[std::size_t(c.b)], 1));
+        const float share_a = 1.0f / float(std::max(contacts_per_body_[std::size_t(c.a)], 1));
+        const float share_b = 1.0f / float(std::max(contacts_per_body_[std::size_t(c.b)], 1));
         a.position = a.position - push * (a.inverse_mass * share_a);
         b.position = b.position + push * (b.inverse_mass * share_b);
     }
