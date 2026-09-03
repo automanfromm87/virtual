@@ -51,6 +51,9 @@ constexpr char kDeferredSrc[] = {
 constexpr char kRaytraceSrc[] = {
 #embed "engine/shaders/raytrace.metal"
     , 0};
+constexpr char kSkinningSrc[] = {
+#embed "engine/shaders/skinning.metal"
+    , 0};
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
 static_assert(sizeof(FrameUniforms) == 416, "FrameUniforms layout drifted");
@@ -101,6 +104,9 @@ struct GpuMesh {
     rhi::BufferId vb;
     rhi::BufferId ib;
     std::size_t index_count = 0;
+    // Needed by compute skinning, which dispatches one thread per VERTEX while
+    // every draw path counts indices.
+    std::size_t vertex_count = 0;
     Bounds bounds;
     // Null for a static mesh. Skinning is a property of the GEOMETRY, not of
     // the material: the same material may be worn by a prop and a character.
@@ -167,6 +173,19 @@ struct Renderer::Impl {
     rhi::PipelineId ray_shadow;
     bool ray_shadow_tried = false;
     rhi::AccelId scene_tlas;
+    // Compute skinning. Built on first use, like the ray tracing pipeline:
+    // most scenes have no skinned geometry and would pay a shader compile for
+    // nothing.
+    rhi::ComputePipelineId skin_pipeline;
+    bool skin_pipeline_tried = false;
+    std::string skin_error;
+    // Posed output per scene instance index, and the buffer pool behind it.
+    // Keyed by instance rather than by mesh: two instances of one mesh at
+    // different poses are different geometry and cannot share a buffer.
+    std::vector<rhi::BufferId> posed_of_instance;
+    std::vector<rhi::BufferId> posed_pool;
+    std::vector<std::size_t> posed_pool_bytes;
+    std::size_t posed_used = 0;
     // Bottom-level structure per registered mesh, or a null handle for one
     // that has not needed one yet. Indexed by MeshHandle.
     std::vector<rhi::AccelId> mesh_blas;
@@ -456,6 +475,7 @@ MeshHandle Renderer::UploadMesh(const Mesh& mesh) {
                                      mesh.indices.size() * sizeof(std::uint16_t));
     if (!Valid(gm.vb) || !Valid(gm.ib)) return {};
     gm.index_count = mesh.indices.size();
+    gm.vertex_count = mesh.vertices.size();
     gm.bounds = mesh.bounds;
     impl_->meshes.push_back(gm);
     return MeshHandle{std::uint32_t(impl_->meshes.size() - 1)};
@@ -1319,6 +1339,95 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
 
 int Renderer::BlasBuilds() const { return impl_->blas_builds; }
 
+rhi::BufferId Renderer::PosedVertices(int instance_index) const {
+    if (instance_index < 0 ||
+        std::size_t(instance_index) >= impl_->posed_of_instance.size())
+        return {};
+    return impl_->posed_of_instance[std::size_t(instance_index)];
+}
+
+const std::string& Renderer::SkinError() const { return impl_->skin_error; }
+
+int Renderer::SkinToBuffers(rhi::ComputeEncoder& enc, const Scene& scene) {
+    impl_->posed_of_instance.assign(scene.instances.size(), rhi::BufferId{});
+    impl_->posed_used = 0;
+
+    if (!impl_->skin_pipeline_tried) {
+        impl_->skin_pipeline_tried = true;
+        std::string err;
+        impl_->skin_pipeline = impl_->dev->CreateComputePipeline(
+            ShaderSource(kSkinningSrc), "cs_skin", err);
+        // KEPT, not discarded. This pipeline is built lazily, so its failure
+        // arrives in the middle of a frame with nowhere to return an error --
+        // and "SkinToBuffers posed nothing" is indistinguishable from "the
+        // scene has no skinned meshes". It cost an hour once already.
+        if (!Valid(impl_->skin_pipeline)) impl_->skin_error = err;
+    }
+    if (!Valid(impl_->skin_pipeline)) return 0;
+
+    int posed = 0;
+    bool pipeline_set = false;
+    for (std::size_t idx = 0; idx < scene.instances.size(); ++idx) {
+        const Instance& inst = scene.instances[idx];
+        if (!Valid(inst.mesh) || inst.mesh.v >= impl_->meshes.size()) continue;
+        const GpuMesh& gm = impl_->meshes[inst.mesh.v];
+        if (gm.joint_count <= 0 || !Valid(gm.skin_vb)) continue;
+        if (inst.palette < 0 ||
+            std::size_t(inst.palette) + std::size_t(gm.joint_count) >
+                scene.joint_matrices.size())
+            continue;
+
+        // A pooled output buffer, reused frame to frame. Allocating one per
+        // skinned instance per frame would work and would also leak a vertex
+        // buffer's worth of memory every frame until the driver gave up.
+        const std::size_t bytes = sizeof(VertexIn) * gm.vertex_count;
+        rhi::BufferId out;
+        if (impl_->posed_used < impl_->posed_pool.size() &&
+            impl_->posed_pool_bytes[impl_->posed_used] >= bytes) {
+            out = impl_->posed_pool[impl_->posed_used];
+        } else {
+            out = impl_->dev->CreateStorageBuffer(bytes);
+            if (!Valid(out)) continue;
+            if (impl_->posed_used < impl_->posed_pool.size()) {
+                impl_->posed_pool[impl_->posed_used] = out;
+                impl_->posed_pool_bytes[impl_->posed_used] = bytes;
+            } else {
+                impl_->posed_pool.push_back(out);
+                impl_->posed_pool_bytes.push_back(bytes);
+            }
+        }
+        ++impl_->posed_used;
+
+        // The palette, into the same ring the draw path uses.
+        const std::size_t palette_offset = impl_->AllocPalette();
+        if (palette_offset == Impl::kNoSpace) continue;
+        std::memcpy(impl_->palette_map + palette_offset,
+                    scene.joint_matrices.data() + inst.palette,
+                    sizeof(Mat4) * std::size_t(gm.joint_count));
+
+        if (!pipeline_set) {
+            enc.SetPipeline(impl_->skin_pipeline);
+            pipeline_set = true;
+        }
+        struct SkinParams {
+            std::uint32_t vertex_count;
+            std::uint32_t joint_count;
+            std::uint32_t pad0 = 0, pad1 = 0;
+        } params{std::uint32_t(gm.vertex_count), std::uint32_t(gm.joint_count)};
+
+        enc.SetBuffer(gm.vb, 0, 0);
+        enc.SetBuffer(gm.skin_vb, 0, 1);
+        enc.SetBuffer(impl_->palettes, palette_offset, 2);
+        enc.SetBytes(&params, sizeof(params), 3);
+        enc.SetBuffer(out, 0, 4);
+        enc.Dispatch(int(gm.vertex_count));
+
+        impl_->posed_of_instance[idx] = out;
+        ++posed;
+    }
+    return posed;
+}
+
 bool Renderer::RaytracingAvailable() const {
     return impl_->dev->SupportsRaytracing();
 }
@@ -1336,13 +1445,38 @@ bool Renderer::BuildSceneAccel(const Scene& scene, std::string& error) {
     for (const Instance& inst : scene.instances) {
         if (!Valid(inst.mesh) || inst.mesh.v >= impl_->meshes.size()) continue;
         const GpuMesh& gm = impl_->meshes[inst.mesh.v];
-        // A SKINNED mesh is deliberately left out. Its triangles live only in
-        // the vertex shader's output -- the buffer on the GPU is the bind pose
-        // -- so a structure built from it would cast the shadow of a character
-        // standing still while the character walks. Doing it properly needs the
-        // skinned positions written back to a buffer first, which is a real
-        // feature and not a line of code.
-        if (gm.joint_count > 0) continue;
+        // A SKINNED mesh uses the buffer SkinToBuffers posed, not the one on
+        // the mesh -- that one is the bind pose, and a structure built from it
+        // casts the shadow of a character standing still while the character
+        // walks.
+        //
+        // It also cannot be shared between instances the way a static mesh's
+        // is: two characters of the same mesh in different poses are different
+        // geometry. So a posed instance gets its own structure, rebuilt each
+        // time the pose changes, and the deduplication below does not apply to
+        // it. That is the real cost of animated ray tracing and there is no
+        // version of it that is cheaper.
+        const rhi::BufferId posed =
+            gm.joint_count > 0 ? PosedVertices(int(&inst - scene.instances.data()))
+                               : rhi::BufferId{};
+        if (gm.joint_count > 0 && !Valid(posed)) {
+            // Skinned, but nothing posed it this frame. Skipping is right --
+            // the alternative is silently using the bind pose, which is the
+            // wrong picture rather than a missing one.
+            continue;
+        }
+
+        if (Valid(posed)) {
+            const rhi::AccelId blas = impl_->dev->CreateBlas(
+                posed, int(sizeof(VertexIn)), gm.ib, int(gm.index_count), error);
+            if (!Valid(blas)) return false;
+            ++impl_->blas_builds;
+            rhi::Device::AccelInstance ai;
+            ai.blas = blas;
+            std::memcpy(ai.transform, &inst.model.col[0].x, sizeof(float) * 16);
+            instances.push_back(ai);
+            continue;
+        }
 
         rhi::AccelId& blas = impl_->mesh_blas[inst.mesh.v];
         if (!Valid(blas)) {

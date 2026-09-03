@@ -49,6 +49,10 @@ struct Box {
 }  // namespace
 
 int main() {
+    // LINE buffered. A test that crashes with a full buffer prints nothing at
+    // all, so the one piece of information that would locate the crash -- how
+    // far it got -- is exactly what gets lost.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::string error;
     auto dev = eng::rhi::Device::Create(error);
     if (!dev) { std::fprintf(stderr, "FAIL: %s\n", error.c_str()); return 1; }
@@ -391,6 +395,391 @@ int main() {
         for (std::size_t i = 0; i < pixels.size(); i += 4)
             std::fwrite(&pixels[i], 1, 3, f);
         std::fclose(f);
+    }
+
+    // --- compute skinning, written back to a buffer ---------------------------
+    //
+    // The vertex shader blends a skinned vertex and hands it straight to the
+    // rasteriser, so the posed triangles exist nowhere a second consumer can
+    // reach. This poses them into a buffer instead, which is what ray tracing
+    // needs (an acceleration structure is built from a buffer, and one built
+    // from the bind pose casts a standing character's shadow while it walks)
+    // and what CPU-side collision against a posed mesh needs.
+    //
+    // The check is EXACT, vertex by vertex, against anim::SkinPosition. The
+    // rasterised test above can only compare bounding boxes with slack, because
+    // culling and occlusion legitimately remove pixels. A buffer has no such
+    // excuse -- every float is either the reference value or a bug.
+    {
+        std::printf("compute skinning\n");
+        eng::Scene s = demo::MakeScene(assets, 0.37f);
+        // One instance, so the mapping from instance index to posed buffer is
+        // unambiguous when a check fails.
+        eng::Instance only;
+        for (const eng::Instance& i : s.instances)
+            if (i.mesh.v == assets.mesh.v) only = i;
+        s.instances.clear();
+        s.instances.push_back(only);
+
+        dev->BeginFrame();
+        int posed = 0;
+        {
+            eng::rhi::ComputeEncoder ce = dev->BeginCompute();
+            posed = renderer->SkinToBuffers(ce, s);
+            dev->EndCompute();
+        }
+        std::string werr;
+        Check(dev->CommitAndWait(werr), "the compute pass submits");
+        std::printf("    posed %d skinned instance(s)\n", posed);
+        Check(posed == 1, "the skinned instance was posed");
+
+        const eng::rhi::BufferId out = renderer->PosedVertices(0);
+        Check(Valid(out), "and has a posed vertex buffer");
+        const auto* gpu = static_cast<const VertexIn*>(dev->MapBuffer(out));
+        Check(gpu != nullptr, "which can be read back");
+
+        if (gpu) {
+            // The same blend, on the CPU, from the same palette the compute
+            // pass was given.
+            const std::vector<eng::Mat4>& palette = s.joint_matrices;
+            float worst_pos = 0.0f, worst_nrm = 0.0f;
+            std::size_t n = assets.flag.mesh.vertices.size();
+            for (std::size_t i = 0; i < n; ++i) {
+                const eng::Vec4& p = assets.flag.mesh.vertices[i].position;
+                const eng::Vec4& nv = assets.flag.mesh.vertices[i].normal;
+                const eng::Vec3 want_p = eng::anim::SkinPosition(
+                    eng::Vec3{p.x, p.y, p.z}, assets.flag.skin[i], palette);
+                const eng::Vec3 want_n = eng::anim::SkinNormal(
+                    eng::Vec3{nv.x, nv.y, nv.z}, assets.flag.skin[i], palette);
+                const eng::Vec3 got_p{gpu[i].position.x, gpu[i].position.y,
+                                      gpu[i].position.z};
+                const eng::Vec3 got_n{gpu[i].normal.x, gpu[i].normal.y,
+                                      gpu[i].normal.z};
+                worst_pos = std::fmax(worst_pos, Length(got_p - want_p));
+                // SkinNormal renormalises and the kernel does not, so compare
+                // directions rather than vectors -- the length is the vertex
+                // shader's business and it renormalises per fragment anyway.
+                const float len = Length(got_n);
+                if (len > 1e-6f)
+                    worst_nrm = std::fmax(worst_nrm,
+                                          Length(got_n * (1.0f / len) - want_n));
+            }
+            std::printf("    %zu vertices: worst position error %.7f, worst "
+                        "normal error %.7f\n", n, worst_pos, worst_nrm);
+            Check(worst_pos < 1e-5f, "the compute blend matches SkinPosition exactly");
+            Check(worst_nrm < 1e-5f, "and the normals match SkinNormal");
+
+            // It must actually have MOVED. Comparing against the reference
+            // would pass on a kernel that copied the bind pose, if the pose
+            // happened to be the rest pose -- and it is not, but nothing above
+            // says so.
+            float moved = 0.0f;
+            for (std::size_t i = 0; i < n; ++i) {
+                const eng::Vec4& p = assets.flag.mesh.vertices[i].position;
+                moved = std::fmax(moved, Length(eng::Vec3{gpu[i].position.x,
+                                                          gpu[i].position.y,
+                                                          gpu[i].position.z} -
+                                                eng::Vec3{p.x, p.y, p.z}));
+            }
+            std::printf("    the furthest vertex moved %.4f from the bind pose\n",
+                        moved);
+            Check(moved > 0.05f, "the pose is not the bind pose");
+
+            // Colour and uv ride along unchanged, so the output is a drop-in
+            // replacement for the input buffer rather than a parallel array.
+            bool carried = true;
+            for (std::size_t i = 0; i < n; ++i) {
+                const VertexIn& src = assets.flag.mesh.vertices[i];
+                if (gpu[i].uv.x != src.uv.x || gpu[i].uv.y != src.uv.y ||
+                    gpu[i].color.x != src.color.x)
+                    carried = false;
+            }
+            Check(carried, "uv and colour survive the pose unchanged");
+        }
+
+        if (!renderer->SkinError().empty())
+            std::fprintf(stderr, "    skinning pipeline: %s\n",
+                         renderer->SkinError().c_str());
+
+        // A DIFFERENT pose must give a different buffer. Without this a kernel
+        // that ignored the palette entirely would pass everything above on the
+        // one pose it was checked at.
+        if (gpu) {
+            eng::Scene s2 = demo::MakeScene(assets, 0.82f);
+            eng::Instance one;
+            for (const eng::Instance& i : s2.instances)
+                if (i.mesh.v == assets.mesh.v) one = i;
+            s2.instances.clear();
+            s2.instances.push_back(one);
+            std::vector<VertexIn> first(
+                gpu, gpu + assets.flag.mesh.vertices.size());
+
+            dev->BeginFrame();
+            {
+                eng::rhi::ComputeEncoder ce = dev->BeginCompute();
+                (void)renderer->SkinToBuffers(ce, s2);
+                dev->EndCompute();
+            }
+            std::string e2;
+            Check(dev->CommitAndWait(e2), "the second pose submits");
+            const auto* g2 = static_cast<const VertexIn*>(
+                dev->MapBuffer(renderer->PosedVertices(0)));
+            float apart = 0.0f;
+            if (g2)
+                for (std::size_t i = 0; i < first.size(); ++i)
+                    apart = std::fmax(
+                        apart, Length(eng::Vec3{g2[i].position.x, g2[i].position.y,
+                                                g2[i].position.z} -
+                                      eng::Vec3{first[i].position.x,
+                                                first[i].position.y,
+                                                first[i].position.z}));
+            std::printf("    a second pose moves the furthest vertex %.4f "
+                        "from the first\n", apart);
+            Check(apart > 0.02f, "a different pose produces a different buffer");
+        }
+    }
+
+    // --- a skinned mesh casting a ray-traced shadow ---------------------------
+    //
+    // This is the whole reason compute skinning exists. An acceleration
+    // structure is built from a BUFFER, and until now the only buffer holding
+    // this mesh was the bind pose -- so a waving flag cast the shadow of a flat
+    // one. The check is that the shadow MOVES when the pose does, which the
+    // bind-pose version cannot do however good it looks in a still.
+    {
+        std::printf("ray-traced shadows from a posed mesh\n");
+        if (!renderer->RaytracingAvailable()) {
+            std::printf("    (no hardware ray tracing on this device)\n");
+        } else {
+            const eng::rhi::TextureId gb0 =
+                dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
+            const eng::rhi::TextureId gb1 =
+                dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
+            const eng::rhi::TextureId gdepth = dev->CreateDepthTarget(kW, kH, true);
+            const eng::rhi::TextureId rmask =
+                dev->CreateRenderTarget(kW, kH, eng::rhi::Format::RGBA8Unorm, true);
+            Check(Valid(gb0) && Valid(rmask), "the ray tracing targets exist");
+
+            // The shadow mask for one pose, as a picture.
+            const auto mask_for = [&](float t, std::vector<std::uint8_t>* out,
+                                      int* blas_before) {
+                eng::Scene s = demo::MakeScene(assets, t);
+                // Straight down, so the flag's shadow lands on the ground
+                // directly beneath it and moving the flag moves the shadow.
+                s.lightDir = eng::Vec4{0.0f, 1.0f, 0.0f, 0.0f};
+                s.camera.eye = eng::Vec3{0.0f, 6.5f, 0.01f};
+                s.camera.target = eng::Vec3{0.0f, 0.0f, 0.0f};
+
+                dev->BeginFrame();
+                {
+                    eng::rhi::ComputeEncoder ce = dev->BeginCompute();
+                    (void)renderer->SkinToBuffers(ce, s);
+                    dev->EndCompute();
+                }
+                *blas_before = renderer->BlasBuilds();
+                std::string e;
+                if (!renderer->BuildSceneAccel(s, e))
+                    std::fprintf(stderr, "    accel: %s\n", e.c_str());
+
+                eng::RenderGraph g;
+                {
+                    eng::RenderGraph::Pass p;
+                    p.name = "gbuffer";
+                    p.color = gb0;
+                    p.extra_colors = {gb1};
+                    p.depth = gdepth;
+                    p.clear_depth = 0.0f;
+                    p.keep_depth = true;
+                    p.execute = [&](eng::rhi::Encoder& e2) {
+                        renderer->DrawGBuffer(e2, s, kW, kH);
+                    };
+                    g.AddPass(std::move(p));
+                }
+                {
+                    eng::RenderGraph::Pass p;
+                    p.name = "ray shadows";
+                    p.color = rmask;
+                    p.reads = {gdepth, gb1};
+                    p.clear_color[0] = 1.0f; p.clear_color[1] = 1.0f;
+                    p.clear_color[2] = 1.0f; p.clear_color[3] = 1.0f;
+                    p.execute = [&](eng::rhi::Encoder& e2) {
+                        renderer->DrawRayShadows(e2, s, kW, kH, gdepth, gb1);
+                    };
+                    g.AddPass(std::move(p));
+                }
+                std::string ce2;
+                if (!g.Compile(ce2)) std::fprintf(stderr, "    graph: %s\n", ce2.c_str());
+                g.Execute(*dev);
+                std::string we;
+                if (!dev->CommitAndWait(we)) std::fprintf(stderr, "    %s\n", we.c_str());
+                out->assign(std::size_t(kW) * kH * 4, 0);
+                (void)dev->ReadPixels(rmask, kW, kH, *out);
+            };
+
+            std::vector<std::uint8_t> a, b;
+            int blas_a = 0, blas_b = 0;
+            mask_for(0.10f, &a, &blas_a);
+            mask_for(0.60f, &b, &blas_b);
+
+            const auto shadow_pixels = [](const std::vector<std::uint8_t>& m) {
+                int n = 0;
+                for (std::size_t i = 0; i + 3 < m.size(); i += 4)
+                    if (m[i] < 64) ++n;
+                return n;
+            };
+            int moved = 0;
+            for (std::size_t i = 0; i + 3 < a.size(); i += 4)
+                if ((a[i] < 64) != (b[i] < 64)) ++moved;
+
+            const int sa = shadow_pixels(a), sb = shadow_pixels(b);
+            std::printf("    pose 0.10 shadows %d px, pose 0.60 shadows %d px, "
+                        "%d px changed between them\n", sa, sb, moved);
+            Check(sa > 2000 && sb > 2000, "the flag casts a shadow at all");
+            // The number that matters. A structure built from the bind pose
+            // gives the SAME shadow at every pose, so this is zero -- and every
+            // other check here passes anyway.
+            Check(moved > 800, "and the shadow moves when the pose does");
+
+            // Confirmed by the build count: a posed mesh cannot share its
+            // structure with anything, so every frame rebuilds it.
+            std::printf("    bottom-level builds: %d after the first pose, %d "
+                        "after the second\n", blas_b, renderer->BlasBuilds());
+            Check(renderer->BlasBuilds() > blas_b,
+                  "a re-posed mesh rebuilds its acceleration structure");
+        }
+    }
+
+    // --- the past-the-end threads, and the zero-influence vertex --------------
+    //
+    // Two branches in the kernel that the flag cannot exercise, each with a
+    // failure that looks like nothing at all.
+    //
+    // The dispatch rounds the thread count up to a whole threadgroup, so a mesh
+    // whose vertex count is not a multiple of the group runs threads past its
+    // end. The output buffers are POOLED and reused, so those threads do not
+    // write into empty space -- they write over whatever the previous, larger
+    // mesh left there. That is the observation: pose something big, then
+    // something small into the same reused buffer, and the big one's tail must
+    // survive.
+    {
+        std::printf("kernel edge cases\n");
+
+        // A small skinned mesh: 100 vertices, which is not a multiple of the
+        // 64-wide threadgroup, so 28 threads run past the end.
+        constexpr int kSmall = 100;
+        eng::Mesh sm;
+        std::vector<eng::anim::SkinVertex> ssk;
+        for (int i = 0; i < kSmall; ++i) {
+            VertexIn v{};
+            // NOT at the origin, and that is the point of the offset. A zero
+            // blend matrix collapses a vertex to (0,0,0), so a fixture authored
+            // there cannot tell "left alone" from "collapsed" -- the two give
+            // the same answer and the check passes either way.
+            v.position = eng::Vec4{1.0f + float(i) * 0.01f, 0.5f, -0.25f, 1.0f};
+            v.normal = eng::Vec4{0, 1, 0, 0};
+            v.color = eng::Vec4{1, 1, 1, 1};
+            sm.vertices.push_back(v);
+            eng::anim::SkinVertex sv{};
+            if (i == 0) {
+                // ALL-ZERO weights. Nothing influences this vertex, and the
+                // kernel must leave it where the modeller put it -- a zero
+                // blend matrix collapses it onto the origin instead, which on a
+                // character is one vertex of the mesh stretched to the world
+                // origin and very easy to blame on the exporter.
+                for (int c = 0; c < 4; ++c) { sv.joints[c] = 0; sv.weights[c] = 0.0f; }
+            } else {
+                sv.joints[0] = std::uint16_t(i % 2);
+                sv.weights[0] = 1.0f;
+            }
+            ssk.push_back(sv);
+        }
+        for (int i = 0; i + 2 < kSmall; ++i) {
+            sm.indices.push_back(std::uint16_t(i));
+            sm.indices.push_back(std::uint16_t(i + 1));
+            sm.indices.push_back(std::uint16_t(i + 2));
+        }
+        const eng::MeshHandle small = renderer->UploadSkinnedMesh(sm, ssk, 2);
+        Check(Valid(small), "a small skinned mesh uploaded");
+
+        // Pose the big flag first, so the pooled buffer is sized for it and
+        // filled with its data.
+        eng::Scene big = demo::MakeScene(assets, 0.45f);
+        eng::Instance flag_only;
+        for (const eng::Instance& i : big.instances)
+            if (i.mesh.v == assets.mesh.v) flag_only = i;
+        big.instances.clear();
+        big.instances.push_back(flag_only);
+        dev->BeginFrame();
+        {
+            eng::rhi::ComputeEncoder ce = dev->BeginCompute();
+            (void)renderer->SkinToBuffers(ce, big);
+            dev->EndCompute();
+        }
+        std::string e1;
+        Check(dev->CommitAndWait(e1), "the big pose submits");
+        const eng::rhi::BufferId pooled = renderer->PosedVertices(0);
+        const auto* big_out = static_cast<const VertexIn*>(dev->MapBuffer(pooled));
+        std::vector<VertexIn> before;
+        if (big_out)
+            before.assign(big_out, big_out + assets.flag.mesh.vertices.size());
+
+        // Now the small mesh, into the same pooled buffer.
+        eng::Scene tiny;
+        tiny.joint_matrices = {eng::Mat4::Translation(eng::Vec3{0.0f, 2.0f, 0.0f}),
+                               eng::Mat4::Translation(eng::Vec3{0.0f, -2.0f, 0.0f})};
+        {
+            eng::Instance i;
+            i.mesh = small;
+            i.material = assets.flag_mat;
+            i.palette = 0;
+            tiny.instances.push_back(i);
+        }
+        dev->BeginFrame();
+        {
+            eng::rhi::ComputeEncoder ce = dev->BeginCompute();
+            (void)renderer->SkinToBuffers(ce, tiny);
+            dev->EndCompute();
+        }
+        std::string e2;
+        Check(dev->CommitAndWait(e2), "the small pose submits");
+        const eng::rhi::BufferId reused = renderer->PosedVertices(0);
+        Check(reused.v == pooled.v, "the small mesh reused the big mesh's buffer");
+
+        const auto* out = static_cast<const VertexIn*>(dev->MapBuffer(reused));
+        if (out && !before.empty()) {
+            // The zero-influence vertex stayed put.
+            std::printf("    the zero-influence vertex is at (%.3f %.3f %.3f), "
+                        "authored at (1.000 0.500 -0.250)\n", out[0].position.x,
+                        out[0].position.y, out[0].position.z);
+            Check(std::fabs(out[0].position.x - 1.0f) < 1e-5f &&
+                      std::fabs(out[0].position.y - 0.5f) < 1e-5f &&
+                      std::fabs(out[0].position.z + 0.25f) < 1e-5f,
+                  "a vertex with no influences stays where it was authored");
+            // ...and the vertices that DO have influences moved, or "nothing
+            // moved at all" would pass the check above. The two joints
+            // translate opposite ways, so odd and even vertices separate --
+            // which also rules out a kernel that applies joint 0 to everything.
+            std::printf("    vertex 1 (joint 1) y=%.3f, vertex 2 (joint 0) "
+                        "y=%.3f\n", out[1].position.y, out[2].position.y);
+            Check(std::fabs(out[1].position.y + 1.5f) < 1e-4f,
+                  "a vertex weighted to joint 1 moved down with it");
+            Check(std::fabs(out[2].position.y - 2.5f) < 1e-4f,
+                  "and one weighted to joint 0 moved up with it");
+
+            // The tail past the small mesh, which the rounded-up dispatch runs
+            // threads over. 100 vertices in groups of 64 is 128 threads, so
+            // indices 100..127 are the ones at risk.
+            int clobbered = 0;
+            for (std::size_t i = std::size_t(kSmall); i < before.size(); ++i)
+                if (out[i].position.x != before[i].position.x ||
+                    out[i].position.y != before[i].position.y)
+                    ++clobbered;
+            std::printf("    %zu vertices of the previous mesh survive past the "
+                        "small one; %d were overwritten\n",
+                        before.size() - kSmall, clobbered);
+            Check(clobbered == 0,
+                  "threads past the end of the mesh write nothing");
+        }
     }
 
     std::printf(g_failures == 0 ? "\nskinned_test: all checks passed\n"

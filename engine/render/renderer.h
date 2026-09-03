@@ -236,6 +236,33 @@ class Renderer {
     //
     // Returns false and leaves the previous structure in place if the device
     // has no ray tracing, so a caller can ask and fall back.
+    // --- compute skinning ----------------------------------------------------
+    //
+    // Poses a skinned mesh into a buffer, so that the posed triangles exist
+    // somewhere other than inside the rasteriser. Ray tracing needs that (an
+    // acceleration structure is built from a buffer, and one built from the
+    // bind pose casts a standing character's shadow while it walks), and so
+    // does anything that wants to collide against the posed mesh.
+    //
+    // Must be called between BeginFrame and the first render pass: a compute
+    // pass and a render pass cannot be open at the same time.
+    //
+    // Returns the number of meshes posed. Instances sharing a mesh AND a pose
+    // are done once; instances of the same mesh at different poses each get
+    // their own output, because they are different geometry.
+    int SkinToBuffers(rhi::ComputeEncoder&, const Scene&);
+
+    // The posed vertex buffer for a scene instance, or a null handle if that
+    // instance is not skinned or has not been posed this frame.
+    [[nodiscard]] rhi::BufferId PosedVertices(int instance_index) const;
+
+    // Why SkinToBuffers posed nothing, if it was the pipeline's fault. Empty
+    // otherwise. The compute pipeline is built lazily, so its compile error
+    // arrives mid-frame from a function with no error parameter -- and without
+    // this, a shader that does not compile looks exactly like a scene with no
+    // skinned meshes in it.
+    [[nodiscard]] const std::string& SkinError() const;
+
     [[nodiscard]] bool BuildSceneAccel(const Scene&, std::string& error);
     [[nodiscard]] bool RaytracingAvailable() const;
 

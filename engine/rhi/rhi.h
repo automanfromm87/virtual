@@ -57,11 +57,20 @@ struct SamplerId {
 struct AccelId {
     std::uint32_t v = 0;
 };
+// A compute pipeline. Separate from PipelineId because the two cannot be
+// substituted for one another anywhere -- a compute pipeline has no
+// attachments, no blend state and no vertex stage, and a single handle type
+// would make binding the wrong one a runtime surprise rather than a compile
+// error.
+struct ComputePipelineId {
+    std::uint32_t v = 0;
+};
 inline bool Valid(BufferId h) { return h.v != 0; }
 inline bool Valid(TextureId h) { return h.v != 0; }
 inline bool Valid(PipelineId h) { return h.v != 0; }
 inline bool Valid(SamplerId h) { return h.v != 0; }
 inline bool Valid(AccelId h) { return h.v != 0; }
+inline bool Valid(ComputePipelineId h) { return h.v != 0; }
 
 struct PipelineDesc {
     // Shader source in the backend's own language. The RHI compiles it but
@@ -160,6 +169,38 @@ class Encoder {
   private:
     friend class Device;
     explicit Encoder(Device* d) : device_(d) {}
+    Device* device_ = nullptr;
+};
+
+// Records work into the compute pass currently open on its Device.
+//
+// WHY compute is a separate encoder and not a mode of the other one: a render
+// pass and a compute pass cannot be open at the same time. Everything a render
+// pass writes is in tile memory until the pass ends, so a compute dispatch
+// cannot read it, and Metal enforces that by making them different encoder
+// objects. Modelling them as one type would let a caller write code the API
+// forbids and find out at runtime.
+class ComputeEncoder {
+  public:
+    void SetPipeline(ComputePipelineId);
+    void SetBuffer(BufferId, std::size_t offset, int slot);
+    void SetTexture(TextureId, int slot);
+    // Small constants, copied immediately.
+    void SetBytes(const void* data, std::size_t bytes, int slot);
+
+    // `count` items, in groups of `group`. Not a threadgroup COUNT: this takes
+    // the number of items and lets the backend round up, because the alternative
+    // is every call site doing the same ceiling division and one of them getting
+    // it wrong in a way that silently skips the last partial group.
+    //
+    // The shader still has to guard on the item index -- the rounding means the
+    // last group runs threads past the end, and nothing else stops them writing
+    // there.
+    void Dispatch(int count, int group = 64);
+
+  private:
+    friend class Device;
+    explicit ComputeEncoder(Device* d) : device_(d) {}
     Device* device_ = nullptr;
 };
 
@@ -265,6 +306,20 @@ class Device {
     [[nodiscard]] AccelId CreateTlas(std::span<const AccelInstance> instances,
                                      std::string& error);
     [[nodiscard]] PipelineId CreatePipeline(const PipelineDesc&, std::string& error);
+    // `source` is backend shader source, `fn` the kernel's name.
+    [[nodiscard]] ComputePipelineId CreateComputePipeline(const std::string& source,
+                                                          const std::string& fn,
+                                                          std::string& error);
+    // A buffer the GPU writes and nothing uploads: `bytes` of undefined
+    // contents, readable afterwards through MapBuffer.
+    //
+    // SHARED storage, not private. Private is the reflex -- "the CPU never
+    // touches it, so do not pay for coherency" -- and on unified memory there
+    // is nothing to pay: there is one copy either way. What private would cost
+    // is the ability to read the result back at all without a blit, and reading
+    // it back is half the point of writing it out. A posed mesh is wanted on
+    // the CPU for collision as much as on the GPU for ray tracing.
+    [[nodiscard]] BufferId CreateStorageBuffer(std::size_t bytes);
     // Releases the texture. The handle is dangling afterwards — the caller is
     // responsible for not reusing it. No generation counters yet.
     void DestroyTexture(TextureId);
@@ -291,6 +346,12 @@ class Device {
     [[nodiscard]] int TextureSlotCount() const;
     [[nodiscard]] Encoder BeginPass(const PassDesc&);
     void EndPass();
+
+    // A compute pass. Must not overlap a render pass on the same device -- see
+    // ComputeEncoder for why that is a hardware fact and not a rule this layer
+    // invented.
+    [[nodiscard]] ComputeEncoder BeginCompute();
+    void EndCompute();
     // Whether the pass currently open has a depth attachment. A pipeline built
     // without depth cannot be used in a pass that has one, and vice versa —
     // Metal rejects the draw — so the renderer has to be able to ask.
@@ -305,6 +366,7 @@ class Device {
 
   private:
     friend class Encoder;
+    friend class ComputeEncoder;
     Device();
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -117,6 +117,13 @@ struct Device::Impl {
         return std::uint32_t(textures.size() - 1);
     }
     std::vector<PipelineObj> pipelines{PipelineObj{}};
+    std::vector<id<MTLComputePipelineState>> compute_pipelines{nil};
+    id<MTLComputeCommandEncoder> compute_enc = nil;
+    // The threadgroup width the last-bound pipeline actually wants. Dispatch
+    // needs it, and asking the pipeline rather than assuming 64 is what keeps a
+    // kernel that declares a different size from silently running fewer threads
+    // than the caller asked for.
+    int compute_group_max = 64;
     std::vector<id<MTLSamplerState>> samplers{nil};
 
     // Acceleration structures, and for each one everything the GPU must have
@@ -347,6 +354,106 @@ BufferId Device::CreateBuffer(const void* data, std::size_t bytes) {
     if (!b) return {};
     impl_->buffers.push_back(b);
     return BufferId{std::uint32_t(impl_->buffers.size() - 1)};
+}
+
+BufferId Device::CreateStorageBuffer(std::size_t bytes) {
+    if (bytes == 0) return {};
+    // Shared, so MapBuffer works on it. See the header: on unified memory this
+    // costs nothing, and a posed mesh is wanted on the CPU for collision as
+    // much as on the GPU for ray tracing.
+    id<MTLBuffer> b = [impl_->dev newBufferWithLength:bytes
+                                              options:MTLResourceStorageModeShared];
+    if (!b) return {};
+    impl_->buffers.push_back(b);
+    return BufferId{std::uint32_t(impl_->buffers.size() - 1)};
+}
+
+ComputePipelineId Device::CreateComputePipeline(const std::string& source,
+                                                const std::string& fn,
+                                                std::string& error) {
+    @autoreleasepool {
+        NSError* err = nil;
+        id<MTLLibrary> lib =
+            [impl_->dev newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
+                                     options:nil
+                                       error:&err];
+        if (!lib) {
+            error = std::string("compute shader compilation failed: ") +
+                    (err ? err.localizedDescription.UTF8String : "unknown error");
+            return {};
+        }
+        id<MTLFunction> kernel =
+            [lib newFunctionWithName:[NSString stringWithUTF8String:fn.c_str()]];
+        if (!kernel) {
+            error = "compute kernel '" + fn + "' not found in the source";
+            return {};
+        }
+        id<MTLComputePipelineState> pso =
+            [impl_->dev newComputePipelineStateWithFunction:kernel error:&err];
+        if (!pso) {
+            error = std::string("compute pipeline creation failed: ") +
+                    (err ? err.localizedDescription.UTF8String : "unknown error");
+            return {};
+        }
+        impl_->compute_pipelines.push_back(pso);
+        return ComputePipelineId{
+            std::uint32_t(impl_->compute_pipelines.size() - 1)};
+    }
+}
+
+ComputeEncoder Device::BeginCompute() {
+    impl_->compute_enc = [impl_->cb computeCommandEncoder];
+    impl_->compute_group_max = 64;
+    return ComputeEncoder(this);
+}
+
+void Device::EndCompute() {
+    [impl_->compute_enc endEncoding];
+    impl_->compute_enc = nil;
+}
+
+void ComputeEncoder::SetPipeline(ComputePipelineId p) {
+    if (!device_ || !Valid(p) || p.v >= device_->impl_->compute_pipelines.size())
+        return;
+    id<MTLComputePipelineState> pso = device_->impl_->compute_pipelines[p.v];
+    [device_->impl_->compute_enc setComputePipelineState:pso];
+    // What the pipeline can actually run, not what the caller guessed. A kernel
+    // whose threadgroup exceeds this is rejected at dispatch, and clamping here
+    // turns that into a smaller group rather than a dropped dispatch.
+    device_->impl_->compute_group_max =
+        int(pso.maxTotalThreadsPerThreadgroup);
+}
+
+void ComputeEncoder::SetBuffer(BufferId b, std::size_t offset, int slot) {
+    if (!device_ || !Valid(b) || b.v >= device_->impl_->buffers.size()) return;
+    [device_->impl_->compute_enc setBuffer:device_->impl_->buffers[b.v]
+                                    offset:offset
+                                   atIndex:NSUInteger(slot)];
+}
+
+void ComputeEncoder::SetTexture(TextureId t, int slot) {
+    if (!device_ || !Valid(t) || t.v >= device_->impl_->textures.size()) return;
+    [device_->impl_->compute_enc setTexture:device_->impl_->textures[t.v]
+                                    atIndex:NSUInteger(slot)];
+}
+
+void ComputeEncoder::SetBytes(const void* data, std::size_t bytes, int slot) {
+    if (!device_ || !data || bytes == 0) return;
+    [device_->impl_->compute_enc setBytes:data
+                                   length:bytes
+                                  atIndex:NSUInteger(slot)];
+}
+
+void ComputeEncoder::Dispatch(int count, int group) {
+    if (!device_ || count <= 0) return;
+    const int g = std::clamp(group, 1, device_->impl_->compute_group_max);
+    // Rounded UP, so the last partial group still runs. The threads past the
+    // end are the shader's problem, and its guard is the only thing that stops
+    // them -- which is why the header says so rather than leaving it implied.
+    const NSUInteger groups = NSUInteger((count + g - 1) / g);
+    [device_->impl_->compute_enc
+        dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(NSUInteger(g), 1, 1)];
 }
 
 BufferId Device::CreateDynamicBuffer(std::size_t bytes) {
