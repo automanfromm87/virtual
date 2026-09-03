@@ -1,0 +1,19 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Navigation. Pure C++20 and no dependency on the physics module: a navmesh is
+# built from geometry, and taking a physics::World here would tie the two
+# together for one thing neither needs from the other.
+cc_library(
+    name = "nav",
+    srcs = ["navmesh.cc"],
+    hdrs = ["navmesh.h"],
+    deps = ["//engine/core"],
+)
+
+cc_test(
+    name = "navmesh_test",
+    srcs = ["navmesh_test.cc"],
+    deps = [":nav"],
+)
