@@ -88,6 +88,17 @@ int main() {
     CASE(GreyKey);      // tRNS colour key on a greyscale image
     CASE(Adam7);        // interlaced: seven sub-images, filtered separately
 
+    // Below 8 bits a pixel is a fraction of a byte. Two rules only bite here:
+    // the filter still steps a whole BYTE at a time, and a grey level has to be
+    // scaled to fill the range while a palette index must not be.
+    CASE(Grey1);
+    CASE(Grey2);
+    CASE(Grey4);
+    CASE(Palette1);
+    CASE(Palette4Trns);
+    CASE(Grey1Adam7);     // sub-byte AND interlaced: unpack before the scatter
+    CASE(Palette2Adam7);
+
     // --- inflate on its own ---------------------------------------------------
     {
         // A back-reference whose distance is shorter than its length: the match

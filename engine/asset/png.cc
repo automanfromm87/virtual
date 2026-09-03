@@ -477,17 +477,30 @@ Texture2D Decode(std::span<const std::uint8_t> bytes, std::string& error) {
                         std::to_string(hdr.interlace);
                 return img;
             }
-            if (hdr.bit_depth != 8 && hdr.bit_depth != 16) {
-                error = "png: only bit depth 8 and 16 are supported, got " +
-                        std::to_string(hdr.bit_depth);
-                return img;
-            }
             if (ChannelsFor(hdr.color_type) == 0) {
                 error = "png: unknown colour type " + std::to_string(hdr.color_type);
                 return img;
             }
-            if (hdr.color_type == 3 && hdr.bit_depth != 8) {
-                error = "png: palette images must be 8-bit";
+            // Which depths are legal depends on the colour type, and the spec
+            // is not uniform about it: greyscale goes down to 1 bit, a palette
+            // goes down to 1 bit but never up to 16 (an index is not a
+            // brightness), and anything with real colour or alpha channels is
+            // 8 or 16 only. Accepting a combination the spec forbids means
+            // decoding whatever the encoder happened to emit.
+            const bool depth_ok = [&] {
+                switch (hdr.color_type) {
+                    case 0: return hdr.bit_depth == 1 || hdr.bit_depth == 2 ||
+                                   hdr.bit_depth == 4 || hdr.bit_depth == 8 ||
+                                   hdr.bit_depth == 16;
+                    case 3: return hdr.bit_depth == 1 || hdr.bit_depth == 2 ||
+                                   hdr.bit_depth == 4 || hdr.bit_depth == 8;
+                    default: return hdr.bit_depth == 8 || hdr.bit_depth == 16;
+                }
+            }();
+            if (!depth_ok) {
+                error = "png: bit depth " + std::to_string(hdr.bit_depth) +
+                        " is not legal for colour type " +
+                        std::to_string(hdr.color_type);
                 return img;
             }
             // 4 bytes per pixel out, and the filtered rows are wider still.
@@ -523,9 +536,26 @@ Texture2D Decode(std::span<const std::uint8_t> bytes, std::string& error) {
     }
 
     const int channels = ChannelsFor(hdr.color_type);
-    const int sample_bytes = hdr.bit_depth / 8;
-    const int bpp = channels * sample_bytes;  // filters work in whole pixels
+    const int depth = hdr.bit_depth;
+    // SUB-BYTE DEPTHS. At 1, 2 or 4 bits a pixel is a fraction of a byte, and
+    // two different widths follow from that:
+    //
+    //   filt_bpp  what the FILTER calls "the pixel to the left". The spec
+    //             rounds it up to one whole byte, so at 1 bit the filter
+    //             reaches back eight pixels, not one. Using the true fractional
+    //             width here decodes a plausible-looking but wrong image.
+    //   bpp       what everything downstream sees, AFTER unpacking to one byte
+    //             per sample. Unpacking early is what keeps the palette lookup,
+    //             the tRNS key and the scatter from each needing a bit-reader.
+    const int filt_bpp = std::max(1, channels * depth / 8);
+    const int sample_bytes = depth == 16 ? 2 : 1;
+    const int bpp = channels * sample_bytes;
     const std::size_t stride = std::size_t(hdr.width) * std::size_t(bpp);
+    // Bytes in one packed row of `w` pixels, rounded up: the last byte of a row
+    // is padded, and those spare bits belong to no pixel.
+    const auto packed_stride = [&](std::uint32_t w) {
+        return (std::size_t(w) * channels * depth + 7) / 8;
+    };
     // Every byte the image can possibly need, known from IHDR alone. Handing
     // this to the decompressor as a cap is what stops a 24 KB file from
     // demanding 24 MB — the size is not a guess, it is arithmetic.
@@ -548,13 +578,13 @@ Texture2D Decode(std::span<const std::uint8_t> bytes, std::string& error) {
     std::size_t expect = 0;
     for (int p = 0; p < passes; ++p) {
         if (!hdr.interlace) {
-            geom[0] = {hdr.width, hdr.height, stride};
+            geom[0] = {hdr.width, hdr.height, packed_stride(hdr.width)};
         } else {
             geom[p].w = std::uint32_t(
                 (hdr.width + kPassDX[p] - 1 - kPassX0[p]) / kPassDX[p]);
             geom[p].h = std::uint32_t(
                 (hdr.height + kPassDY[p] - 1 - kPassY0[p]) / kPassDY[p]);
-            geom[p].stride = std::size_t(geom[p].w) * std::size_t(bpp);
+            geom[p].stride = packed_stride(geom[p].w);
         }
         // An empty pass contributes NOTHING, not even a filter byte. A small
         // image legitimately has several, and counting a byte for each is the
@@ -580,6 +610,7 @@ Texture2D Decode(std::span<const std::uint8_t> bytes, std::string& error) {
         const PassGeom& g = geom[p];
         if (g.w == 0 || g.h == 0) continue;
         std::vector<std::uint8_t> pass(g.stride * g.h);
+        std::size_t g_stride_out = g.stride;
         for (std::uint32_t y = 0; y < g.h; ++y) {
             const std::uint8_t filter = raw[read_at];
             const std::uint8_t* src = &raw[read_at + 1];
@@ -588,9 +619,10 @@ Texture2D Decode(std::span<const std::uint8_t> bytes, std::string& error) {
             const std::uint8_t* prev = y ? &pass[g.stride * (y - 1)] : nullptr;
 
             for (std::size_t x = 0; x < g.stride; ++x) {
-                const int a = x >= std::size_t(bpp) ? dst[x - bpp] : 0;
+                const int a = x >= std::size_t(filt_bpp) ? dst[x - filt_bpp] : 0;
                 const int b = prev ? prev[x] : 0;
-                const int c = (prev && x >= std::size_t(bpp)) ? prev[x - bpp] : 0;
+                const int c =
+                    (prev && x >= std::size_t(filt_bpp)) ? prev[x - filt_bpp] : 0;
                 int v = src[x];
                 switch (filter) {
                     case 0: break;
@@ -605,6 +637,29 @@ Texture2D Decode(std::span<const std::uint8_t> bytes, std::string& error) {
                 dst[x] = std::uint8_t(v);
             }
         }
+        // UNPACK, per pass and before the scatter. Doing it once at the end
+        // instead would work for a non-interlaced image and quietly corrupt an
+        // interlaced one: the scatter moves whole pixels, and below 8 bits a
+        // pixel does not start on a byte boundary.
+        if (depth < 8) {
+            std::vector<std::uint8_t> wide(std::size_t(g.w) * channels * g.h);
+            const int per_byte = 8 / depth;
+            const int mask = (1 << depth) - 1;
+            for (std::uint32_t y = 0; y < g.h; ++y)
+                for (std::size_t i = 0; i < std::size_t(g.w) * channels; ++i) {
+                    // MSB first within the byte, which is the order the spec
+                    // uses and the opposite of what a bit-shift loop written
+                    // from intuition produces.
+                    const std::uint8_t byte = pass[g.stride * y + i / per_byte];
+                    const int shift = (per_byte - 1 - int(i % per_byte)) * depth;
+                    wide[std::size_t(g.w) * channels * y + i] =
+                        std::uint8_t((byte >> shift) & mask);
+                }
+            pass.swap(wide);
+            g_stride_out = std::size_t(g.w) * channels;
+        } else {
+            g_stride_out = g.stride;
+        }
         if (!hdr.interlace) {
             lines.swap(pass);
             continue;
@@ -616,7 +671,7 @@ Texture2D Decode(std::span<const std::uint8_t> bytes, std::string& error) {
                 const std::uint32_t fy =
                     std::uint32_t(kPassY0[p]) + y * std::uint32_t(kPassDY[p]);
                 std::memcpy(&lines[stride * fy + std::size_t(fx) * bpp],
-                            &pass[g.stride * y + std::size_t(x) * bpp],
+                            &pass[g_stride_out * y + std::size_t(x) * bpp],
                             std::size_t(bpp));
             }
     }
@@ -655,7 +710,14 @@ Texture2D Decode(std::span<const std::uint8_t> bytes, std::string& error) {
         auto sample = [&](int ch) { return s[ch * sample_bytes]; };  // high byte
         switch (hdr.color_type) {
             case 0:  // greyscale
-                d[0] = d[1] = d[2] = sample(0);
+                // SCALED to fill the byte. A 1-bit image is black and WHITE; a
+                // raw sample of 1 left alone is black and very-slightly-less
+                // black. Palette indices below get no such treatment -- an
+                // index is not a brightness, and scaling one is a lookup into
+                // the wrong entry.
+                d[0] = d[1] = d[2] =
+                    depth < 8 ? std::uint8_t(sample(0) * 255 / ((1 << depth) - 1))
+                              : sample(0);
                 if (key_r >= 0 && full(s, 0) == key_r) d[3] = 0;
                 break;
             case 2:  // rgb
