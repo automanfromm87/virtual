@@ -13,11 +13,14 @@ using namespace metal;
 #  define ENG_MAT4 float4x4
 #  define ENG_VEC4 float4
 #  define ENG_VEC3 float3  // 16 bytes
+#  define ENG_UVEC4 uint4
 #else
 #  include "engine/core/math.h"
 #  define ENG_MAT4 ::eng::Mat4
 #  define ENG_VEC4 ::eng::Vec4
 #  define ENG_VEC3 ::eng::Vec4  // deliberately Vec4: matches MSL float3's 16 bytes
+struct EngUVec4 { std::uint32_t x = 0, y = 0, z = 0, w = 0; };
+#  define ENG_UVEC4 ::EngUVec4
 #endif
 
 struct FrameUniforms {
@@ -47,6 +50,18 @@ struct FrameUniforms {
     // Depth reconstruction for the SSAO pass: .x nearZ, .y 1/tan(fovY/2),
     // .z aspect, .w sample radius in world metres.
     ENG_VEC4 ssao;
+};
+
+// Skinning attributes, in their OWN buffer rather than inside VertexIn. A
+// static mesh vastly outnumbers a skinned one in most scenes, and adding this
+// to every vertex would cost 32 bytes each for four weights that are all zero.
+//
+// 32-bit joint indices where 16 would do: an MSL ushort4 is 8 bytes and still
+// forces the float4 that follows onto a 16-byte boundary, so the smaller field
+// buys nothing but a chance to get the padding wrong.
+struct SkinIn {
+    ENG_UVEC4 joints;
+    ENG_VEC4 weights;
 };
 
 struct VertexIn {

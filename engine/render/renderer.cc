@@ -55,6 +55,8 @@ constexpr Vec3 kSphereEye{0.0f, 0.0f, 3.0f};
 // Uniform slot 1 in both stages; vertex buffer in slot 0.
 constexpr int kVertexSlot = 0;
 constexpr int kUniformSlot = 1;
+constexpr int kSkinSlot = 2;     // per-vertex joints and weights
+constexpr int kPaletteSlot = 3;  // this instance's joint matrices
 
 // Ring capacity per frame slot. Exceeding it drops draws rather than
 // corrupting the frame — see the clamp in DrawScene.
@@ -75,10 +77,18 @@ struct GpuMesh {
     rhi::BufferId ib;
     std::size_t index_count = 0;
     Bounds bounds;
+    // Null for a static mesh. Skinning is a property of the GEOMETRY, not of
+    // the material: the same material may be worn by a prop and a character.
+    rhi::BufferId skin_vb;
+    int joint_count = 0;
 };
 
 struct GpuMaterial {
     rhi::PipelineId pipeline;
+    // The same state compiled against the skinned vertex stage. Built up front
+    // rather than on first use, so a skinned draw never fails at frame time for
+    // a reason a material could have reported at creation.
+    rhi::PipelineId skinned_pipeline;
     rhi::Cull cull = rhi::Cull::Back;
     bool depth_test = true;
     bool transparent = false;
@@ -115,6 +125,7 @@ struct Renderer::Impl {
     rhi::BufferId triangle_vb;
     rhi::PipelineId composite;
     rhi::PipelineId shadow;
+    rhi::PipelineId shadow_skinned;
     rhi::PipelineId ssao;
     rhi::TextureId dummy_shadow;  // bound when shadows are off
     // 1x1 opaque white. Standing in for an absent map keeps the shader
@@ -129,6 +140,31 @@ struct Renderer::Impl {
     std::uint8_t* uniform_map = nullptr;
     std::size_t uniform_stride = 0;  // per instance, alignment-padded
     std::size_t slot_bytes = 0;      // per frame slot
+
+    // A SECOND ring, for joint matrices. Not folded into FrameUniforms: sixty-
+    // four matrices is four kilobytes, and every unskinned draw in the scene
+    // would pay for it.
+    rhi::BufferId palettes;
+    std::uint8_t* palette_map = nullptr;
+    std::size_t palette_stride = 0;
+    std::size_t palette_slot_bytes = 0;
+    std::uint64_t palette_frame = ~std::uint64_t{0};
+    std::size_t palette_cursor = 0;
+
+    // Byte offset for one palette, or kNoSpace when this frame's ring is full.
+    std::size_t AllocPalette() {
+        const std::uint64_t frame = dev->FrameIndex();
+        if (frame != palette_frame) {
+            palette_frame = frame;
+            palette_cursor = 0;
+        }
+        if (palette_cursor >= std::size_t(Renderer::kMaxSkinnedPerFrame))
+            return kNoSpace;
+        const std::size_t off = std::size_t(dev->FrameSlot()) * palette_slot_bytes +
+                                palette_cursor * palette_stride;
+        ++palette_cursor;
+        return off;
+    }
 
     RenderStats stats;
     int shadow_draws = 0;
@@ -167,17 +203,23 @@ struct Renderer::Impl {
     [[nodiscard]] rhi::PipelineId GetOrCreatePipeline(Shading shading,
                                                       bool depth_test,
                                                       bool blend,
-                                                      std::string& error);
+                                                      std::string& error,
+                                                      bool skinned = false);
 };
 
 rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
                                                     bool depth_test,
                                                     bool blend,
-                                                    std::string& error) {
+                                                    std::string& error,
+                                                    bool skinned) {
     // Blend and depth-write ARE pipeline state, unlike cull mode, so they have
     // to be in the key. Leaving them out would hand a transparent material the
     // opaque pipeline and quietly turn glass solid.
-    const std::uint64_t key = (std::uint64_t(shading) << 12) |
+    // Skinning is in the KEY because it is a different vertex stage, not a
+    // different uniform. Leaving it out would hand a skinned mesh the static
+    // pipeline, which reads no palette and draws the bind pose forever.
+    const std::uint64_t key = (std::uint64_t(skinned) << 16) |
+                              (std::uint64_t(shading) << 12) |
                               (std::uint64_t(blend) << 8) |
                               (std::uint64_t(depth_test) << 4) |
                               std::uint64_t(color);
@@ -187,7 +229,7 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
     rhi::PipelineDesc desc;
     if (shading == Shading::Lit) {
         desc.source = ShaderSource(kLitSrc);
-        desc.vertex_fn = "vs_lit";
+        desc.vertex_fn = skinned ? "vs_skinned" : "vs_lit";
         desc.fragment_fn = "fs_lit";
     } else if (shading == Shading::Composite) {
         desc.source = ShaderSource(kCompositeSrc);
@@ -199,7 +241,7 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
         desc.fragment_fn = "fs_ssao";
     } else if (shading == Shading::ShadowDepth) {
         desc.source = ShaderSource(kShadowSrc);
-        desc.vertex_fn = "vs_shadow";
+        desc.vertex_fn = skinned ? "vs_shadow_skinned" : "vs_shadow";
         desc.fragment_fn = "fs_shadow";  // void, but it discards for the cut
         desc.depth_only = true;
     } else {
@@ -221,6 +263,20 @@ rhi::PipelineId Renderer::Impl::GetOrCreatePipeline(Shading shading,
     if (Valid(id)) pipeline_cache.emplace(key, id);
     return id;
 }
+
+namespace {
+
+// True when this instance should be drawn through the skinned vertex stage.
+bool IsSkinned(const GpuMesh& gm, const Instance& inst, const Scene& scene) {
+    if (!Valid(gm.skin_vb) || gm.joint_count <= 0) return false;
+    if (inst.palette < 0) return false;
+    // The scene has to actually carry the matrices it points at. A short array
+    // would otherwise be read past its end for the tail of the palette.
+    return std::size_t(inst.palette) + std::size_t(gm.joint_count) <=
+           scene.joint_matrices.size();
+}
+
+}  // namespace
 
 Renderer::Renderer() : impl_(std::make_unique<Impl>()) {}
 Renderer::~Renderer() = default;
@@ -249,12 +305,55 @@ MeshHandle Renderer::UploadMesh(const Mesh& mesh) {
     return MeshHandle{std::uint32_t(impl_->meshes.size() - 1)};
 }
 
+MeshHandle Renderer::UploadSkinnedMesh(const Mesh& mesh,
+                                       const std::vector<anim::SkinVertex>& skin,
+                                       int joint_count) {
+    // A short skin array would leave the tail of the mesh reading whatever came
+    // after it in memory, so this is a refusal rather than a clamp.
+    if (skin.size() != mesh.vertices.size()) return {};
+    if (joint_count <= 0 || joint_count > kMaxJoints) return {};
+
+    const MeshHandle h = UploadMesh(mesh);
+    if (!Valid(h)) return {};
+
+    // Widened to 32-bit indices to match the shader's uint4. See SkinIn.
+    std::vector<SkinIn> gpu(skin.size());
+    for (std::size_t i = 0; i < skin.size(); ++i) {
+        for (int c = 0; c < anim::kMaxInfluences; ++c) {
+            const std::uint16_t j = skin[i].joints[c];
+            // An index past the palette would read another instance's matrices.
+            // Clamping to 0 with the weight left alone is wrong-looking but
+            // bounded; the alternative is undefined.
+            const std::uint32_t safe = j < joint_count ? j : 0u;
+            (&gpu[i].joints.x)[c] = safe;
+            (&gpu[i].weights.x)[c] = skin[i].weights[c];
+        }
+    }
+    GpuMesh& gm = impl_->meshes[h.v];
+    gm.skin_vb = impl_->dev->CreateBuffer(gpu.data(), gpu.size() * sizeof(SkinIn));
+    gm.joint_count = joint_count;
+    if (!Valid(gm.skin_vb)) return {};
+    return h;
+}
+
+int Renderer::JointCount(MeshHandle m) const {
+    if (!Valid(m) || m.v >= impl_->meshes.size()) return 0;
+    return impl_->meshes[m.v].joint_count;
+}
+
 MaterialHandle Renderer::CreateMaterial(const MaterialDesc& desc,
                                         std::string& error) {
     GpuMaterial m;
     m.pipeline = impl_->GetOrCreatePipeline(desc.shading, desc.depth_test,
                                             desc.transparent, error);
     if (!Valid(m.pipeline)) return {};
+    // Only Lit has a skinned counterpart. A fullscreen or depth-only pass has
+    // no vertices of its own to blend.
+    if (desc.shading == Shading::Lit) {
+        m.skinned_pipeline = impl_->GetOrCreatePipeline(
+            desc.shading, desc.depth_test, desc.transparent, error, /*skinned=*/true);
+        if (!Valid(m.skinned_pipeline)) return {};
+    }
     m.cull = desc.cull;
     m.depth_test = desc.depth_test;
     m.transparent = desc.transparent;
@@ -338,6 +437,9 @@ std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
 
     r->impl_->ssao = r->impl_->GetOrCreatePipeline(Shading::Ssao, false, false, error);
     if (!Valid(r->impl_->ssao)) return nullptr;
+    r->impl_->shadow_skinned = r->impl_->GetOrCreatePipeline(
+        Shading::ShadowDepth, true, false, error, /*skinned=*/true);
+    if (!Valid(r->impl_->shadow_skinned)) return nullptr;
 
     // Something has to be bound at the shadow slot even when shadows are off;
     // the shader guards on a flag rather than reading it, so 1x1 is plenty.
@@ -354,6 +456,20 @@ std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
     r->impl_->slot_bytes = r->impl_->uniform_stride * kMaxInstancesPerFrame;
     r->impl_->uniforms =
         dev.CreateDynamicBuffer(r->impl_->slot_bytes * rhi::kFramesInFlight);
+    // Joint palettes get their own ring, sized for kMaxSkinnedPerFrame draws.
+    r->impl_->palette_stride =
+        AlignUp(sizeof(Mat4) * kMaxJoints, dev.UniformAlignment());
+    r->impl_->palette_slot_bytes =
+        r->impl_->palette_stride * std::size_t(kMaxSkinnedPerFrame);
+    r->impl_->palettes =
+        dev.CreateDynamicBuffer(r->impl_->palette_slot_bytes * rhi::kFramesInFlight);
+    r->impl_->palette_map =
+        static_cast<std::uint8_t*>(dev.MapBuffer(r->impl_->palettes));
+    if (!Valid(r->impl_->palettes) || !r->impl_->palette_map) {
+        error = "failed to allocate the joint palette ring";
+        return nullptr;
+    }
+
     r->impl_->uniform_map =
         static_cast<std::uint8_t*>(dev.MapBuffer(r->impl_->uniforms));
     if (!Valid(r->impl_->uniforms) || !r->impl_->uniform_map) {
@@ -368,7 +484,10 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
     if (scene.shadowExtent <= 0.0f) return;
     const Mat4 lightViewProj = scene.LightViewProj();
 
-    enc.SetPipeline(impl_->shadow);
+    // The pipeline is set PER DRAW now rather than once, because a skinned
+    // caster needs the skinned vertex stage. Tracked so an all-static scene
+    // still binds it exactly once.
+    rhi::PipelineId bound_shadow;
     // Front faces culled instead of back: shifting the recorded depth to the
     // BACK of each caster is the cheapest peter-panning-free way to keep a
     // surface from shadowing itself, and it costs nothing here because every
@@ -392,6 +511,22 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
         const std::size_t offset = impl_->AllocUniform();
         if (offset == Impl::kNoSpace) break;
 
+        const bool skinned = IsSkinned(gm, inst, scene);
+        std::size_t palette_offset = Impl::kNoSpace;
+        if (skinned) {
+            palette_offset = impl_->AllocPalette();
+            if (palette_offset == Impl::kNoSpace) continue;  // ring full: skip
+            std::memcpy(impl_->palette_map + palette_offset,
+                        scene.joint_matrices.data() + inst.palette,
+                        sizeof(Mat4) * std::size_t(gm.joint_count));
+        }
+        const rhi::PipelineId want =
+            skinned ? impl_->shadow_skinned : impl_->shadow;
+        if (want.v != bound_shadow.v) {
+            enc.SetPipeline(want);
+            bound_shadow = want;
+        }
+
         FrameUniforms u{};
         u.lightViewProj = lightViewProj;
         u.model = inst.model;
@@ -409,6 +544,10 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
         // off the ground stop casting, which looks like a lighting bug and is
         // a missing bind.
         enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
+        if (skinned) {
+            enc.SetVertexBuffer(gm.skin_vb, 0, kSkinSlot);
+            enc.SetVertexBuffer(impl_->palettes, palette_offset, kPaletteSlot);
+        }
         enc.DrawIndexedU16(gm.ib, gm.index_count);
         ++impl_->shadow_draws;
     }
@@ -512,9 +651,26 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
         const GpuMesh& gm = impl_->meshes[inst.mesh.v];
         const GpuMaterial& mat = impl_->materials[inst.material.v];
 
-        if (mat.pipeline.v != bound_pipeline.v) {
-            enc.SetPipeline(mat.pipeline);
-            bound_pipeline = mat.pipeline;
+        const bool skinned = IsSkinned(gm, *item.inst, scene);
+        std::size_t palette_offset = Impl::kNoSpace;
+        if (skinned) {
+            palette_offset = impl_->AllocPalette();
+            if (palette_offset == Impl::kNoSpace) {
+                ++impl_->stats.overflowed;
+                continue;
+            }
+            std::memcpy(impl_->palette_map + palette_offset,
+                        scene.joint_matrices.data() + item.inst->palette,
+                        sizeof(Mat4) * std::size_t(gm.joint_count));
+        }
+        const rhi::PipelineId want = skinned ? mat.skinned_pipeline : mat.pipeline;
+        if (!Valid(want)) {
+            ++impl_->stats.invalid;
+            continue;
+        }
+        if (want.v != bound_pipeline.v) {
+            enc.SetPipeline(want);
+            bound_pipeline = want;
             ++impl_->stats.pipeline_switches;
         }
         if (!cull_set || mat.cull != bound_cull) {
@@ -547,6 +703,10 @@ void Renderer::DrawScene(rhi::Encoder& enc, const Scene& scene, int width,
         enc.SetFragmentTexture(mat.roughness_map, 1);
         enc.SetFragmentTexture(shadow_tex, 2);
         enc.SetFragmentSampler(impl_->sampler, 0);
+        if (skinned) {
+            enc.SetVertexBuffer(gm.skin_vb, 0, kSkinSlot);
+            enc.SetVertexBuffer(impl_->palettes, palette_offset, kPaletteSlot);
+        }
         enc.DrawIndexedU16(gm.ib, gm.index_count);
         impl_->draw_order.push_back(item.index);
         ++impl_->stats.draws;

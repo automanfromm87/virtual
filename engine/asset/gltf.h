@@ -6,13 +6,14 @@
 // need a second, invented convention for everything a PBR material needs.
 //
 // SUPPORTED: .gltf with embedded base64 buffers or a sibling .bin; meshes
-// (POSITION, NORMAL, TEXCOORD_0, indices); the node hierarchy with TRS or
-// matrix transforms; pbrMetallicRoughness factors; PNG images, whether embedded
-// as a data uri, stored in a bufferView, or sitting next to the file.
+// (POSITION, NORMAL, TEXCOORD_0, JOINTS_0, WEIGHTS_0, indices); the node
+// hierarchy with TRS or matrix transforms; pbrMetallicRoughness factors; PNG
+// images, whether embedded as a data uri, stored in a bufferView, or sitting
+// next to the file; skins; animations with LINEAR, STEP and CUBICSPLINE
+// sampling.
 //
 // NOT SUPPORTED, and each is a real piece of work rather than an oversight:
-// .glb containers, JPEG images, animations, skins, sparse accessors, morph
-// targets, cameras.
+// .glb containers, JPEG images, sparse accessors, morph targets, cameras.
 #pragma once
 
 #include <cstdint>
@@ -20,6 +21,7 @@
 #include <string_view>
 #include <vector>
 
+#include "engine/anim/anim.h"
 #include "engine/core/math.h"
 #include "engine/geometry/mesh.h"
 #include "engine/texture/texture.h"
@@ -42,16 +44,51 @@ struct MaterialDef {
 struct Primitive {
     Mesh mesh;
     int material = -1;  // index into Document::materials, or -1
+    // Parallel to mesh.vertices, and EMPTY for an unskinned primitive. Kept
+    // separate so a static mesh does not carry 32 bytes a vertex of zeroes.
+    // The joint indices are as the file wrote them, which is what the skin's
+    // joint array is indexed by.
+    std::vector<anim::SkinVertex> skin;
+
+    [[nodiscard]] bool Skinned() const { return !skin.empty(); }
 };
 
 struct Node {
     std::string name;
+    // Index into Document::skins, or -1. A node with both a mesh and a skin is
+    // a skinned mesh instance.
+    int skin = -1;
     Mat4 local = Mat4::Identity();
     // Indices into Document::primitives. A glTF mesh may hold several
     // primitives, and each becomes its own draw.
     std::vector<int> primitives;
     std::vector<int> children;
     int parent = -1;
+};
+
+// A glTF skin, already turned into something the animation layer can pose.
+struct SkinDef {
+    std::string name;
+    anim::Skeleton skeleton;
+    // Joint index -> the glTF node it came from. Animation channels target
+    // nodes, so this is what retargets a clip onto this skeleton.
+    std::vector<int> joint_nodes;
+};
+
+// A channel as the file stores it: aimed at a NODE, not at a joint. Which joint
+// that is depends on which skin you are posing, and a file may have several.
+struct NodeChannel {
+    int node = -1;
+    anim::Path path = anim::Path::Translation;
+    anim::Interp interp = anim::Interp::Linear;
+    std::vector<float> times;
+    std::vector<float> values;
+};
+
+struct AnimationDef {
+    std::string name;
+    float duration = 0.0f;
+    std::vector<NodeChannel> channels;
 };
 
 struct Document {
@@ -67,7 +104,18 @@ struct Document {
     std::vector<Node> nodes;
     std::vector<int> roots;
 
+    std::vector<SkinDef> skins;
+    std::vector<AnimationDef> animations;
+
     [[nodiscard]] bool Empty() const { return primitives.empty(); }
+
+    // Retargets animation `animation` onto skin `skin`'s skeleton, dropping any
+    // channel aimed at a node that skin does not use. Returns an empty clip for
+    // an out-of-range index.
+    //
+    // Separate from parsing because the two are genuinely independent: one file
+    // can hold several skins and several clips, and every pairing is legal.
+    [[nodiscard]] anim::Clip MakeClip(int animation, int skin) const;
     // Accumulated parent transforms, in the same order as `nodes`.
     [[nodiscard]] std::vector<Mat4> WorldTransforms() const;
 };

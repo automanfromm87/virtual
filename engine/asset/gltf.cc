@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <unordered_map>
 #include <sstream>
 
 #include "engine/asset/json.h"
@@ -183,6 +184,34 @@ class Reader {
     std::string& error_;
     std::vector<std::vector<std::uint8_t>> buffers_;
 };
+
+// A node's rest transform as SEPARATE components, which is what a skeleton
+// needs: a clip interpolates rotations as quaternions, and a matrix cannot be
+// decomposed back into one without guessing about shear.
+//
+// A node given as a bare "matrix" has no components to recover. glTF forbids
+// that form for any node targeted by an animation, and a joint in a rest pose
+// is exactly such a node, so falling back to identity here is the spec's own
+// position rather than a shortcut.
+anim::Transform NodeRest(const json::Value& n) {
+    anim::Transform t;
+    if (n.Has("translation")) {
+        const json::Value& v = n["translation"];
+        t.translation = Vec3{float(v[0].Number()), float(v[1].Number()),
+                             float(v[2].Number())};
+    }
+    if (n.Has("rotation")) {
+        const json::Value& v = n["rotation"];
+        t.rotation = Normalize(Quat{float(v[0].Number()), float(v[1].Number()),
+                                    float(v[2].Number()), float(v[3].Number(1.0))});
+    }
+    if (n.Has("scale")) {
+        const json::Value& v = n["scale"];
+        t.scale = Vec3{float(v[0].Number(1.0)), float(v[1].Number(1.0)),
+                       float(v[2].Number(1.0))};
+    }
+    return t;
+}
 
 Mat4 NodeTransform(const json::Value& n) {
     if (n.Has("matrix")) {
@@ -373,6 +402,15 @@ Document ParseGltf(std::string_view json_text, const std::vector<std::uint8_t>& 
             const bool has_uv = attrs.Has("TEXCOORD_0");
             if (has_normal) { nrm = reader.View(attrs["NORMAL"].Int()); if (!nrm.valid) return doc; }
             if (has_uv) { uv = reader.View(attrs["TEXCOORD_0"].Int()); if (!uv.valid) return doc; }
+            AccessorView joints, weights;
+            // Both or neither. One without the other is a file that says which
+            // joints influence a vertex but not by how much, or the reverse.
+            const bool has_skin = attrs.Has("JOINTS_0") && attrs.Has("WEIGHTS_0");
+            if (has_skin) {
+                joints = reader.View(attrs["JOINTS_0"].Int());
+                weights = reader.View(attrs["WEIGHTS_0"].Int());
+                if (!joints.valid || !weights.valid) return doc;
+            }
 
             if (pos.count > 65535) {
                 error = "gltf: primitive has " + std::to_string(pos.count) +
@@ -402,6 +440,23 @@ Document ParseGltf(std::string_view json_text, const std::vector<std::uint8_t>& 
                 }
                 v.color = Vec4{1, 1, 1, 1};
                 out.mesh.vertices.push_back(v);
+
+                if (!has_skin) continue;
+                // JOINTS_0 is an integer type (ubyte or ushort) that ReadFloats
+                // has already widened; the cast back is exact for every index
+                // a 16-bit palette can hold.
+                float j[4] = {0, 0, 0, 0}, w[4] = {0, 0, 0, 0};
+                Reader::ReadFloats(joints, i, j);
+                Reader::ReadFloats(weights, i, w);
+                anim::SkinVertex sv;
+                for (int c = 0; c < anim::kMaxInfluences; ++c) {
+                    sv.joints[c] = std::uint16_t(j[c]);
+                    sv.weights[c] = w[c];
+                }
+                // Exporters round, and weights that do not sum to one shrink
+                // the vertex toward the origin.
+                anim::NormalizeWeights(&sv);
+                out.skin.push_back(sv);
             }
 
             if (p.Has("indices")) {
@@ -436,6 +491,7 @@ Document ParseGltf(std::string_view json_text, const std::vector<std::uint8_t>& 
         Node& out = doc.nodes[i];
         out.name = n["name"].Str();
         out.local = NodeTransform(n);
+        out.skin = n["skin"].Int(-1);
         const int mesh = n["mesh"].Int(-1);
         if (mesh >= 0 && std::size_t(mesh) < mesh_to_prims.size())
             out.primitives = mesh_to_prims[std::size_t(mesh)];
@@ -451,7 +507,156 @@ Document ParseGltf(std::string_view json_text, const std::vector<std::uint8_t>& 
     for (std::size_t i = 0; i < doc.nodes.size(); ++i)
         if (doc.nodes[i].parent < 0) doc.roots.push_back(int(i));
 
+    // --- skins -----------------------------------------------------------------
+    // Built AFTER the nodes, because a joint's rest transform and its parent
+    // both come from the node hierarchy.
+    {
+        const json::Value& skins = root["skins"];
+        for (std::size_t i = 0; i < skins.Size(); ++i) {
+            const json::Value& sk = skins[i];
+            SkinDef def;
+            def.name = sk["name"].Str();
+
+            const json::Value& joints = sk["joints"];
+            def.joint_nodes.reserve(joints.Size());
+            for (std::size_t j = 0; j < joints.Size(); ++j)
+                def.joint_nodes.push_back(joints[j].Int(-1));
+
+            // Node index -> joint index, so a joint's parent link can be
+            // expressed in the skeleton's own numbering. A joint whose node
+            // parent is outside the skin becomes a root, which is correct: the
+            // skin is only the part of the hierarchy it lists.
+            std::unordered_map<int, int> joint_of;
+            for (std::size_t j = 0; j < def.joint_nodes.size(); ++j)
+                joint_of[def.joint_nodes[j]] = int(j);
+
+            AccessorView ibm;
+            const int ibm_index = sk["inverseBindMatrices"].Int(-1);
+            if (ibm_index >= 0) {
+                ibm = reader.View(ibm_index);
+                if (!ibm.valid) return doc;
+            }
+
+            def.skeleton.joints.resize(def.joint_nodes.size());
+            for (std::size_t j = 0; j < def.joint_nodes.size(); ++j) {
+                const int node = def.joint_nodes[j];
+                anim::Joint& out = def.skeleton.joints[j];
+                if (node < 0 || std::size_t(node) >= doc.nodes.size()) {
+                    error = "gltf: skin joint refers to a node that is not there";
+                    return doc;
+                }
+                out.name = doc.nodes[std::size_t(node)].name;
+                const auto it = joint_of.find(doc.nodes[std::size_t(node)].parent);
+                out.parent = it == joint_of.end() ? -1 : it->second;
+                out.rest = NodeRest(nodes[std::size_t(node)]);
+
+                // Absent inverseBindMatrices means identity, per the spec: the
+                // mesh is already in each joint's space.
+                if (ibm_index >= 0 && int(j) < ibm.count) {
+                    float m[16];
+                    Reader::ReadFloats(ibm, int(j), m);
+                    // glTF matrices are column-major, and so is Mat4, so this
+                    // is a straight copy rather than a transpose.
+                    out.inverse_bind = Mat4{{{m[0], m[1], m[2], m[3]},
+                                             {m[4], m[5], m[6], m[7]},
+                                             {m[8], m[9], m[10], m[11]},
+                                             {m[12], m[13], m[14], m[15]}}};
+                }
+            }
+            if (!def.skeleton.Finalize()) {
+                error = "gltf: skin " + std::to_string(i) + " has a cyclic hierarchy";
+                return doc;
+            }
+            doc.skins.push_back(std::move(def));
+        }
+    }
+
+    // --- animations --------------------------------------------------------------
+    {
+        const json::Value& anims = root["animations"];
+        for (std::size_t i = 0; i < anims.Size(); ++i) {
+            const json::Value& a = anims[i];
+            AnimationDef def;
+            def.name = a["name"].Str();
+            const json::Value& samplers = a["samplers"];
+            const json::Value& channels = a["channels"];
+
+            for (std::size_t c = 0; c < channels.Size(); ++c) {
+                const json::Value& ch = channels[c];
+                const json::Value& target = ch["target"];
+                const std::string& path = target["path"].Str();
+
+                NodeChannel out;
+                out.node = target["node"].Int(-1);
+                if (path == "translation") out.path = anim::Path::Translation;
+                else if (path == "rotation") out.path = anim::Path::Rotation;
+                else if (path == "scale") out.path = anim::Path::Scale;
+                else continue;  // "weights" is morph targets, which are not here
+
+                const int si = ch["sampler"].Int(-1);
+                if (si < 0 || std::size_t(si) >= samplers.Size()) continue;
+                const json::Value& sampler = samplers[std::size_t(si)];
+                const std::string& interp = sampler["interpolation"].Str();
+                if (interp == "STEP") out.interp = anim::Interp::Step;
+                else if (interp == "CUBICSPLINE") out.interp = anim::Interp::CubicSpline;
+                else out.interp = anim::Interp::Linear;  // the spec's default
+
+                const AccessorView in = reader.View(sampler["input"].Int(-1));
+                const AccessorView vals = reader.View(sampler["output"].Int(-1));
+                if (!in.valid || !vals.valid) return doc;
+
+                out.times.reserve(std::size_t(in.count));
+                for (int k = 0; k < in.count; ++k) {
+                    float t[4] = {0, 0, 0, 0};
+                    Reader::ReadFloats(in, k, t);
+                    out.times.push_back(t[0]);
+                    def.duration = std::max(def.duration, t[0]);
+                }
+                out.values.reserve(std::size_t(vals.count) * 4);
+                for (int k = 0; k < vals.count; ++k) {
+                    float v[4] = {0, 0, 0, 0};
+                    Reader::ReadFloats(vals, k, v);
+                    for (int q = 0; q < vals.components; ++q) out.values.push_back(v[q]);
+                }
+                def.channels.push_back(std::move(out));
+            }
+            doc.animations.push_back(std::move(def));
+        }
+    }
+
     return doc;
+}
+
+anim::Clip Document::MakeClip(int animation, int skin) const {
+    anim::Clip clip;
+    if (animation < 0 || std::size_t(animation) >= animations.size()) return clip;
+    if (skin < 0 || std::size_t(skin) >= skins.size()) return clip;
+
+    const AnimationDef& src = animations[std::size_t(animation)];
+    const SkinDef& sk = skins[std::size_t(skin)];
+    clip.name = src.name;
+    clip.duration = src.duration;
+
+    std::unordered_map<int, int> joint_of;
+    for (std::size_t j = 0; j < sk.joint_nodes.size(); ++j)
+        joint_of[sk.joint_nodes[j]] = int(j);
+
+    for (const NodeChannel& nc : src.channels) {
+        const auto it = joint_of.find(nc.node);
+        // A channel aimed at a node this skin does not use is dropped rather
+        // than mapped to joint 0 — one file can hold two characters, and
+        // silently applying one's walk cycle to the other is worse than
+        // applying nothing.
+        if (it == joint_of.end()) continue;
+        anim::Channel out;
+        out.joint = it->second;
+        out.path = nc.path;
+        out.interp = nc.interp;
+        out.times = nc.times;
+        out.values = nc.values;
+        clip.channels.push_back(std::move(out));
+    }
+    return clip;
 }
 
 Document LoadGltfFile(const std::string& path, std::string& error) {

@@ -69,6 +69,13 @@ struct Instance {
     MaterialHandle material = kMaterialLit;
     Mat4 model = Mat4::Identity();
     Vec4 tint = Vec4{1.0f, 1.0f, 1.0f, 1.0f};
+    // Offset into Scene::joint_matrices, or -1 for an unskinned instance. The
+    // mesh knows how many joints to read.
+    //
+    // An offset into one flat array rather than a palette per instance: two
+    // characters in the same pose still need two palettes, but the renderer
+    // wants one contiguous upload, not a vector of vectors.
+    int palette = -1;
 };
 
 struct Scene {
@@ -94,6 +101,11 @@ struct Scene {
     // World -> the light's clip space, for the shadow pass and the lookup.
     [[nodiscard]] Mat4 LightViewProj() const;
     std::vector<Instance> instances;
+
+    // Joint matrices for every skinned instance this frame, concatenated.
+    // Already world-relative: palette[j] = jointWorld * inverseBind, so the
+    // instance's model matrix still applies on top.
+    std::vector<Mat4> joint_matrices;
 };
 
 // Two spheres that OVERLAP ON SCREEN at different depths, plus a cube above.

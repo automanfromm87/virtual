@@ -27,11 +27,15 @@ constexpr const char* kQuad =
 // A quad with a real PNG baked into the document, so this exercises the whole
 // chain: base64 -> zlib -> PNG -> RGBA, then glTF's material -> texture ->
 // image indirection on top of it.
+const char* const kSkinnedGltf =
+#include "engine/asset/testdata_skinned_gltf.inc"
+    ;
+
 const char* const kTexturedGltf =
 #include "engine/asset/testdata_textured_gltf.inc"
     ;
 
-bool Near(float a, float b) { return std::fabs(a - b) < 1e-4f; }
+bool Near(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) < eps; }
 
 }  // namespace
 
@@ -147,6 +151,100 @@ int main() {
         CHECK(plain.images.empty());
         CHECK(!plain.materials.empty());
         CHECK(plain.materials[0].base_color_image == -1);
+    }
+
+    // --- skins and animations -------------------------------------------------
+    {
+        std::string error;
+        const gltf::Document doc = gltf::ParseGltf(kSkinnedGltf, {}, error);
+        CHECK(error.empty());
+        if (!error.empty()) std::fprintf(stderr, "  skinned: %s\n", error.c_str());
+
+        // The skin became a posable skeleton, with parents resolved from the
+        // node hierarchy rather than declared.
+        CHECK(doc.skins.size() == 1);
+        const gltf::SkinDef& sk = doc.skins[0];
+        CHECK(sk.skeleton.joints.size() == 2);
+        CHECK(sk.skeleton.joints[0].name == "joint_root");
+        CHECK(sk.skeleton.joints[1].name == "joint_elbow");
+        CHECK(sk.skeleton.joints[0].parent == -1);
+        CHECK(sk.skeleton.joints[1].parent == 0);
+        CHECK(Near(sk.skeleton.joints[1].rest.translation.x, 1.0f));
+
+        // inverseBindMatrices came across without a transpose. glTF and this
+        // engine are both column-major, so the elbow's is a -1 on x; a
+        // transposed read would put it in the bottom row and the mesh would
+        // shear instead of translate.
+        const Vec4 ib = sk.skeleton.joints[1].inverse_bind * Vec4{0, 0, 0, 1};
+        CHECK(Near(ib.x, -1.0f) && Near(ib.y, 0.0f));
+
+        // JOINTS_0 and WEIGHTS_0 came in, and the middle pair is the 50/50
+        // split that a wrong palette order would get wrong.
+        CHECK(doc.primitives.size() == 1);
+        const gltf::Primitive& prim = doc.primitives[0];
+        CHECK(prim.Skinned());
+        CHECK(prim.skin.size() == prim.mesh.vertices.size());
+        CHECK(prim.skin[0].joints[0] == 0 && Near(prim.skin[0].weights[0], 1.0f));
+        CHECK(Near(prim.skin[2].weights[0], 0.5f));
+        CHECK(Near(prim.skin[2].weights[1], 0.5f));
+        CHECK(prim.skin[4].joints[1] == 1 && Near(prim.skin[4].weights[1], 1.0f));
+
+        // The node knows it is skinned.
+        CHECK(doc.nodes.size() == 3);
+        CHECK(doc.nodes[0].skin == 0);
+        CHECK(doc.nodes[1].skin == -1);
+
+        // The animation parsed, and retargets onto the skin.
+        CHECK(doc.animations.size() == 1);
+        CHECK(doc.animations[0].name == "bend");
+        CHECK(Near(doc.animations[0].duration, 1.0f));
+        const anim::Clip clip = doc.MakeClip(0, 0);
+        CHECK(clip.channels.size() == 1);
+        CHECK(clip.channels[0].joint == 1);  // node 2 -> joint 1
+        CHECK(clip.channels[0].path == anim::Path::Rotation);
+        CHECK(clip.channels[0].Valid(sk.skeleton.joints.size()));
+
+        // AND IT ACTUALLY POSES. At t=0 the mesh is at rest; at t=1 the elbow
+        // has turned a quarter turn, so the tip swings from x=2 to (1,1).
+        anim::Pose pose;
+        std::vector<Mat4> palette;
+
+        clip.Sample(0.0f, sk.skeleton, &pose);
+        anim::ComputeJointMatrices(sk.skeleton, pose, &palette);
+        Vec3 tip = anim::SkinPosition(Vec3{2, 0, 0}, prim.skin[4], palette);
+        CHECK(Near(tip.x, 2.0f) && Near(tip.y, 0.0f));
+
+        clip.Sample(1.0f, sk.skeleton, &pose, /*loop=*/false);
+        anim::ComputeJointMatrices(sk.skeleton, pose, &palette);
+        tip = anim::SkinPosition(Vec3{2, 0, 0}, prim.skin[4], palette);
+        CHECK(Near(tip.x, 1.0f, 1e-3f) && Near(tip.y, 1.0f, 1e-3f));
+
+        // Halfway is 45 degrees, so the tip is on the unit circle about the
+        // elbow. A step or a hold would leave it at one of the ends.
+        clip.Sample(0.5f, sk.skeleton, &pose);
+        anim::ComputeJointMatrices(sk.skeleton, pose, &palette);
+        tip = anim::SkinPosition(Vec3{2, 0, 0}, prim.skin[4], palette);
+        CHECK(Near(tip.x, 1.0f + 0.70710678f, 1e-3f));
+        CHECK(Near(tip.y, 0.70710678f, 1e-3f));
+
+        // The root-weighted vertex never moves, whatever the elbow does.
+        const Vec3 base = anim::SkinPosition(Vec3{0, 0, 0}, prim.skin[0], palette);
+        CHECK(Near(base.x, 0.0f) && Near(base.y, 0.0f));
+
+        // Retargeting onto a skin the channel does not belong to yields
+        // nothing rather than posing the wrong character.
+        CHECK(doc.MakeClip(0, 5).channels.empty());
+        CHECK(doc.MakeClip(9, 0).channels.empty());
+    }
+
+    // --- an unskinned file has no skin data ------------------------------------
+    {
+        std::string error;
+        const gltf::Document plain = gltf::ParseGltf(kQuad, {}, error);
+        CHECK(error.empty());
+        CHECK(plain.skins.empty());
+        CHECK(plain.animations.empty());
+        CHECK(!plain.primitives[0].Skinned());
     }
 
     if (g_failures == 0) std::printf("gltf_test: all checks passed\n");

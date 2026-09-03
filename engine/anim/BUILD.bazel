@@ -1,0 +1,19 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Skeletons, clips and the vertex blend. Pure C++20 and no GPU: the failure
+# mode of skinning is a mesh that looks ALMOST right, so the arithmetic has to
+# be checkable against known input rather than by eye.
+cc_library(
+    name = "anim",
+    srcs = ["anim.cc"],
+    hdrs = ["anim.h"],
+    deps = ["//engine/core"],
+)
+
+cc_test(
+    name = "anim_test",
+    srcs = ["anim_test.cc"],
+    deps = [":anim"],
+)

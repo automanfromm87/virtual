@@ -38,6 +38,50 @@ vertex VSOut vs_lit(uint                     vid   [[vertex_id]],
     return o;
 }
 
+// The SKINNED variant. Same output, same fragment stage — the only difference
+// is where the vertex was before it got there.
+//
+// Linear blend skinning: sum the joint matrices weighted per vertex, then
+// transform once. Summing the MATRICES rather than transforming four times and
+// averaging the results is not an optimisation, it is the definition — the two
+// agree for positions, and for normals the blended matrix is what keeps the
+// basis consistent.
+//
+// The palette is world-relative already: palette[j] = jointWorld * inverseBind,
+// so `model` still applies on top for where the character is standing.
+vertex VSOut vs_skinned(uint                     vid     [[vertex_id]],
+                        device const VertexIn*   verts   [[buffer(0)]],
+                        constant FrameUniforms&  u       [[buffer(1)]],
+                        device const SkinIn*     skin    [[buffer(2)]],
+                        device const float4x4*   palette [[buffer(3)]])
+{
+    const SkinIn s = skin[vid];
+    float4x4 blend = float4x4(0.0f);
+    float total = 0.0f;
+    for (uint i = 0; i < 4; ++i) {
+        const float w = s.weights[i];
+        if (w <= 0.0f) continue;
+        blend += palette[s.joints[i]] * w;
+        total += w;
+    }
+    // No influences at all: leave the vertex where the modeller put it rather
+    // than collapsing it onto the origin, which is what a zero matrix does.
+    if (total <= 0.0f) blend = float4x4(1.0f);
+
+    VSOut o;
+    const float4 skinned = blend * float4(verts[vid].position.xyz, 1.0f);
+    const float4 worldPos = u.model * skinned;
+    o.position = u.viewProj * worldPos;
+    o.worldPos = worldPos.xyz;
+    // w = 0 drops both translations: a normal is a direction.
+    const float3 skinnedN = (blend * float4(verts[vid].normal.xyz, 0.0f)).xyz;
+    o.normalW = (u.model * float4(skinnedN, 0.0f)).xyz;
+    o.color = verts[vid].color * u.tint;
+    o.uv = verts[vid].uv.xy;
+    o.lightClip = u.lightViewProj * worldPos;
+    return o;
+}
+
 // --- microfacet terms --------------------------------------------------------
 
 // GGX / Trowbridge-Reitz. Describes what fraction of microfacets are oriented

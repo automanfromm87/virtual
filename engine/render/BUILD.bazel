@@ -20,6 +20,7 @@ cc_library(
         "-Wno-c23-extensions",
     ],
     deps = [
+        "//engine/anim",
         "//engine/core",
         "//engine/geometry",
         "//engine/rhi",

@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "engine/anim/anim.h"
 #include "engine/geometry/mesh.h"
 #include "engine/resource/handles.h"
 #include "engine/rhi/rhi.h"
@@ -92,6 +93,27 @@ class Renderer {
     // Uploads vertex + index data and returns a handle the scene can name.
     // Returns the null handle if the mesh is empty or the upload fails.
     [[nodiscard]] MeshHandle UploadMesh(const Mesh&);
+
+    // The same, plus per-vertex joint indices and weights. `skin` must be
+    // parallel to mesh.vertices; a mismatch returns the null handle rather than
+    // reading past the end of the shorter one.
+    //
+    // `joint_count` is how many matrices a palette for this mesh holds, and is
+    // capped at kMaxJoints. Storing it on the MESH rather than the material is
+    // deliberate: skinning is a property of the geometry, and the same material
+    // may be worn by a static prop and a character.
+    [[nodiscard]] MeshHandle UploadSkinnedMesh(const Mesh&,
+                                               const std::vector<anim::SkinVertex>&,
+                                               int joint_count);
+
+    // Largest palette a single mesh may use. A frame may hold several.
+    static constexpr int kMaxJoints = 64;
+    // How many skinned instances one frame can draw before the palette ring is
+    // full. Overflowing drops the draw, and shows up in RenderStats::overflowed.
+    static constexpr int kMaxSkinnedPerFrame = 16;
+
+    // Joints the mesh was uploaded with, or 0 if it is not skinned.
+    [[nodiscard]] int JointCount(MeshHandle) const;
 
     // Registers a material, reusing an existing pipeline when the state matches.
     [[nodiscard]] MaterialHandle CreateMaterial(const MaterialDesc&,

@@ -25,6 +25,33 @@ vertex ShadowOut vs_shadow(uint                     vid   [[vertex_id]],
     return o;
 }
 
+// A skinned caster has to be posed before it is recorded, or its shadow stays
+// in the bind pose while the character moves — a shadow that is the right shape
+// and in the wrong place, which reads as a lighting bug.
+vertex ShadowOut vs_shadow_skinned(uint                     vid     [[vertex_id]],
+                                   device const VertexIn*   verts   [[buffer(0)]],
+                                   constant FrameUniforms&  u       [[buffer(1)]],
+                                   device const SkinIn*     skin    [[buffer(2)]],
+                                   device const float4x4*   palette [[buffer(3)]])
+{
+    const SkinIn s = skin[vid];
+    float4x4 blend = float4x4(0.0f);
+    float total = 0.0f;
+    for (uint i = 0; i < 4; ++i) {
+        const float w = s.weights[i];
+        if (w <= 0.0f) continue;
+        blend += palette[s.joints[i]] * w;
+        total += w;
+    }
+    if (total <= 0.0f) blend = float4x4(1.0f);
+
+    const float4 world = u.model * (blend * float4(verts[vid].position.xyz, 1.0f));
+    ShadowOut o;
+    o.position = u.lightViewProj * world;
+    o.worldY = world.y;
+    return o;
+}
+
 // The pass is still colour-less, but it is no longer purely a vertex stage:
 // the SECTION CUT has to apply here too.
 //
