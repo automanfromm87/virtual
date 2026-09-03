@@ -26,15 +26,22 @@
 
 namespace eng::physics {
 
-enum class ShapeType : std::uint8_t { Sphere, Box, Hull };
+enum class ShapeType : std::uint8_t { Sphere, Box, Hull, Capsule };
 
 struct Shape {
     ShapeType type = ShapeType::Sphere;
-    // Sphere: the radius. EVERY shape: the bounding sphere, which the cheap
-    // rejects in raycasts, overlap queries and the CCD broadphase all read
-    // without asking what kind of shape it is. Each factory below keeps it
-    // right, and a shape built by hand must too.
+    // Sphere: the radius. Capsule: the radius of its caps. Meaningless for a
+    // box or a hull.
     float radius = 0.5f;
+    // The BOUNDING sphere, which the cheap rejects in raycasts, overlap
+    // queries and the CCD broadphase all read without asking what kind of
+    // shape it is.
+    //
+    // A separate field, and it was not at first: `radius` served as both, which
+    // works right up to a capsule -- whose cap radius and bounding radius are
+    // different numbers, and which would have had to lie about one of them.
+    // Each factory below sets it; a shape built by hand must too.
+    float bounds_radius = 0.5f;
     Vec3 half_extents{0.5f, 0.5f, 0.5f};  // Box, in the body's own frame
     // Hull: the vertices, in the body's own frame, already reduced by
     // geom::ConvexHull. Only the vertices are kept -- GJK never asks anything
@@ -55,6 +62,7 @@ struct Shape {
         Shape s;
         s.type = ShapeType::Sphere;
         s.radius = r;
+        s.bounds_radius = r;
         return s;
     }
     [[nodiscard]] static Shape MakeBox(Vec3 half) {
@@ -70,7 +78,7 @@ struct Shape {
         // against small bullets, and nothing else asked. A raycast asks
         // immediately, and a ray passing 1.5 m above the centre of a 4 m box
         // was rejected before the exact test ever ran.
-        s.radius = Length(half);
+        s.bounds_radius = Length(half);
         return s;
     }
     // From a built hull, which is the form that also knows its own volume and
@@ -85,6 +93,21 @@ struct Shape {
     // Mass properties fall back to the bounding box, which OVERESTIMATES the
     // inertia of anything that is not a box: the shape resists spinning more
     // than it should. Use the geom::Hull overload where that matters.
+    // A CAPSULE: a segment of length 2*half_height along the body's own Y,
+    // swept by a sphere of `r`. The shape a character is, because a box catches
+    // on every corner it passes and a sphere rolls.
+    [[nodiscard]] static Shape MakeCapsule(float r, float half_height) {
+        Shape s;
+        s.type = ShapeType::Capsule;
+        s.radius = r;
+        // Stored in half_extents so the whole shape is described by the fields
+        // that already exist; y is the SEGMENT's half length, not including the
+        // caps, which is what the support function wants.
+        s.half_extents = Vec3{r, half_height, r};
+        s.bounds_radius = half_height + r;
+        return s;
+    }
+
     [[nodiscard]] static Shape MakeHull(std::vector<Vec3> vertices) {
         Shape s;
         s.type = ShapeType::Hull;

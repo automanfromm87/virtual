@@ -208,6 +208,21 @@ void Body::SetMass(float mass) {
         inverse_inertia = Vec3{i.x > 0.0f ? 1.0f / i.x : 0.0f,
                                i.y > 0.0f ? 1.0f / i.y : 0.0f,
                                i.z > 0.0f ? 1.0f / i.z : 0.0f};
+    } else if (shape.type == ShapeType::Capsule) {
+        // A cylinder plus two hemispheres, done as the cylinder alone.
+        //
+        // The caps contribute maybe a tenth of the inertia of a character-sized
+        // capsule, and the exact formula is four terms with a parallel-axis
+        // shift on each. This is an APPROXIMATION and the number it gets wrong
+        // is how readily the thing tumbles -- which for the case a capsule
+        // exists to serve, an upright character, is locked to zero anyway.
+        const float r = shape.radius;
+        const float h = shape.half_extents.y * 2.0f;
+        const float ix = mass * (3.0f * r * r + h * h) / 12.0f;
+        const float iy = 0.5f * mass * r * r;
+        inverse_inertia = Vec3{ix > 0.0f ? 1.0f / ix : 0.0f,
+                               iy > 0.0f ? 1.0f / iy : 0.0f,
+                               ix > 0.0f ? 1.0f / ix : 0.0f};
     } else if (shape.type == ShapeType::Sphere) {
         // Solid sphere: I = 2/5 m r², the same about every axis.
         const float i = 0.4f * mass * shape.radius * shape.radius;
@@ -428,6 +443,19 @@ Vec3 Support(const Body& body, Vec3 dir) {
                               local.y >= 0.0f ? h.y : -h.y,
                               local.z >= 0.0f ? h.z : -h.z};
             return body.position + Rotate(body.orientation, corner);
+        }
+        case ShapeType::Capsule: {
+            const float len = Length(dir);
+            const Vec3 unit = len > 1e-12f ? dir * (1.0f / len) : Vec3{1, 0, 0};
+            // The segment's furthest END, then the cap's radius along the
+            // direction. A capsule IS a swept sphere, and its support function
+            // is the segment's support plus the sphere's -- which is why one
+            // line covers it and a box needs three.
+            const Vec3 local = RotateInverse(body.orientation, dir);
+            const float h = local.y >= 0.0f ? body.shape.half_extents.y
+                                            : -body.shape.half_extents.y;
+            return body.position + Rotate(body.orientation, Vec3{0.0f, h, 0.0f}) +
+                   unit * body.shape.radius;
         }
         case ShapeType::Hull: {
             if (body.shape.points.empty()) return body.position;
@@ -1018,7 +1046,8 @@ bool World::Raycast(Vec3 origin, Vec3 direction, float max_distance, RayHit* out
         // work of this one.
         float t = 0.0f;
         Vec3 n{0, 1, 0};
-        if (!RaySphere(origin, direction, b.position, b.shape.radius, best_t, &t, &n))
+        if (!RaySphere(origin, direction, b.position, b.shape.bounds_radius,
+                       best_t, &t, &n))
             continue;
 
         switch (b.shape.type) {
@@ -1027,6 +1056,7 @@ bool World::Raycast(Vec3 origin, Vec3 direction, float max_distance, RayHit* out
             case ShapeType::Box:
                 if (!RayBox(origin, direction, b, best_t, &t, &n)) continue;
                 break;
+            case ShapeType::Capsule:
             case ShapeType::Hull: {
                 // CONSERVATIVE ADVANCEMENT, the same idea the continuous
                 // collision code uses: the distance from a point to a convex
@@ -1089,7 +1119,7 @@ int World::OverlapShape(const Shape& shape, Vec3 position, Quat orientation,
         if ((b.layer & filter.mask) == 0u) continue;
         if (b.trigger && !filter.hit_triggers) continue;
         // Bounding spheres first, for the same reason as the raycast.
-        const float reach = probe.shape.radius + b.shape.radius;
+        const float reach = probe.shape.bounds_radius + b.shape.bounds_radius;
         if (Dot(b.position - position, b.position - position) > reach * reach)
             continue;
         // The general convex test, not the specialised ones: a query shape can
@@ -1609,7 +1639,8 @@ void World::StepFixed() {
                 // the bounding sphere of the other, no sweep is needed -- and
                 // that is the overwhelmingly common case, which is what keeps
                 // this affordable at all.
-                const float reach = b.shape.radius + other.shape.radius +
+                const float reach = b.shape.bounds_radius +
+                                    other.shape.bounds_radius +
                                     Length(motion);
                 if (Dot(other.position - b.position, other.position - b.position) >
                     reach * reach)

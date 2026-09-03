@@ -1,0 +1,9 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_test(
+    name = "character_test",
+    srcs = ["character_test.cc"],
+    deps = ["//engine/physics"],
+)
