@@ -12,11 +12,15 @@
 // next to the file; skins; animations with LINEAR, STEP and CUBICSPLINE
 // sampling.
 //
+// Also .glb, the binary container: a header, a JSON chunk and an optional
+// binary chunk, which is how a model ships as one file.
+//
 // NOT SUPPORTED, and each is a real piece of work rather than an oversight:
-// .glb containers, JPEG images, sparse accessors, morph targets, cameras.
+// JPEG images, morph targets, cameras.
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -125,6 +129,18 @@ struct Document {
 [[nodiscard]] Document ParseGltf(std::string_view json,
                                  const std::vector<std::uint8_t>& bin,
                                  std::string& error);
+
+// The .glb container: 12-byte header, then length-prefixed chunks. The first is
+// always the JSON; a second, if present, is the buffer that JSON refers to with
+// no uri at all.
+//
+// Separate from ParseGltf rather than sniffed inside it, because "is this a
+// glb" is a question about bytes and "what does this document mean" is a
+// question about a document — and a caller that already knows should not pay
+// for the guess.
+[[nodiscard]] bool IsGlb(std::span<const std::uint8_t> bytes);
+[[nodiscard]] Document ParseGlb(std::span<const std::uint8_t> bytes,
+                                std::string& error);
 
 // Reads a .gltf from disk, resolving a sibling .bin if the document names one.
 [[nodiscard]] Document LoadGltfFile(const std::string& path, std::string& error);

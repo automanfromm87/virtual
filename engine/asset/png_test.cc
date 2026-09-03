@@ -86,6 +86,7 @@ int main() {
     CASE(Rgba8Stored);  // uncompressed deflate blocks
     CASE(Rgba8Runs);    // long back-references
     CASE(GreyKey);      // tRNS colour key on a greyscale image
+    CASE(Adam7);        // interlaced: seven sub-images, filtered separately
 
     // --- inflate on its own ---------------------------------------------------
     {
@@ -185,11 +186,13 @@ int main() {
 
     // --- unsupported-but-valid features say so --------------------------------
     {
-        // Same header as a real file, with the interlace byte set. It has to
-        // report that rather than decode the first Adam7 pass as the image.
+        // Interlace method 2 does not exist. Method 1 is Adam7 and is decoded
+        // (see the fixture above); an UNKNOWN one has to be refused rather
+        // than treated as "probably not interlaced", which would read the
+        // seven sub-images as one and produce a scrambled picture.
         std::vector<std::uint8_t> interlaced(kRgb8PaethPng,
                                              kRgb8PaethPng + sizeof(kRgb8PaethPng));
-        interlaced[8 + 8 + 12] = 1;  // IHDR data byte 12 = interlace method
+        interlaced[8 + 8 + 12] = 2;  // IHDR data byte 12 = interlace method
         // Recompute the IHDR CRC so the failure is about interlacing, not the
         // checksum — otherwise this test would pass for the wrong reason.
         auto crc32 = [](const std::uint8_t* d, std::size_t n) {
@@ -212,7 +215,7 @@ int main() {
 
         std::string error;
         CHECK(png::Decode(interlaced, error).Empty());
-        CHECK(error.find("interlac") != std::string::npos);
+        CHECK(error.find("interlace") != std::string::npos);
     }
 
     // --- decompression is bounded ---------------------------------------------

@@ -40,6 +40,7 @@ cc_library(
     name = "testdata",
     textual_hdrs = [
         "testdata_quad_gltf.inc",
+        "testdata_glb.inc",
         "testdata_skinned_gltf.inc",
         "testdata_textured_gltf.inc",
     ],
@@ -71,6 +72,7 @@ cc_test(
         # In srcs, not data: it is #include'd, so it is a compile-time input.
         "testdata_quad_gltf.inc",
         "testdata_textured_gltf.inc",
+        "testdata_glb.inc",
         "testdata_skinned_gltf.inc",
     ],
     deps = [":asset"],

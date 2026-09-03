@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <span>
 #include <unordered_map>
 #include <sstream>
 
@@ -93,13 +94,21 @@ class Reader {
         AccessorView v;
         const json::Value& acc = root_["accessors"][std::size_t(index)];
         if (acc.IsNull()) { Fail("missing accessor " + std::to_string(index)); return v; }
-        if (acc.Has("sparse")) { Fail("sparse accessors are not supported"); return v; }
-
         v.count = acc["count"].Int();
         v.component_type = acc["componentType"].Int();
         v.components = ComponentCount(acc["type"].Str());
         const int csize = ComponentSize(v.component_type);
         if (v.components == 0 || csize == 0) { Fail("unknown accessor type"); return v; }
+
+        // SPARSE. A handful of elements overriding an otherwise shared buffer —
+        // how an exporter ships a mesh that is mostly one thing with a few
+        // vertices moved, without duplicating the whole array.
+        //
+        // Materialised into a densified copy rather than handled at read time.
+        // A sparse view would have to binary-search its override list on every
+        // element access, in the inner loop of every attribute; doing it once
+        // costs a buffer and makes the rest of this file not care.
+        if (acc.Has("sparse")) return Sparse(acc, v, csize);
 
         const int bv_index = acc["bufferView"].Int(-1);
         if (bv_index < 0) { Fail("accessor without a bufferView"); return v; }
@@ -120,6 +129,90 @@ class Reader {
         if (v.count > 0 && need > data.size()) { Fail("accessor runs past the buffer"); return v; }
 
         v.base = data.data() + offset;
+        v.valid = true;
+        return v;
+    }
+
+    // Builds the densified copy a sparse accessor describes: the base values
+    // where there are any, then the overrides written over the top.
+    AccessorView Sparse(const json::Value& acc, AccessorView v, int csize) {
+        const json::Value& sp = acc["sparse"];
+        const int n = sp["count"].Int(0);
+        const std::size_t elem = std::size_t(csize) * std::size_t(v.components);
+        const std::size_t bytes = elem * std::size_t(v.count);
+        if (v.count <= 0 || n < 0) { Fail("sparse accessor with no elements"); return v; }
+
+        std::vector<std::uint8_t> dense(bytes, 0);
+
+        // The base is OPTIONAL. Without one every element starts at zero, which
+        // is the spec's answer and is how a morph target ships only the
+        // vertices that actually move.
+        const int bv_index = acc["bufferView"].Int(-1);
+        if (bv_index >= 0) {
+            const json::Value& bv = root_["bufferViews"][std::size_t(bv_index)];
+            const int buf = bv["buffer"].Int(-1);
+            if (buf < 0 || std::size_t(buf) >= buffers_.size()) {
+                Fail("sparse accessor has a bad base buffer");
+                return v;
+            }
+            const std::vector<std::uint8_t>& data = buffers_[std::size_t(buf)];
+            std::size_t stride = std::size_t(bv["byteStride"].Int(0));
+            if (stride == 0) stride = elem;
+            const std::size_t off = std::size_t(bv["byteOffset"].Int(0)) +
+                                    std::size_t(acc["byteOffset"].Int(0));
+            for (int i = 0; i < v.count; ++i) {
+                const std::size_t at = off + stride * std::size_t(i);
+                if (at + elem > data.size()) {
+                    Fail("sparse accessor's base runs past the buffer");
+                    return v;
+                }
+                std::memcpy(&dense[elem * std::size_t(i)], data.data() + at, elem);
+            }
+        }
+
+        if (n > 0) {
+            const AccessorView idx = ViewOfBufferView(sp["indices"], 1);
+            const AccessorView val = ViewOfBufferView(sp["values"], v.components);
+            if (!idx.valid || !val.valid) { Fail("sparse accessor is malformed"); return v; }
+            for (int i = 0; i < n; ++i) {
+                const std::uint32_t target = ReadIndex(idx, i);
+                // An override aimed past the end is a corrupt file, not a
+                // reason to write outside the array.
+                if (target >= std::uint32_t(v.count)) {
+                    Fail("sparse accessor overrides an element that is not there");
+                    return v;
+                }
+                const std::uint8_t* src = val.base + val.stride * std::size_t(i);
+                std::memcpy(&dense[elem * std::size_t(target)], src, elem);
+            }
+        }
+
+        scratch_.push_back(std::move(dense));
+        v.base = scratch_.back().data();
+        v.stride = elem;  // densified, so tightly packed by construction
+        v.valid = true;
+        return v;
+    }
+
+    // A bufferView referenced directly, the way a sparse accessor's index and
+    // value arrays are — they carry their own componentType and no count.
+    AccessorView ViewOfBufferView(const json::Value& spec, int components) {
+        AccessorView v;
+        const int bv_index = spec["bufferView"].Int(-1);
+        if (bv_index < 0) return v;
+        const json::Value& bv = root_["bufferViews"][std::size_t(bv_index)];
+        const int buf = bv["buffer"].Int(-1);
+        if (buf < 0 || std::size_t(buf) >= buffers_.size()) return v;
+        v.component_type = spec["componentType"].Int(kFloat);
+        v.components = components;
+        const int csize = ComponentSize(v.component_type);
+        if (csize == 0) return v;
+        v.stride = std::size_t(csize * components);
+        const std::size_t off = std::size_t(bv["byteOffset"].Int(0)) +
+                                std::size_t(spec["byteOffset"].Int(0));
+        const std::vector<std::uint8_t>& data = buffers_[std::size_t(buf)];
+        if (off >= data.size()) return v;
+        v.base = data.data() + off;
         v.valid = true;
         return v;
     }
@@ -183,6 +276,11 @@ class Reader {
     const json::Value& root_;
     std::string& error_;
     std::vector<std::vector<std::uint8_t>> buffers_;
+    // Densified sparse accessors. A vector of vectors is safe to grow while
+    // views point into it: reallocating the outer one MOVES the inner vectors,
+    // which transfers their heap buffers rather than copying them, so data()
+    // stays put.
+    std::vector<std::vector<std::uint8_t>> scratch_;
 };
 
 // A node's rest transform as SEPARATE components, which is what a skeleton
@@ -659,6 +757,60 @@ anim::Clip Document::MakeClip(int animation, int skin) const {
     return clip;
 }
 
+bool IsGlb(std::span<const std::uint8_t> bytes) {
+    return bytes.size() >= 12 && bytes[0] == 'g' && bytes[1] == 'l' &&
+           bytes[2] == 'T' && bytes[3] == 'F';
+}
+
+Document ParseGlb(std::span<const std::uint8_t> bytes, std::string& error) {
+    Document doc;
+    if (!IsGlb(bytes)) {
+        error = "glb: bad magic";
+        return doc;
+    }
+    auto read32 = [&](std::size_t at) {
+        return std::uint32_t(bytes[at]) | (std::uint32_t(bytes[at + 1]) << 8) |
+               (std::uint32_t(bytes[at + 2]) << 16) |
+               (std::uint32_t(bytes[at + 3]) << 24);
+    };
+    const std::uint32_t version = read32(4);
+    if (version != 2) {
+        error = "glb: version " + std::to_string(version) + ", expected 2";
+        return doc;
+    }
+    // The header's total length is advisory — a file may be longer. Trusting it
+    // over the actual size is how a truncated download reads past its end.
+    const std::size_t total = std::min(std::size_t(read32(8)), bytes.size());
+
+    std::string json;
+    std::vector<std::uint8_t> bin;
+    std::size_t at = 12;
+    while (at + 8 <= total) {
+        const std::uint32_t len = read32(at);
+        const std::uint32_t type = read32(at + 4);
+        const std::size_t body = at + 8;
+        if (body + len > total) {
+            error = "glb: chunk runs past the end of the file";
+            return doc;
+        }
+        if (type == 0x4E4F534Au) {  // 'JSON'
+            json.assign(reinterpret_cast<const char*>(bytes.data() + body), len);
+        } else if (type == 0x004E4942u) {  // 'BIN\0'
+            bin.assign(bytes.begin() + std::ptrdiff_t(body),
+                       bytes.begin() + std::ptrdiff_t(body + len));
+        }
+        // Anything else is an extension chunk and is skipped, per the spec.
+        // Chunks are four-byte aligned.
+        at = body + len;
+        at += (4 - (at % 4)) % 4;
+    }
+    if (json.empty()) {
+        error = "glb: no JSON chunk";
+        return doc;
+    }
+    return ParseGltf(json, bin, error);
+}
+
 Document LoadGltfFile(const std::string& path, std::string& error) {
     Document doc;
     std::ifstream in(path, std::ios::binary);
@@ -666,6 +818,14 @@ Document LoadGltfFile(const std::string& path, std::string& error) {
     std::ostringstream ss;
     ss << in.rdbuf();
     const std::string text = ss.str();
+
+    // Sniffed by content, not by extension: a .gltf that is really a glb is a
+    // real thing that happens, and the magic is four bytes.
+    {
+        const auto* raw = reinterpret_cast<const std::uint8_t*>(text.data());
+        if (IsGlb(std::span<const std::uint8_t>(raw, text.size())))
+            return ParseGlb(std::span<const std::uint8_t>(raw, text.size()), error);
+    }
 
     // Resolve a sibling .bin if the document names an external buffer.
     std::vector<std::uint8_t> bin;

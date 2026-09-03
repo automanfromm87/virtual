@@ -472,8 +472,9 @@ Texture2D Decode(std::span<const std::uint8_t> bytes, std::string& error) {
                 error = "png: unknown compression or filter method";
                 return img;
             }
-            if (hdr.interlace != 0) {
-                error = "png: interlaced (Adam7) images are not supported";
+            if (hdr.interlace != 0 && hdr.interlace != 1) {
+                error = "png: unknown interlace method " +
+                        std::to_string(hdr.interlace);
                 return img;
             }
             if (hdr.bit_depth != 8 && hdr.bit_depth != 16) {
@@ -528,7 +529,39 @@ Texture2D Decode(std::span<const std::uint8_t> bytes, std::string& error) {
     // Every byte the image can possibly need, known from IHDR alone. Handing
     // this to the decompressor as a cap is what stops a 24 KB file from
     // demanding 24 MB — the size is not a guess, it is arithmetic.
-    const std::size_t expect = (stride + 1) * hdr.height;
+    // ADAM7. An interlaced image is seven smaller images, each with its own
+    // rows, its own filtering and its own scanline width — a coarse pass first
+    // so a slow download shows something early. Every pass has to be defiltered
+    // in isolation: filters refer to the previous row OF THAT PASS, which is
+    // eight pixels away in the final image, not one.
+    static constexpr int kPassX0[7] = {0, 4, 0, 2, 0, 1, 0};
+    static constexpr int kPassY0[7] = {0, 0, 4, 0, 2, 0, 1};
+    static constexpr int kPassDX[7] = {8, 8, 4, 4, 2, 2, 1};
+    static constexpr int kPassDY[7] = {8, 8, 8, 4, 4, 2, 2};
+
+    const int passes = hdr.interlace ? 7 : 1;
+    struct PassGeom {
+        std::uint32_t w = 0, h = 0;
+        std::size_t stride = 0;
+    };
+    PassGeom geom[7];
+    std::size_t expect = 0;
+    for (int p = 0; p < passes; ++p) {
+        if (!hdr.interlace) {
+            geom[0] = {hdr.width, hdr.height, stride};
+        } else {
+            geom[p].w = std::uint32_t(
+                (hdr.width + kPassDX[p] - 1 - kPassX0[p]) / kPassDX[p]);
+            geom[p].h = std::uint32_t(
+                (hdr.height + kPassDY[p] - 1 - kPassY0[p]) / kPassDY[p]);
+            geom[p].stride = std::size_t(geom[p].w) * std::size_t(bpp);
+        }
+        // An empty pass contributes NOTHING, not even a filter byte. A small
+        // image legitimately has several, and counting a byte for each is the
+        // classic way to decode every interlaced thumbnail one row short.
+        if (geom[p].w == 0 || geom[p].h == 0) continue;
+        expect += (geom[p].stride + 1) * geom[p].h;
+    }
 
     std::vector<std::uint8_t> raw;
     if (!ZlibInflate(idat, raw, error, expect)) return img;
@@ -539,32 +572,53 @@ Texture2D Decode(std::span<const std::uint8_t> bytes, std::string& error) {
         return img;
     }
 
-    // Defilter in place into a contiguous buffer without the per-row filter
-    // byte, so `prev` is just the previous row of the same buffer.
-    std::vector<std::uint8_t> lines(stride * hdr.height);
-    for (std::uint32_t y = 0; y < hdr.height; ++y) {
-        const std::uint8_t filter = raw[(stride + 1) * y];
-        const std::uint8_t* src = &raw[(stride + 1) * y + 1];
-        std::uint8_t* dst = &lines[stride * y];
-        const std::uint8_t* prev = y ? &lines[stride * (y - 1)] : nullptr;
+    // Defiltered, then scattered into place. `lines` is always the final
+    // full-size image; a non-interlaced file is simply the one-pass case.
+    std::vector<std::uint8_t> lines(stride * hdr.height, 0);
+    std::size_t read_at = 0;
+    for (int p = 0; p < passes; ++p) {
+        const PassGeom& g = geom[p];
+        if (g.w == 0 || g.h == 0) continue;
+        std::vector<std::uint8_t> pass(g.stride * g.h);
+        for (std::uint32_t y = 0; y < g.h; ++y) {
+            const std::uint8_t filter = raw[read_at];
+            const std::uint8_t* src = &raw[read_at + 1];
+            read_at += g.stride + 1;
+            std::uint8_t* dst = &pass[g.stride * y];
+            const std::uint8_t* prev = y ? &pass[g.stride * (y - 1)] : nullptr;
 
-        for (std::size_t x = 0; x < stride; ++x) {
-            const int a = x >= std::size_t(bpp) ? dst[x - bpp] : 0;
-            const int b = prev ? prev[x] : 0;
-            const int c = (prev && x >= std::size_t(bpp)) ? prev[x - bpp] : 0;
-            int v = src[x];
-            switch (filter) {
-                case 0: break;
-                case 1: v += a; break;
-                case 2: v += b; break;
-                case 3: v += (a + b) / 2; break;
-                case 4: v += Paeth(a, b, c); break;
-                default:
-                    error = "png: unknown row filter " + std::to_string(filter);
-                    return img;
+            for (std::size_t x = 0; x < g.stride; ++x) {
+                const int a = x >= std::size_t(bpp) ? dst[x - bpp] : 0;
+                const int b = prev ? prev[x] : 0;
+                const int c = (prev && x >= std::size_t(bpp)) ? prev[x - bpp] : 0;
+                int v = src[x];
+                switch (filter) {
+                    case 0: break;
+                    case 1: v += a; break;
+                    case 2: v += b; break;
+                    case 3: v += (a + b) / 2; break;
+                    case 4: v += Paeth(a, b, c); break;
+                    default:
+                        error = "png: unknown row filter " + std::to_string(filter);
+                        return img;
+                }
+                dst[x] = std::uint8_t(v);
             }
-            dst[x] = std::uint8_t(v);
         }
+        if (!hdr.interlace) {
+            lines.swap(pass);
+            continue;
+        }
+        for (std::uint32_t y = 0; y < g.h; ++y)
+            for (std::uint32_t x = 0; x < g.w; ++x) {
+                const std::uint32_t fx =
+                    std::uint32_t(kPassX0[p]) + x * std::uint32_t(kPassDX[p]);
+                const std::uint32_t fy =
+                    std::uint32_t(kPassY0[p]) + y * std::uint32_t(kPassDY[p]);
+                std::memcpy(&lines[stride * fy + std::size_t(fx) * bpp],
+                            &pass[g.stride * y + std::size_t(x) * bpp],
+                            std::size_t(bpp));
+            }
     }
 
     // Expand to RGBA8. 16-bit samples are truncated to their high byte: this

@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <span>
 
 namespace {
 
@@ -34,6 +35,8 @@ const char* const kSkinnedGltf =
 const char* const kTexturedGltf =
 #include "engine/asset/testdata_textured_gltf.inc"
     ;
+
+#include "engine/asset/testdata_glb.inc"
 
 bool Near(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) < eps; }
 
@@ -245,6 +248,63 @@ int main() {
         CHECK(plain.skins.empty());
         CHECK(plain.animations.empty());
         CHECK(!plain.primitives[0].Skinned());
+    }
+
+    // --- .glb container, with a SPARSE accessor inside it ----------------------
+    {
+        const std::span<const std::uint8_t> bytes(
+            reinterpret_cast<const std::uint8_t*>(kSparseGlb), sizeof(kSparseGlb));
+        CHECK(gltf::IsGlb(bytes));
+        CHECK(!gltf::IsGlb(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(kQuad), 8)));
+
+        std::string error;
+        const gltf::Document doc = gltf::ParseGlb(bytes, error);
+        CHECK(error.empty());
+        if (!error.empty()) std::fprintf(stderr, "  glb: %s\n", error.c_str());
+        CHECK(doc.primitives.size() == 1);
+        if (doc.primitives.empty()) return 1;
+
+        const eng::Mesh& m = doc.primitives[0].mesh;
+        CHECK(m.vertices.size() == 4);
+        CHECK(m.indices.size() == 6);
+
+        // The buffer had NO uri: its bytes are the glb's BIN chunk. If that
+        // were not wired up the positions would all be zero.
+        CHECK(Near(m.vertices[0].position.x, 0.0f));
+        CHECK(Near(m.vertices[2].position.x, 2.0f));
+
+        // SPARSE: the base is a flat line at y = 0, and the override list
+        // lifts vertices 1 and 3 to y = 5. Both halves have to work — reading
+        // only the base gives a flat line, reading only the overrides gives
+        // two vertices and two holes.
+        CHECK(Near(m.vertices[0].position.y, 0.0f));
+        CHECK(Near(m.vertices[1].position.y, 5.0f));
+        CHECK(Near(m.vertices[2].position.y, 0.0f));
+        CHECK(Near(m.vertices[3].position.y, 5.0f));
+        // ...and the overridden elements kept their x, so the whole vec3 was
+        // replaced rather than just the component that changed.
+        CHECK(Near(m.vertices[1].position.x, 1.0f));
+        CHECK(Near(m.vertices[3].position.x, 3.0f));
+    }
+
+    // --- a corrupt container is refused ----------------------------------------
+    {
+        std::string error;
+        std::vector<std::uint8_t> bad(kSparseGlb, kSparseGlb + sizeof(kSparseGlb));
+        bad[4] = 3;  // version 3
+        CHECK(gltf::ParseGlb(bad, error).primitives.empty());
+        CHECK(error.find("version") != std::string::npos);
+
+        error.clear();
+        std::vector<std::uint8_t> truncated(kSparseGlb, kSparseGlb + 40);
+        CHECK(gltf::ParseGlb(truncated, error).primitives.empty());
+        CHECK(!error.empty());
+
+        error.clear();
+        const std::uint8_t junk[12] = {'x', 'x', 'x', 'x'};
+        CHECK(gltf::ParseGlb(junk, error).primitives.empty());
+        CHECK(error.find("magic") != std::string::npos);
     }
 
     if (g_failures == 0) std::printf("gltf_test: all checks passed\n");
