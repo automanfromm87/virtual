@@ -179,6 +179,17 @@ int main(int argc, char** argv) {
     // that path opened a nested device frame, leaked a frames-in-flight permit
     // per bake and deadlocked the app outright on the third, and a defect that
     // needs three keypresses to reproduce is a defect no test will ever see.
+    // NO HUD. The debug panel is 500x276 points plus five text lines that
+    // overflow it onto the sky -- 16.5% of a 1100x760 capture -- and there was
+    // no way to turn it off, which is why this repository has never had a
+    // screenshot of its own renderer that was not mostly a screenshot of its
+    // own diagnostics.
+    //
+    // It also makes a capture REPRODUCIBLE. Two --shot runs of the same frame
+    // differ in 0.18-0.30% of pixels and every one of those pixels is inside
+    // the HUD: the frame counter, the exposure reading, the pass timings. The
+    // scene under it is bit-identical.
+    bool hud_on = true;
     int rebake_every = 0;
     // BLOOM, in LINEAR radiance before the tone map. The threshold has to sit
     // above the brightest thing that is merely lit and below the things that
@@ -280,6 +291,7 @@ int main(int argc, char** argv) {
             render_scale = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--localshadows") == 0)
             local_shadows_start = true;
+        else if (std::strcmp(argv[i], "--nohud") == 0) hud_on = false;
         else if (std::strcmp(argv[i], "--nobloom") == 0) bloom_start = false;
         else if (std::strcmp(argv[i], "--bloom") == 0 && i + 2 < argc) {
             bloom_threshold = float(std::atof(argv[++i]));
@@ -2231,7 +2243,12 @@ int main(int argc, char** argv) {
         // outside the frame loop, so the HUD below reads last frame's.
 
         // --- HUD ----------------------------------------------------------------
+        //
+        // Begin runs even with the HUD off: it is what clears last frame's
+        // quads, and skipping it would leave the composite drawing a stale
+        // panel forever rather than none.
         ui->Begin(f.width, f.height);
+        if (hud_on) {
         ui->Rect(12, 12, 500, 276, eng::Vec4{0.05f, 0.06f, 0.08f, 0.72f});
         ui->Outline(12, 12, 500, 276, 1.0f, eng::Vec4{0.35f, 0.40f, 0.48f, 0.9f});
         char line[192];
@@ -2395,6 +2412,7 @@ int main(int argc, char** argv) {
             ui->Text(24, top + 12 + row * 20 + 6, line,
                      eng::Vec4{0.92f, 0.94f, 0.98f, 1.0f});
         }
+        }  // hud_on
 
         // --- passes --------------------------------------------------------------
         // config.color, NOT a format of its own. The composite and the UI
@@ -2811,6 +2829,21 @@ int main(int argc, char** argv) {
             std::vector<std::uint8_t> px(std::size_t(f.width) * f.height * 4);
             if (!app->Gpu().ReadPixels(shot_target, f.width, f.height, px))
                 return Fail("readback");
+            // BGRA OUT, RGBA IN. ReadPixels returns the texture's own bytes in
+            // the texture's own order, and the capture target is config.color
+            // -- BGRA8Unorm -- because the composite and UI pipelines are built
+            // for that and a mismatch is a pipeline Metal refuses to bind.
+            // png::EncodeFile documents RGBA. Two channels, swapped once.
+            //
+            // Worth spelling out because the previous arrangement was wrong in
+            // a way that LOOKED right: the target was RGBA8Unorm against BGRA
+            // pipelines, which Metal rejects under validation and this hardware
+            // tolerated, and the tolerated behaviour happened to store the
+            // channels in the order the encoder wanted. Fixing the format
+            // without fixing the encode turned every fire in the demo blue.
+            if (config.color == eng::rhi::Format::BGRA8Unorm)
+                for (std::size_t i = 0; i + 3 < px.size(); i += 4)
+                    std::swap(px[i], px[i + 2]);
             if (!eng::png::EncodeFile(shot_path, px, f.width, f.height, error))
                 return Fail(error);
             std::printf("wrote %s (%dx%d)\n", shot_path.c_str(), f.width, f.height);
