@@ -101,6 +101,7 @@ inline constexpr eng::Vec3 kLanternHall{-28.0f, 0.0f, -22.0f};
 inline constexpr eng::Vec3 kGlassPavilion{24.0f, 0.0f, 24.0f};
 inline constexpr eng::Vec3 kFirePit{-22.0f, 0.0f, 23.0f};
 inline constexpr eng::Vec3 kFlag{14.0f, 0.0f, 6.0f};
+inline constexpr eng::Vec3 kSpring{-13.0f, 0.0f, 7.0f};
 
 // A DISTRICT IS BUILT ON A LEVEL PAD, and the terrain function has to cut it.
 //
@@ -128,6 +129,7 @@ inline constexpr Pad kPads[] = {
     {kGlassPavilion, 6.5f},  // a fan of panes at radius 4.2
     {kFirePit, 7.0f},        // stones at radius 3.4, embers out to 5
     {kFlag, 4.0f},           // one pole and its shadow
+    {kSpring, 5.0f},         // a basin 3.0 x 2.2 outside, plus its apron
 };
 // HOW FAST THE GROUND MAY CLIMB AWAY from a pad, as a gradient.
 //
@@ -443,6 +445,104 @@ inline void BuildGlassPavilion(eng::Renderer& r, eng::Scene& scene,
 // what MakeGroundDecal is. It has to know what it lands on and be rebuilt if
 // that changes; in exchange it works here, sorts like anything else, and is lit
 // by the same sun as the ground under it.
+// --- the spring ------------------------------------------------------------
+//
+// A stone basin with water actually simulated in it. The fluid solver's
+// boundary is an axis-aligned BOX -- it knows nothing about terrain -- so the
+// container has to be a box, and the basin's inner faces ARE that box. Getting
+// them to agree is the whole trick: a rim the water does not touch reads as a
+// puddle floating inside a trough, and a rim the water passes through reads as
+// nothing at all.
+//
+// SMALL ON PURPOSE. Smoothed-particle hydrodynamics costs volume, not area, so
+// a pond is a hundred times a basin. At the spacing this uses, 2.6 by 1.8
+// metres of water half a metre deep is about six thousand particles, which the
+// solver steps in a fraction of a frame. A lake is a different project.
+struct Spring {
+    // The solver's box: the basin's INNER faces, and the extent of its
+    // neighbour grid. In world metres, not relative to kSpring.
+    eng::Vec3 bounds_min, bounds_max;
+    float fill_y = 0.0f;  // how high to seed the water
+};
+
+inline Spring BuildSpring(eng::Renderer& r, eng::Scene& scene,
+                          eng::physics::World& world, float ground_y,
+                          std::string& error) {
+    // Inner half-extents and depth. Everything below is derived from these
+    // three numbers so the rim, the floor, the collider and the solver bounds
+    // cannot drift apart.
+    constexpr float kHalfX = 1.30f, kHalfZ = 0.90f;
+    constexpr float kDepth = 0.45f;   // inner floor to rim top
+    constexpr float kWall = 0.22f;    // rim thickness
+    // RAISED, NOT SUNK. Sinking the floor below the pad was the first attempt
+    // and it put the whole basin inside the hill: the terrain function does not
+    // know this district exists, kPads only LEVELS the ground, and nothing cuts
+    // a hole in it. The water simulated correctly and was buried, which from
+    // outside is indistinguishable from a solver that did nothing. A trough
+    // standing on the grass needs no earthworks and reads at a glance.
+    const float floor_y = ground_y;
+
+    eng::MaterialDesc kerb_md;
+    kerb_md.shading = eng::Shading::Lit;
+    // Wet stone: darker and smoother than the fire pit's, so the water has
+    // something with a specular response to sit against.
+    kerb_md.base_color = eng::Vec4{0.28f, 0.29f, 0.30f, 1.0f};
+    kerb_md.roughness = 0.42f;
+    const eng::MaterialHandle kerb = r.CreateMaterial(kerb_md, error);
+
+    eng::MaterialDesc bed_md;
+    bed_md.shading = eng::Shading::Lit;
+    // PALE, so refraction has something to bend. A dark floor under clear
+    // water is indistinguishable from no water at all -- apps/fluid learned
+    // this and calls its version sand.
+    bed_md.base_color = eng::Vec4{0.52f, 0.48f, 0.38f, 1.0f};
+    bed_md.roughness = 0.90f;
+    const eng::MaterialHandle bed = r.CreateMaterial(bed_md, error);
+    if (!eng::Valid(kerb) || !eng::Valid(bed)) return {};
+
+    const auto slab = [&](eng::Vec3 centre, eng::Vec3 half,
+                          eng::MaterialHandle mat) {
+        const eng::MeshHandle mesh =
+            r.UploadMesh(eng::MakeBox(half, eng::Vec4{1, 1, 1, 1}));
+        if (!eng::Valid(mesh)) return;
+        eng::Instance in;
+        in.mesh = mesh;
+        in.material = mat;
+        in.model = eng::Mat4::Translation(centre);
+        AddSolid(scene, world, in, eng::physics::Shape::MakeBox(half), centre);
+    };
+
+    // The bed, its top face exactly at floor_y.
+    slab(eng::Vec3{kSpring.x, floor_y - 0.10f, kSpring.z},
+         eng::Vec3{kHalfX + kWall, 0.10f, kHalfZ + kWall}, bed);
+    // Four kerbs, inner faces exactly on the solver's box. The long pair runs
+    // the full outer width and the short pair butts against them, so no two
+    // faces are coincident -- overlapping boxes z-fight where they meet, which
+    // reads as crawling moire along the rim.
+    const float kerb_y = floor_y + kDepth * 0.5f;
+    slab(eng::Vec3{kSpring.x, kerb_y, kSpring.z - kHalfZ - kWall * 0.5f},
+         eng::Vec3{kHalfX + kWall, kDepth * 0.5f, kWall * 0.5f}, kerb);
+    slab(eng::Vec3{kSpring.x, kerb_y, kSpring.z + kHalfZ + kWall * 0.5f},
+         eng::Vec3{kHalfX + kWall, kDepth * 0.5f, kWall * 0.5f}, kerb);
+    slab(eng::Vec3{kSpring.x - kHalfX - kWall * 0.5f, kerb_y, kSpring.z},
+         eng::Vec3{kWall * 0.5f, kDepth * 0.5f, kHalfZ}, kerb);
+    slab(eng::Vec3{kSpring.x + kHalfX + kWall * 0.5f, kerb_y, kSpring.z},
+         eng::Vec3{kWall * 0.5f, kDepth * 0.5f, kHalfZ}, kerb);
+
+    Spring out;
+    out.bounds_min = eng::Vec3{kSpring.x - kHalfX, floor_y, kSpring.z - kHalfZ};
+    out.bounds_max = eng::Vec3{kSpring.x + kHalfX, floor_y + kDepth,
+                               kSpring.z + kHalfZ};
+    // SEEDED HIGHER THAN IT WILL SIT. A lattice at the seeding spacing is
+    // looser than the rest state the solver derives each particle's mass from,
+    // so the column compacts on the first few steps -- seeded to 0.43 m it
+    // settles to 0.29. Filling to the brim and letting it drop is what makes
+    // the basin read as full; seeding to the height you want is what makes it
+    // read as a puddle in a trough.
+    out.fill_y = floor_y + kDepth * 0.96f;
+    return out;
+}
+
 inline void BuildFirePit(eng::Renderer& r, eng::Scene& scene,
                          eng::physics::World& world, eng::MeshHandle sphere,
                          eng::rhi::TextureId soot, float ground_y,

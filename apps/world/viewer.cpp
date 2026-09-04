@@ -31,6 +31,7 @@
 #include "apps/world/districts.h"
 #include "engine/asset/texgen.h"
 #include "engine/render/gi.h"
+#include "engine/render/fluid.h"
 #include "engine/render/particles.h"
 #include "engine/render/volumetric.h"
 #include "engine/geometry/terrain.h"
@@ -1187,7 +1188,45 @@ int main(int argc, char** argv) {
                         [&](float x, float z) { return terrain.HeightAt(x, z); }, error);
     const world::Banner banner = world::BuildBanner(
         app->Draw(), scene, world, terrain.HeightAt(world::kFlag.x, world::kFlag.z), error);
+    const world::Spring spring = world::BuildSpring(
+        app->Draw(), scene, world,
+        terrain.HeightAt(world::kSpring.x, world::kSpring.z), error);
     if (!error.empty()) return Fail(error);
+
+    // --- the water -----------------------------------------------------------
+    //
+    // Real smoothed-particle hydrodynamics, in the basin BuildSpring just laid
+    // out. The solver's box is the basin's inner faces; the seeding fills it to
+    // just under the rim on a lattice at the rest spacing, which is what lets
+    // the solver derive each particle's mass from the rest density.
+    //
+    // The spacing is twice apps/fluid's and so is the smoothing radius, because
+    // this basin is twice that tank in every dimension and SPH costs volume:
+    // keeping the tank's numbers here would be eight times the particles for a
+    // fluid nobody would look at any closer.
+    eng::FluidConfig fcfg;
+    fcfg.bounds_min = spring.bounds_min;
+    fcfg.bounds_max = spring.bounds_max;
+    fcfg.smoothing_radius = 0.14f;
+    fcfg.viscosity = 0.30f;
+    std::vector<eng::Vec3> seed;
+    {
+        constexpr float kSpacing = 0.07f;
+        for (float x = spring.bounds_min.x + kSpacing; x < spring.bounds_max.x - kSpacing * 0.5f; x += kSpacing)
+            for (float y = spring.bounds_min.y + kSpacing * 0.5f; y < spring.fill_y; y += kSpacing)
+                for (float z = spring.bounds_min.z + kSpacing; z < spring.bounds_max.z - kSpacing * 0.5f; z += kSpacing)
+                    seed.push_back(eng::Vec3{x, y, z});
+    }
+    auto water = eng::FluidSim::Create(app->Gpu(), fcfg, seed,
+                                       eng::Renderer::kSceneFormat, error, 1);
+    if (!water) return Fail(error);
+    auto water_surface = eng::FluidSurface::Create(app->Gpu(), error);
+    if (!water_surface) return Fail(error);
+    std::printf("spring: %zu water particles in a %.1f x %.1f x %.1f m basin\n",
+                seed.size(), spring.bounds_max.x - spring.bounds_min.x,
+                spring.bounds_max.y - spring.bounds_min.y,
+                spring.bounds_max.z - spring.bounds_min.z);
+
     // CLUSTERED LIGHTING ON, because 60 lanterns is well past the point where
     // a forward pass can loop over every light for every fragment -- and
     // because without it the lights are in the scene and contribute nothing at
@@ -1625,6 +1664,20 @@ int main(int argc, char** argv) {
     bool ssao_on = ssao_start;
     bool shafts_on = shafts_start;
     bool bloom_on = bloom_start;
+    // The valley's water, not the tank's. The tank shades against a slate wall
+    // in a dark room; this sits outdoors under the same sky the atmosphere
+    // model is producing, so the horizon tint and the sun direction have to
+    // follow the scene rather than be constants.
+    eng::SurfaceLook water_look;
+    // SCALED WITH THE PARTICLES. The defaults are apps/fluid's, and that tank
+    // is half this basin in every dimension: its spacing is 0.034 m and this
+    // one's is 0.07. edge_stop is the bilateral smooth's "these two taps are
+    // different surfaces" threshold in metres -- below the particle spacing the
+    // sheet falls back apart into the individual spheres, which is exactly what
+    // the default did here. Above the spacing, and the basin's own stone starts
+    // bleeding into the water.
+    water_look.edge_stop = 0.11f;
+    water_look.sphere_radius = 0.58f;
     const bool local_shadows_on = local_shadows_start;
     int lamp_draws = 0, lamp_culled = 0;
     bool sparks_on = sparks_start;
@@ -1647,6 +1700,7 @@ int main(int argc, char** argv) {
     app->Actions().Bind("stop3", '3');
     app->Actions().Bind("stop4", '4');
     app->Actions().Bind("stop5", '5');
+    app->Actions().Bind("stop6", '6');
     app->Actions().Bind("reset", 'r');
     app->Actions().Bind("passes", 'p');
     app->Actions().Bind("bloom", 'b');
@@ -1718,11 +1772,16 @@ int main(int argc, char** argv) {
             // way to point at it at all.
             camera_pitch = std::clamp(camera_pitch - f.mouse_dy * 0.004f, -1.20f, 1.35f);
         }
-        camera_distance = std::clamp(camera_distance - f.scroll * 1.2f, 6.0f, 60.0f);
+        // 2.5 m, not 6. Six metres is a reasonable floor for following a
+        // character and it makes everything in the valley impossible to look
+        // AT: the spring's basin is three metres across, so at the old minimum
+        // it never filled more than a tenth of the frame, and --dist was
+        // silently clamped up every frame without saying so.
+        camera_distance = std::clamp(camera_distance - f.scroll * 1.2f, 2.5f, 60.0f);
         // 0 goes back to the character, 1-5 to the districts.
-        static const char* kStopAction[6] = {"stop0", "stop1", "stop2",
-                                            "stop3", "stop4", "stop5"};
-        for (int k = 0; k < 6; ++k)
+        static const char* kStopAction[7] = {"stop0", "stop1", "stop2", "stop3",
+                                            "stop4", "stop5", "stop6"};
+        for (int k = 0; k < 7; ++k)
             if (app->Actions().Pressed(kStopAction[k])) goto_stop = k;
         if (app->Actions().Pressed("fog")) post->config.fog = !post->config.fog;
         if (app->Actions().Pressed("taa")) post->config.taa = !post->config.taa;
@@ -1787,6 +1846,7 @@ int main(int argc, char** argv) {
             {"glass pavilion", world::kGlassPavilion},
             {"fire pit", world::kFirePit},
             {"the banner", world::kFlag},
+            {"the spring", world::kSpring},
         };
         constexpr int kStops = int(sizeof(kStopList) / sizeof(kStopList[0]));
         if (goto_stop >= 0 && goto_stop < kStops) {
@@ -2668,6 +2728,84 @@ int main(int argc, char** argv) {
                 app->Gpu().EndCompute();
             }
         }
+        water_look.sun_dir = eng::Vec3{sky.sun_direction.x, sky.sun_direction.y,
+                                       sky.sun_direction.z};
+        water_look.sky_horizon = eng::Vec3{scene.ambientSky.x, scene.ambientSky.y,
+                                           scene.ambientSky.z};
+
+        // --- the water -------------------------------------------------------
+        //
+        // SCREEN-SPACE, in four passes, and the order is forced by what each
+        // one reads: instanced spheres into a depth buffer of the water ALONE,
+        // a separable bilateral smooth that turns those beads into one sheet,
+        // then the optics -- fresnel sky reflection, background refraction and
+        // a sun glint -- shaded from the smoothed sheet's screen-space normals.
+        //
+        // The water gets its OWN depth buffer and not the scene's. Sharing one
+        // was tried in apps/fluid and it bakes the world into the surface: the
+        // smoother cannot tell a sphere from a kerb, so the whole basin shades
+        // as water. What the shade pass DOES need from the scene is its depth,
+        // to know when a sphere is behind something -- and that is the resolved
+        // depth the scene pass now produces, which did not exist until the
+        // prepass was deleted. This district is only affordable because of it.
+        if (!water_surface->BeginFrame(app->Gpu(), rw, rh, error))
+            return Fail(error);
+        const eng::rhi::TextureId watered = scene_targets.Hdr("watered");
+        // BOUND BY VALUE, before the reassignment below. The pass lambdas
+        // capture by reference and run inside graph.Execute, long after
+        // `composited` has been pointed at `watered` -- so a shade pass that
+        // read `composited` would read the target it is writing, and the frame
+        // comes out black.
+        const eng::rhi::TextureId dry = composited;
+        {
+            eng::RenderGraph::Pass p;
+            p.name = "waterdepth";
+            p.depth = water_surface->Depth();
+            p.clear_depth = 0.0f;
+            p.keep_depth = true;
+            // Not "water": the compute encoder that steps the solver has that
+            // name, and two rows with one label in a profile is worse than none.
+            p.timer = "waterdepth";
+            p.execute = [&](eng::rhi::Encoder& e) {
+                water_surface->DrawDepth(e, *water, scene.camera, water_look, rw, rh);
+            };
+            graph.AddPass(p);
+        }
+        {
+            eng::RenderGraph::Pass p;
+            p.name = "watersmoothh";
+            p.color = water_surface->SmoothH();
+            p.reads = {water_surface->Depth()};
+            p.execute = [&](eng::rhi::Encoder& e) {
+                water_surface->SmoothH(e, scene.camera, water_look, rw, rh);
+            };
+            graph.AddPass(p);
+        }
+        {
+            eng::RenderGraph::Pass p;
+            p.name = "watersmoothv";
+            p.color = water_surface->Smooth();
+            p.reads = {water_surface->SmoothH()};
+            p.execute = [&](eng::rhi::Encoder& e) {
+                water_surface->SmoothV(e, scene.camera, water_look, rw, rh);
+            };
+            graph.AddPass(p);
+        }
+        {
+            eng::RenderGraph::Pass p;
+            p.name = "watershade";
+            p.color = watered;
+            p.reads = {dry, depth, water_surface->Smooth()};
+            p.timer = "watershade";
+            p.execute = [&, dry](eng::rhi::Encoder& e) {
+                water_surface->DrawShade(e, scene.camera, water_look, rw, rh,
+                                         dry, depth);
+            };
+            graph.AddPass(p);
+        }
+        // Everything downstream reads the watered image, not the dry one.
+        composited = watered;
+
         // --- bloom ---------------------------------------------------------
         //
         // THE ENGINE HAD IT AND THE VALLEY NEVER RAN IT. DrawComposite was
@@ -2742,6 +2880,13 @@ int main(int argc, char** argv) {
         // its own vertex stage. One compute encoder and one palette upload a
         // frame, for nothing. The engine keeps the entry point -- ray-traced
         // shadows from a posed mesh need it, and tests/skinned covers that.
+        // THE FLUID, outside the graph for the fourth time and the same reason:
+        // it writes particle BUFFERS and the graph orders passes by textures.
+        {
+            auto e = app->Gpu().BeginCompute("water");
+            (void)water->Step(e, dt);
+            app->Gpu().EndCompute();
+        }
         // BINNING, outside the graph for the same reason the exposure meter is:
         // it writes BUFFERS, and the graph orders passes by the textures they
         // write. Before the scene pass, not after -- unlike the meter, this

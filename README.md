@@ -19,7 +19,7 @@ bazel test //...
 
 `-c opt` is not optional; the demo is an order of magnitude slower without it.
 Left-click to walk, `wasd` to move (`space` to run), right-drag to orbit,
-scroll to zoom, `0`–`5` to fast-travel between districts, `[`/`]` to move the
+scroll to zoom, `0`–`6` to fast-travel between districts, `[`/`]` to move the
 sun, `f` fog, `t` TAA, `o` SSAO, `v` light shafts, `e`/`q` focus height,
 `r` reset, `esc` to quit. `--shot` renders a fixed number of frames offscreen
 to a PNG; `viewer.cpp` parses further capture flags (`--frames`, `--sun`,
