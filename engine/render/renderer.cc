@@ -314,6 +314,10 @@ struct Renderer::Impl {
         std::size_t capacity = 0;  // instances the buffers can hold
     };
     std::vector<Batch> batches;
+    // Grouping scratch, reused across frames so a steady-state cull allocates
+    // nothing -- the same standard `visible` is held to above.
+    std::vector<std::vector<std::pair<const Instance*, int>>> cull_groups;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> cull_keys;
     int live_batches = 0;
     int batched_instances = 0;
     // One byte per scene instance, set by the last CullScene: 1 when the
@@ -2542,8 +2546,15 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
         impl_->batched_instances = 0;
         return 0;
     };
-    std::vector<std::vector<std::pair<const Instance*, int>>> groups;
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> keys;
+    // REUSED ACROSS FRAMES, like `visible` twenty lines up in this same struct.
+    // These were locals: one outer vector plus one inner vector per batch,
+    // allocated and freed every frame -- 197 allocations a frame on the world's
+    // scene, for a list whose shape barely changes.
+    auto& groups = impl_->cull_groups;
+    auto& keys = impl_->cull_keys;
+    for (auto& g : groups) g.clear();
+    keys.clear();
+    std::size_t live_groups = 0;
     for (std::size_t n = 0; n < scene.instances.size(); ++n) {
         const Instance& inst = scene.instances[n];
         if (!Valid(inst.mesh) || inst.mesh.v >= impl_->meshes.size()) continue;
@@ -2559,12 +2570,13 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
             if (keys[i] == key) { at = i; break; }
         if (at == keys.size()) {
             keys.push_back(key);
-            groups.emplace_back();
+            if (groups.size() < keys.size()) groups.emplace_back();
+            ++live_groups;
         }
         groups[at].emplace_back(&inst, int(n));
         impl_->batched_mask[n] = 1;
     }
-    if (groups.empty()) return 0;
+    if (keys.empty()) return 0;
 
     const Mat4 viewProj = scene.camera.ViewProj(float(width) / float(height));
     const Frustum frustum = Frustum::FromViewProj(viewProj);
@@ -2598,7 +2610,7 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
             ? float(height) * 0.5f / std::max(scene.camera.orthoHeight, 1e-4f)
             : float(height) * 0.5f / std::tan(scene.camera.fovY * 0.5f);
 
-    for (std::size_t g = 0; g < groups.size(); ++g) {
+    for (std::size_t g = 0; g < live_groups; ++g) {
         if (impl_->batches.size() <= g) impl_->batches.emplace_back();
         Impl::Batch& b = impl_->batches[g];
         b.mesh = MeshHandle{keys[g].first};
@@ -2677,6 +2689,28 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
         // A SECOND dispatch to publish the counts. Writing them from inside the
         // cull kernel would race with the threads still counting -- the last
         // thread to increment is not the last thread to run.
+        //
+        // AND IT IS PER BATCH, which is the single biggest cost in this pass:
+        // 196 batches means 392 dispatches, each with its own pipeline bind,
+        // and the cull compute measures 1.91 ms at --crowd 600 and 2.58 ms at
+        // --crowd 6000 on a 2200x1520 frame. Merging the publish into one grid
+        // over every (batch, level) is the obvious halving and it was tried.
+        //
+        // IT PRODUCED A WRONG PICTURE and the cause was not found. Recorded so
+        // the next attempt starts from the reproduction rather than the idea:
+        // --crowd 600 --indirect renders at a mean of 53.3 against 63.3, with
+        // the batch and draw counts IDENTICAL, so the argument blocks are being
+        // published with wrong instance counts rather than the grouping being
+        // wrong. Moving the counters and arguments into one buffer per kind,
+        // indexed by batch and bound at an offset, is correct on its own -- the
+        // per-batch publish reading those same shared buffers is byte-identical
+        // to this. Ringing them by frame slot, which they are NOT and should
+        // be, did not fix the merge and broke the per-batch version too, so the
+        // offset arithmetic in that attempt was wrong somewhere.
+        //
+        // The frames-in-flight hole is real and outlives this note: b.instances
+        // is CPU-written every frame with no ring at all, so the frame being
+        // encoded shares it with up to two still running.
         enc.SetPipeline(impl_->cull_finish_pipeline);
         enc.SetBuffer(b.counter, 0, 0);
         enc.SetBuffer(b.args, 0, 1);
@@ -2685,7 +2719,7 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
 
         impl_->batched_instances += int(need);
     }
-    impl_->live_batches = int(groups.size());
+    impl_->live_batches = int(live_groups);
     return impl_->live_batches;
 }
 
