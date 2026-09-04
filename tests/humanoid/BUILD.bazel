@@ -1,0 +1,17 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# The generated character. No GPU: a skeleton, a vertex buffer and a set of
+# curves are all arithmetic, and a rig fails in ways that are unmistakable on
+# screen and impossible to describe afterwards.
+cc_test(
+    name = "humanoid_test",
+    size = "small",
+    srcs = ["main.cpp"],
+    deps = [
+        "//apps/world:humanoid",
+        "//engine/anim",
+        "//engine/core",
+    ],
+)

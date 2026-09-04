@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -6,10 +6,26 @@ package(default_visibility = ["//visibility:public"])
 # failures are BETWEEN systems -- the navmesh and the collider disagreeing about
 # where the ground is, the sky and the fog disagreeing about the distance -- and
 # none of those is visible in a demo that has only one of the two.
+# The character, split out so a test can build it without a GPU. Everything in
+# it is arithmetic -- a skeleton, a vertex buffer and a set of curves -- and a
+# rig whose bind pose is wrong is far cheaper to catch here than by looking at
+# a screenshot of a body turned inside out.
+cc_library(
+    name = "humanoid",
+    hdrs = ["humanoid.h"],
+    deps = [
+        "//engine/anim",
+        "//engine/core",
+        "//engine/geometry",
+    ],
+)
+
 cc_binary(
     name = "world",
     srcs = ["districts.h", "viewer.cpp"],
     deps = [
+        ":humanoid",
+        "//engine/anim",
         "//engine/app",
         "//engine/asset:png",
         "//engine/asset:texgen",

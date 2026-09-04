@@ -33,6 +33,10 @@
 #include "engine/render/volumetric.h"
 #include "engine/geometry/terrain.h"
 #include "engine/geometry/tree.h"
+#include "apps/world/humanoid.h"
+#include "engine/anim/anim.h"
+#include "engine/anim/blend.h"
+#include "engine/anim/ik.h"
 #include "engine/nav/navmesh.h"
 #include "engine/physics/character.h"
 #include "engine/physics/physics.h"
@@ -143,6 +147,8 @@ int main(int argc, char** argv) {
     // the haze has to leave the trees in it.
     float shaft_ext = 0.004f;
     int tour_start = 0;
+    float headless_walk = 0.0f, headless_heading = 0.0f;
+    bool no_foot_ik = false;
     float pitch_start = 0.26f;
     float focus_start = 1.0f;
     float dist_start = 0.0f;  // 0 = whatever the stop chooses
@@ -195,6 +201,14 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--noshafts") == 0) shafts_start = false;
         else if (std::strcmp(argv[i], "--shaft") == 0 && i + 1 < argc)
             shaft_ext = float(std::atof(argv[++i]));
+        else if (std::strcmp(argv[i], "--noik") == 0)
+            no_foot_ik = true;
+        else if (std::strcmp(argv[i], "--walk") == 0)
+            headless_walk = world::kWalkSpeed;
+        else if (std::strcmp(argv[i], "--run") == 0)
+            headless_walk = world::kRunSpeed;
+        else if (std::strcmp(argv[i], "--heading") == 0 && i + 1 < argc)
+            headless_heading = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--look") == 0 && i + 1 < argc)
             tour_start = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--pitch") == 0 && i + 1 < argc)
@@ -1049,18 +1063,76 @@ int main(int argc, char** argv) {
                 scene.lights.size());
 
     // --- the character -------------------------------------------------------
+    //
+    // A skinned figure, generated the way everything else here is. It replaced
+    // an orange sphere, and the sphere was hiding more than it looked like: a
+    // sphere has no feet, so nothing in this demo had ever had to agree with
+    // the ground at a point rather than on average, and it has no gait, so the
+    // character's speed had never had to be a speed a body could move at.
+    const eng::anim::Skeleton skeleton = world::BuildHumanSkeleton();
+    const world::HumanBody figure = world::BuildHumanBody(skeleton);
+    const eng::anim::Clip clip_idle = world::MakeIdle();
+    const eng::anim::Clip clip_walk = world::MakeGait("walk", world::kWalkGait);
+    const eng::anim::Clip clip_run = world::MakeGait("run", world::kRunGait);
     const eng::MeshHandle capsule_mesh = app->Draw().UploadMesh(
         eng::MakeUVSphere(0.45f, 16, 20, eng::Vec4{1, 1, 1, 1}, eng::Vec4{1, 1, 1, 1}));
+    const eng::MeshHandle figure_mesh = app->Draw().UploadSkinnedMesh(
+        figure.mesh, figure.skin, world::kHumanJoints);
+    if (!eng::Valid(figure_mesh)) return Fail("skinned upload");
     eng::MaterialDesc body_md;
     body_md.shading = eng::Shading::Lit;
-    body_md.base_color = eng::Vec4{0.92f, 0.35f, 0.22f, 1.0f};
-    body_md.roughness = 0.4f;
+    // WHITE, because the mesh's vertex colours already carry the cloth and the
+    // skin. A base colour here would multiply into both and turn the face the
+    // colour of the coat.
+    body_md.base_color = eng::Vec4{1.0f, 1.0f, 1.0f, 1.0f};
+    body_md.roughness = 0.72f;
     const eng::MaterialHandle body_mat = app->Draw().CreateMaterial(body_md, error);
     eng::Instance body;
-    body.mesh = capsule_mesh;
+    body.mesh = figure_mesh;
     body.material = body_mat;
     const std::size_t body_instance = scene.instances.size();
     scene.instances.push_back(body);
+
+    eng::anim::Animator animator(skeleton);
+    eng::anim::StateDesc idle_state;
+    idle_state.name = "idle";
+    idle_state.clip = &clip_idle;
+    idle_state.blend_in = 0.25f;
+    const int state_idle = animator.AddState(idle_state);
+    // A BLEND SPACE RATHER THAN TWO STATES. A character at 2 m/s is genuinely
+    // between a walk and a run, and crossfading between them only looks right
+    // at the instant of the switch. The samples sit at the speeds the clips
+    // actually travel at, measured in tests/humanoid -- put them anywhere else
+    // and the legs cycle at one speed while the body moves at another.
+    eng::anim::BlendSpaceDesc loco;
+    loco.name = "locomotion";
+    loco.samples = {{&clip_walk, world::kWalkSpeed, 1.0f},
+                    {&clip_run, world::kRunSpeed, 1.0f}};
+    loco.synchronise = true;
+    loco.blend_in = 0.2f;
+    const int state_loco = animator.AddBlendSpace(loco);
+    animator.PlayImmediate(state_idle);
+    int animator_state = state_idle;
+    float facing = 0.0f;  // radians about +Y; the figure is modelled facing +Z
+
+    // Foot IK, one config per leg. The pole points FORWARD, which is the way a
+    // knee bends; without it the solver has a whole circle of solutions and the
+    // usual fallback -- keep the current bend -- flips every time the leg
+    // passes through straight, snapping the knee backwards once per step.
+    const bool foot_ik = !no_foot_ik;
+    eng::anim::FootIkConfig ik_left, ik_right;
+    ik_left.limb.root = world::kThighL;
+    ik_left.limb.mid = world::kShinL;
+    ik_left.limb.end = world::kFootL;
+    ik_left.limb.pole = eng::Vec3{0.0f, 0.0f, 1.0f};
+    ik_left.limb.max_extension = 0.985f;
+    ik_left.ankle_to_sole = eng::Vec3{0.0f, -0.09f, 0.0f};
+    ik_right = ik_left;
+    ik_right.limb.root = world::kThighR;
+    ik_right.limb.mid = world::kShinR;
+    ik_right.limb.end = world::kFootR;
+    const std::initializer_list<const eng::anim::FootIkConfig*> kBothFeet{&ik_left, &ik_right};
+    const std::initializer_list<const eng::anim::FootIkConfig*> kNoFeet{};
 
     // A marker at the destination, so a click has visible feedback even before
     // the character starts moving.
@@ -1532,10 +1604,26 @@ int main(int argc, char** argv) {
                 // forget about.
                 path.clear();
                 path_at = 0;
-                const float speed = app->Actions().Down("run") ? 11.0f : 4.5f;
+                // THE GAITS' OWN SPEEDS, not a number that felt right. These
+                // were 4.5 and 11 m/s, which are a sphere's speeds -- 11 m/s is
+                // faster than a person has ever run -- and they were invisible
+                // because the character was a sphere. With legs on it, any
+                // speed that is not the one the clip travels at shows up
+                // immediately as the feet skating.
+                const float speed =
+                    app->Actions().Down("run") ? world::kRunSpeed : world::kWalkSpeed;
                 wish = walk * (speed / len);
             }
         }
+        // HEADLESS LOCOMOTION. Capture mode has no keyboard, so without this
+        // the only pose that can ever be photographed is the idle -- and a walk
+        // cycle is exactly the thing that has to be looked at, not just
+        // measured. Drives the same `wish` the keys do, so it exercises the
+        // blend space, the turn rate and the foot IK rather than a shortcut
+        // past them.
+        if (headless_walk != 0.0f)
+            wish = eng::Vec3{std::sin(headless_heading), 0.0f, std::cos(headless_heading)} *
+                   headless_walk;
         if (wish.x == 0.0f && wish.z == 0.0f && path_at < path.size()) {
             const eng::Vec3 target = path[path_at];
             eng::Vec3 to{target.x - player.Feet().x, 0.0f, target.z - player.Feet().z};
@@ -1546,7 +1634,7 @@ int main(int argc, char** argv) {
             if (distance < cc.radius + 0.15f) {
                 ++path_at;
             } else {
-                wish = to * (1.0f / distance) * 4.5f;
+                wish = to * (1.0f / distance) * world::kRunSpeed;
             }
         }
         const float dt = std::min(f.dt, 0.05f);
@@ -1585,8 +1673,103 @@ int main(int argc, char** argv) {
         }
         player.Move(world, eng::Vec3{wish.x * dt, fall_speed * dt, wish.z * dt});
 
-        scene.instances[body_instance].model =
-            eng::Mat4::Translation(player.Feet() + eng::Vec3{0.0f, 0.9f, 0.0f});
+        // --- posing the character ---------------------------------------------
+        {
+            const float ground_speed = eng::Length(eng::Vec3{wish.x, 0.0f, wish.z});
+            // Face the way you are going, turning at a rate rather than
+            // snapping: a character who changes facing in one frame reads as a
+            // sprite being flipped.
+            if (ground_speed > 0.05f) {
+                const float want = std::atan2(wish.x, wish.z);
+                float delta = want - facing;
+                // Through the short way round. Without this a turn from +179 to
+                // -179 degrees spins the character all the way about.
+                while (delta > world::kPi) delta -= 2.0f * world::kPi;
+                while (delta < -world::kPi) delta += 2.0f * world::kPi;
+                facing += delta * std::min(1.0f, dt * 9.0f);
+            }
+            const int want_state = ground_speed > 0.12f ? state_loco : state_idle;
+            // Only on a CHANGE. Play() starts a fade, so calling it every frame
+            // restarts the fade every frame and the blend never completes --
+            // the character is permanently 20% into a transition.
+            if (want_state != animator_state) {
+                animator.Play(want_state);
+                animator_state = want_state;
+            }
+            animator.SetParameter(ground_speed);
+            animator.Update(dt);
+
+            const eng::Mat4 to_world = eng::Mat4::Translation(player.Feet()) *
+                                       eng::Mat4::RotationY(facing);
+            eng::anim::Pose pose = animator.CurrentPose();
+
+            // FOOT IK, which is the reason this demo is the right place for a
+            // character: the ground here is never flat. Without it both feet
+            // sit at the height the clip drew them, so on a slope one hovers
+            // and the other is buried, and the error is exactly the thing the
+            // eye uses to judge whether someone is standing on the ground.
+            //
+            // The ground query is the terrain function rather than a raycast:
+            // it is exact, it costs nothing, and the collider is built from the
+            // same heights, so the foot cannot disagree with what the character
+            // is standing on.
+            if (foot_ik) {
+                // GATED ON CONTACT, and iterated with the hip drop.
+                //
+                // Full-weight IK on both feet every frame does not work. At the
+                // extreme of a stride the swing leg is nearly straight and its
+                // foot is at its farthest forward, so dragging it down to the
+                // ground asks for more leg than there is; the solver refuses to
+                // stretch a bone, correctly, and both feet end up reaching for
+                // the floor and never arriving. It measured 118 mm off. On
+                // screen it read as the legs having collapsed into sticks,
+                // which is a different fault and would have been hunted
+                // somewhere else entirely -- see tests/humanoid, which says
+                // which of the three possible causes it is in three numbers.
+                //
+                // The weights come from the ANIMATED pose, before any solving,
+                // so that a foot's contact does not depend on what the IK did
+                // to the other one.
+                std::vector<eng::Mat4> jw;
+                eng::anim::ComputeJointWorld(skeleton, pose, &jw);
+                eng::anim::FootIkConfig cfg[2] = {ik_left, ik_right};
+                eng::anim::GroundHit hit[2];
+                for (int i = 0; i < 2; ++i) {
+                    const eng::Mat4 ankle = to_world * jw[std::size_t(cfg[i].limb.end)];
+                    const eng::Vec4 sole = ankle * eng::Vec4{world::kAnkleToSole.x,
+                                                             world::kAnkleToSole.y,
+                                                             world::kAnkleToSole.z, 1.0f};
+                    const float ground = terrain.HeightAt(sole.x, sole.z);
+                    hit[i].hit = true;
+                    hit[i].point = eng::Vec3{sole.x, ground, sole.z};
+                    hit[i].normal = terrain.NormalAt(sole.x, sole.z);
+                    cfg[i].limb.weight = world::FootPlantWeight(sole.y - ground);
+                }
+                // Three passes. Lowering the pelvis by the shortfall changes
+                // the geometry, so each solve asks for a little less and the
+                // residual falls off geometrically: 32 mm to 4 mm by the third,
+                // where one pass alone leaves 12. The drop has to be applied
+                // BEFORE the solve that needs the reach -- doing it afterwards,
+                // which is the obvious reading of "the caller applies it",
+                // moves the foot further from the ground it just failed to
+                // touch.
+                for (int pass = 0; pass < 3; ++pass) {
+                    float drop = 0.0f;
+                    for (int i = 0; i < 2; ++i)
+                        drop = std::min(drop, eng::anim::SolveFootIk(skeleton, cfg[i],
+                                                                     to_world, hit[i], &pose));
+                    // BOTH FEET DECIDE THE HIPS: with one foot on a rock and
+                    // the other on the ground, the pelvis has to come down to
+                    // the lower of the two or the higher leg locks straight.
+                    if (drop >= -1e-4f) break;
+                    pose.local[world::kPelvis].translation.y += drop;
+                }
+            }
+
+            eng::anim::ComputeJointMatrices(skeleton, pose, &scene.joint_matrices);
+            scene.instances[body_instance].palette = 0;
+            scene.instances[body_instance].model = to_world;
+        }
         if (path_at < path.size()) {
             scene.instances[marker_instance].model =
                 eng::Mat4::Translation(path.back() + eng::Vec3{0.0f, 0.45f, 0.0f}) *
@@ -1705,9 +1888,14 @@ int main(int argc, char** argv) {
         ui->Text(26, 50, line,
                  gi_stale ? eng::Vec4{1.0f, 0.72f, 0.35f, 1.0f}
                           : eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
-        std::snprintf(line, sizeof(line), "path: %zu points, at %zu   ground %.2f m",
-                      path.size(), path_at, terrain.HeightAt(player.Feet().x,
-                                                             player.Feet().z));
+        // FEET ABOVE GROUND, because a character floating a hand's width over
+        // the terrain is nearly invisible in a screenshot and unmistakable as a
+        // number. It should be within a millimetre or two of the contact skin.
+        std::snprintf(line, sizeof(line),
+                      "path: %zu points, at %zu   ground %.2f m   feet %+.3f m",
+                      path.size(), path_at,
+                      terrain.HeightAt(player.Feet().x, player.Feet().z),
+                      player.Feet().y - terrain.HeightAt(player.Feet().x, player.Feet().z));
         ui->Text(26, 74, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
         std::snprintf(line, sizeof(line),
                       "gpu %.2f ms  fog %s  taa %s  ao %s  exposure %.2f (%+.1f EV)  %s",
