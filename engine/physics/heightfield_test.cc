@@ -227,6 +227,75 @@ int main() {
     }
 
     {
+        std::printf("\na standing character stands still\n");
+        // THE INVARIANT world2 now depends on, after its character was found
+        // bouncing 14 mm forever while apparently at rest -- feet.y alternating
+        // between -5.609918 and -5.623887 for as long as the demo ran. The
+        // camera was attached to it, so what anyone saw was the PICTURE
+        // flickering: 0.68% of pixels changed between two consecutive frames of
+        // a completely still shot, some by three quarters of the range.
+        //
+        // IT IS NOT REPRODUCED HERE, and that is worth writing down rather than
+        // hiding. Two mechanisms were tried and neither did it on this field: a
+        // step longer than the skin, and the caller's 9.81 * dt * dt * 6 with a
+        // frame time that jitters. Both come out under a hundredth of a
+        // millimetre below. world2's terrain is four octaves of noise in a bowl
+        // and this one is smooth, so the trigger is very likely a particular
+        // slope or triangle boundary that this field does not have.
+        //
+        // What IS established is the property the fix relies on, and it is the
+        // one worth guarding: a constant ground stick holds the character
+        // exactly still. If that ever stops being true, every camera attached
+        // to a character starts shaking.
+        eng::physics::World world;
+        eng::physics::Body ground;
+        ground.shape = eng::physics::Shape::MakeHeightfield(field);
+        ground.inverse_mass = 0.0f;
+        world.Add(ground);
+
+        // world2's numbers exactly, because a controller can behave differently
+        // at a different radius or step height.
+        eng::physics::CharacterConfig cc;
+        cc.radius = 0.4f;
+        cc.height = 1.8f;
+        cc.slope_limit_degrees = 45.0f;
+        cc.step_height = 0.4f;
+        eng::physics::CharacterController player(cc);
+        player.Teleport(Vec3{0.0f, field->HeightAt(0.0f, 0.0f) + 0.5f, 0.0f});
+
+        const auto swing = [&](float stick, int frames) {
+            float lo = 1e30f, hi = -1e30f;
+            for (int i = 0; i < frames; ++i) {
+                player.Move(world, Vec3{0.0f, -stick, 0.0f});
+                lo = std::min(lo, player.Feet().y);
+                hi = std::max(hi, player.Feet().y);
+            }
+            return hi - lo;
+        };
+        swing(cc.skin * 0.5f, 60);  // settle
+        const float inside = swing(cc.skin * 0.5f, 200);
+        std::printf("    ground stick %.1f mm, held for 200 frames: moves %.4f mm\n",
+                    double(cc.skin * 0.5f * 1000.0f), double(inside * 1000.0f));
+        // EXACTLY still, not nearly. A tenth of a millimetre of creep per frame
+        // is 20 mm over a walk across the map, and it is a camera that never
+        // stops drifting.
+        Check(inside == 0.0f, "a constant ground stick leaves it exactly where it is");
+
+        // AND IT DOES NOT CREEP SIDEWAYS either. A purely vertical push that
+        // produces horizontal motion means the contact normal is being applied
+        // asymmetrically, and the character slides off a flat surface on its
+        // own -- which is the same class of bug seen from a different axis.
+        const Vec3 before = player.Feet();
+        swing(cc.skin * 0.5f, 200);
+        const Vec3 after = player.Feet();
+        const float drift = std::sqrt((after.x - before.x) * (after.x - before.x) +
+                                      (after.z - before.z) * (after.z - before.z));
+        std::printf("    and drifts %.4f mm horizontally over another 200\n",
+                    double(drift * 1000.0f));
+        Check(drift == 0.0f, "and does not slide across a surface it is resting on");
+    }
+
+    {
         std::printf("\noverlap queries find the terrain\n");
         eng::physics::World world;
         eng::physics::Body ground;

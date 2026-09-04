@@ -101,12 +101,19 @@ int main(int argc, char** argv) {
     std::string shot_path;
     int shot_frames = 12;
     bool start_fog = true;
+    // For measuring temporal aliasing. Two captures a fraction of a pixel apart
+    // should differ by a fraction of a pixel's worth of colour; anything that
+    // flips hard under a sub-pixel move is aliasing, and that is the only way
+    // to separate shimmer from honest motion.
+    float yaw_offset = 0.0f;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc)
             shot_path = argv[++i];
         else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
             shot_frames = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--nofog") == 0) start_fog = false;
+        else if (std::strcmp(argv[i], "--yaw") == 0 && i + 1 < argc)
+            yaw_offset = float(std::atof(argv[++i]));
     }
 
     // LINE BUFFERED. Redirected to a file, stdout is fully buffered, and a
@@ -642,6 +649,19 @@ int main(int argc, char** argv) {
     // a stop down puts the sun side where it reads as grass.
     post->config.exposure_compensation = -0.5f;
     app->Draw().SetExposureBuffer(post->ExposureBuffer());
+    // TEMPORAL ANTIALIASING. 4x MSAA resolves EDGES, and this forest is not
+    // made of edges -- it is two hundred trees of branches thinner than a pixel
+    // at any distance. MSAA gives a pixel four coverage samples, so a branch
+    // covering an eighth of it either lands on one or does not, and which way
+    // that goes changes as the camera moves. Measured: a QUARTER PIXEL of
+    // camera yaw flips 0.014% of pixels by more than a third of the range, and
+    // they are in the canopy 103 to 1 over the ground. That is the sparkle.
+    //
+    // TAA jitters the sample point within the pixel each frame and averages
+    // over the history, so a branch that covers an eighth of a pixel
+    // contributes an eighth of the time and converges to an eighth of the
+    // colour. It is the only thing that fixes geometry finer than a sample.
+    post->config.taa = true;
     post->config.fog = start_fog;
     post->config.fog_density = 0.0055f;
     post->config.fog_height_falloff = 0.035f;
@@ -649,17 +669,20 @@ int main(int argc, char** argv) {
 
     std::vector<eng::Vec3> path;
     std::size_t path_at = 0;
+    float fall_speed = 0.0f;
         // PITCHED DOWN 17 DEGREES, NOT 31. At 0.55 rad the camera looks at the
     // ground: the frame was all terrain, no horizon, no canopy and no sky, and
     // a scene photographed straight down has nothing in it to judge the light
     // by. Looking ACROSS the clearing puts the treeline and the sky in frame,
     // which is what the trees were added for.
-    float camera_yaw = 0.7f, camera_pitch = 0.26f, camera_distance = 13.0f;
+    float camera_yaw = 0.7f + yaw_offset, camera_pitch = 0.26f,
+          camera_distance = 13.0f;
     float baked_az = 1e9f, baked_el = 1e9f;
 
     app->Actions().BindMouse("click", eng::app::MouseButton::Left);
     app->Actions().BindMouse("orbit", eng::app::MouseButton::Right);
     app->Actions().Bind("fog", 'f');
+    app->Actions().Bind("taa", 't');
     app->Actions().Bind("reset", 'r');
 
     eng::RenderGraph graph;
@@ -677,6 +700,7 @@ int main(int argc, char** argv) {
         }
         camera_distance = std::clamp(camera_distance - f.scroll * 1.2f, 6.0f, 60.0f);
         if (app->Actions().Pressed("fog")) post->config.fog = !post->config.fog;
+        if (app->Actions().Pressed("taa")) post->config.taa = !post->config.taa;
         if (app->Actions().Pressed("reset")) {
             player.Teleport(eng::Vec3{0.0f, terrain.HeightAt(0.0f, 0.0f) + 0.5f, 0.0f});
             path.clear();
@@ -733,7 +757,44 @@ int main(int argc, char** argv) {
             }
         }
         const float dt = std::min(f.dt, 0.05f);
-        player.Move(world, eng::Vec3{wish.x * dt, -9.81f * dt * dt * 6.0f, wish.z * dt});
+
+        // A CONSTANT GROUND STICK, not a gravity term recomputed from dt.
+        //
+        // This used to push the character down by 9.81 * dt * dt * 6 every
+        // frame -- 16.3 mm at 60 Hz, and a different distance whenever the
+        // frame time changed, because it goes as the SQUARE of it. The
+        // character never came to rest: measured at feet.y alternating between
+        // -5.609918 and -5.623887 for as long as the demo ran, a 14 mm bounce
+        // that never decayed.
+        //
+        // The camera is rigidly attached to the character, so that went
+        // straight into the view matrix. What it looked like was the PICTURE
+        // flickering, not a physics bug -- 0.68% of pixels changed between two
+        // consecutive frames of a completely still shot, some by three quarters
+        // of the range, because a 14 mm camera judder against branches a pixel
+        // wide flips them on and off. After this it is 0.011%, and all of that
+        // is the exposure readout in the HUD.
+        //
+        // WHY IT OSCILLATED IS NOT SETTLED. Two mechanisms were tried in
+        // heightfield_test -- a step longer than the controller's 15 mm skin,
+        // and the dt-squared jitter -- and neither reproduces it on a smooth
+        // field; both come out under a hundredth of a millimetre. This terrain
+        // is four octaves of noise in a bowl, so it is probably a particular
+        // slope this test does not have. What is established, and tested, is
+        // that a CONSTANT stick holds the character exactly still.
+        //
+        // A grounded character does not need to accelerate downward anyway. It
+        // needs just enough push to stay glued to a slope it walks down, and
+        // that wants to be inside the skin so there is nothing to resolve.
+        if (player.Grounded()) {
+            fall_speed = -cc.skin * 0.5f / std::max(dt, 1e-4f);
+        } else {
+            fall_speed -= 9.81f * dt;
+            // Terminal velocity, so a long fall cannot produce a step longer
+            // than the capsule and tunnel through the ground.
+            fall_speed = std::max(fall_speed, -55.0f);
+        }
+        player.Move(world, eng::Vec3{wish.x * dt, fall_speed * dt, wish.z * dt});
 
         scene.instances[body_instance].model =
             eng::Mat4::Translation(player.Feet() + eng::Vec3{0.0f, 0.9f, 0.0f});
@@ -777,7 +838,14 @@ int main(int argc, char** argv) {
             baked_az = sun_azimuth;
             baked_el = sun_elevation;
         }
+        // JITTER, TWICE. BeginFrame advances the sequence and also builds the
+        // previous-frame matrices from the camera it is handed, so the camera
+        // needs this frame's offset going in and the next one coming out.
+        // Without it TAA is a pure blur -- every frame samples the same points
+        // and averaging them recovers nothing.
+        scene.camera.jitter = post->Jitter();
         post->BeginFrame(scene.camera, f.width, f.height, dt);
+        scene.camera.jitter = post->Jitter();
 
         // --- HUD ----------------------------------------------------------------
         ui->Begin(f.width, f.height);
@@ -793,15 +861,16 @@ int main(int argc, char** argv) {
                                                              player.Feet().z));
         ui->Text(26, 50, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
         std::snprintf(line, sizeof(line),
-                      "gpu %.2f ms   fog %s   exposure %.2f (%+.1f EV)   %s",
+                      "gpu %.2f ms   fog %s   taa %s   exposure %.2f (%+.1f EV)   %s",
                       app->Gpu().LastFrameGpuMilliseconds(),
-                      post->config.fog ? "on" : "off", post->LastExposure(),
+                      post->config.fog ? "on" : "off",
+                      post->config.taa ? "on" : "off", post->LastExposure(),
                       std::log2(std::max(post->LastExposure(), 1e-6f)),
                       player.Grounded() ? "grounded" : "airborne");
         ui->Text(26, 74, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
         ui->Text(26, 104, "click: walk there    right-drag: orbit    scroll: zoom",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
-        ui->Text(26, 128, "f: fog    r: reset",
+        ui->Text(26, 128, "f: fog    t: taa    r: reset",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
 
         // --- passes --------------------------------------------------------------
@@ -871,14 +940,32 @@ int main(int argc, char** argv) {
             p.execute = [&](eng::rhi::Encoder& e) { post->DrawFog(e, depth); };
             graph.AddPass(p);
         }
+        eng::rhi::TextureId composited = color;
+        if (post->config.taa) {
+            // Velocity first: the resolve needs to know where each pixel was
+            // last frame, or a moving camera smears everything it passes.
+            graph.AddCompute("velocity", {post->Velocity()},
+                             [&](eng::rhi::ComputeEncoder& e) {
+                                 post->ComputeVelocity(e, depth);
+                             },
+                             "velocity");
+            eng::RenderGraph::Pass p;
+            p.name = "taa";
+            p.color = post->Output();
+            p.reads = {color, post->Velocity()};
+            p.timer = "taa";
+            p.execute = [&](eng::rhi::Encoder& e) { post->DrawTaa(e, color); };
+            graph.AddPass(p);
+            composited = post->Output();
+        }
         {
             eng::RenderGraph::Pass p;
             p.name = "composite";
             p.color = shot_path.empty() ? f.drawable : shot_target;
-            p.reads = {color};
+            p.reads = {composited};
             p.timer = "composite";
             p.execute = [&](eng::rhi::Encoder& e) {
-                app->Draw().DrawComposite(e, color);
+                app->Draw().DrawComposite(e, composited);
                 ui->Draw(e);
             };
             graph.AddPass(p);
@@ -904,9 +991,13 @@ int main(int argc, char** argv) {
         }
         post->EndFrame();
         app->EndFrame();
+        // Every frame during a capture, because the two things most likely to
+        // be wrong in a screenshot are an exposure that has not settled and a
+        // camera that is not where it was asked to be.
         if (!shot_path.empty())
-            std::printf("  frame %2d  exposure %.4f\n", int(f.index),
-                        post->LastExposure());
+            std::printf("  frame %3d  exposure %.4f  eye %.6f %.6f %.6f\n",
+                        int(f.index), post->LastExposure(), scene.camera.eye.x,
+                        scene.camera.eye.y, scene.camera.eye.z);
 
         if (!shot_path.empty() && int(f.index) >= shot_frames) {
             std::vector<std::uint8_t> px(std::size_t(f.width) * f.height * 4);
