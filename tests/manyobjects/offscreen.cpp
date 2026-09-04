@@ -211,6 +211,17 @@ int main() {
     // the cull below would be measuring nothing.
     Check(cpu_stats.culled > 1000, "a good fraction of the scene is offscreen");
 
+    // WHO WENT INTO A BATCH. The world app draws the remainder -- skinned,
+    // transparent -- the ordinary way, and WasBatched is how it knows who
+    // that is. Here everything is opaque, so the mask is all ones; the
+    // exclusions are covered by the same filter CullScene always had, and
+    // what this pins is the bookkeeping: every index set, nothing else.
+    bool all_batched = true;
+    for (int i = 0; i < kObjects; ++i) all_batched &= r->WasBatched(i);
+    Check(all_batched, "every opaque instance reports batched");
+    Check(!r->WasBatched(-1) && !r->WasBatched(kObjects),
+          "out of range reports not batched");
+
     // WHAT THE CULL KEPT. Not observable from the picture: a cull that keeps
     // everything draws exactly the same frame, because the instances it should
     // have dropped are off screen and rasterise nothing. Only the count says

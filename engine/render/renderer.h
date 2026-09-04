@@ -426,6 +426,11 @@ class Renderer {
     // The pair is the whole point: 5000 and 3.
     [[nodiscard]] int LastBatchCount() const;
     [[nodiscard]] int LastInstanceCount() const;
+    // Whether scene instance `instance_index` went into a batch in the last
+    // CullScene. False for everything the indirect path excludes -- skinned,
+    // transparent, depth-test-off -- so the caller can collect the remainder
+    // into a second scene and draw it with DrawScene. Out of range is false.
+    [[nodiscard]] bool WasBatched(int instance_index) const;
 
     // How many instances the GPU cull actually kept, summed over the batches.
     //

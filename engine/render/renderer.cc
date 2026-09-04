@@ -323,6 +323,11 @@ struct Renderer::Impl {
     std::vector<Batch> batches;
     int live_batches = 0;
     int batched_instances = 0;
+    // One byte per scene instance, set by the last CullScene: 1 when the
+    // instance went into a batch, 0 when the indirect path excluded it
+    // (skinned, transparent, no depth test, bad handle). Lets the caller draw
+    // the remainder the ordinary way, so indirect and forward can share a pass.
+    std::vector<char> batched_mask;
     // Bottom-level structure per registered mesh, or a null handle for one
     // that has not needed one yet. Indexed by MeshHandle.
     std::vector<rhi::AccelId> mesh_blas;
@@ -2345,6 +2350,13 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
 int Renderer::LastBatchCount() const { return impl_->live_batches; }
 int Renderer::LastInstanceCount() const { return impl_->batched_instances; }
 
+bool Renderer::WasBatched(int instance_index) const {
+    if (instance_index < 0 ||
+        std::size_t(instance_index) >= impl_->batched_mask.size())
+        return false;
+    return impl_->batched_mask[std::size_t(instance_index)] != 0;
+}
+
 int Renderer::VisibleAfterCull() const {
     int total = 0;
     for (int i = 0; i < impl_->live_batches; ++i) {
@@ -2387,6 +2399,7 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
                         int height) {
     impl_->live_batches = 0;
     impl_->batched_instances = 0;
+    impl_->batched_mask.assign(scene.instances.size(), 0);
     if (width <= 0 || height <= 0 || scene.instances.empty()) return 0;
 
     if (!impl_->cull_tried) {
@@ -2408,9 +2421,14 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
     // pipeline. Skinned and transparent instances are excluded here rather than
     // filtered later: a skinned mesh needs a palette per instance, and a
     // transparent one needs an order this path cannot provide.
-    std::vector<std::vector<const Instance*>> groups;
+    // One entry per (mesh, material) group: the instance AND its index in the
+    // scene, because the caller needs to know who was taken. WasBatched answers
+    // that from `batched_mask` below, so the remainder -- skinned, transparent
+    // -- can still be drawn the ordinary way.
+    std::vector<std::vector<std::pair<const Instance*, int>>> groups;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> keys;
-    for (const Instance& inst : scene.instances) {
+    for (std::size_t n = 0; n < scene.instances.size(); ++n) {
+        const Instance& inst = scene.instances[n];
         if (!Valid(inst.mesh) || inst.mesh.v >= impl_->meshes.size()) continue;
         if (!Valid(inst.material) || inst.material.v >= impl_->materials.size())
             continue;
@@ -2426,7 +2444,8 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
             keys.push_back(key);
             groups.emplace_back();
         }
-        groups[at].push_back(&inst);
+        groups[at].emplace_back(&inst, int(n));
+        impl_->batched_mask[n] = 1;
     }
     if (groups.empty()) return 0;
 
@@ -2492,7 +2511,7 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
         if (!dst) return 0;
         const GpuMesh& gm = impl_->meshes[keys[g].first];
         for (std::size_t i = 0; i < need; ++i) {
-            const Instance& inst = *groups[g][i];
+            const Instance& inst = *groups[g][i].first;
             dst[i].model = inst.model;
             dst[i].tint = inst.tint;
             // OBJECT-space bounds. The kernel transforms them, because the

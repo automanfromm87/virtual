@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <random>
 #include <thread>
 #include <cstdio>
 #include <string>
@@ -144,6 +145,7 @@ int main(int argc, char** argv) {
     float ssao_radius = 1.1f;
     bool ssao_start = true;
     bool shafts_start = true;
+    bool sparks_start = true;
     // 0.004. At 0.014 the far treeline vanished entirely and the meter dropped
     // most of a stop trying to save the sun glow, which crushed the ground.
     // Looking into a low sun through trees IS hazy -- that is the effect -- but
@@ -162,6 +164,16 @@ int main(int argc, char** argv) {
     // native; 0.5 quarters the scene's pixels. The UI stays at display.
     float render_scale = 1.0f;
     bool decals_on = true;
+    // GPU-DRIVEN (#3): the opaque statics go through CullScene (a compute
+    // frustum cull) and one indirect draw per (mesh, material) batch, instead
+    // of one CPU draw per object. Whatever the indirect path excludes --
+    // the skinned figure, transparents -- is drawn the ordinary way after it.
+    bool indirect_on = false;
+    // GPU-DRIVEN showcase: this many free-standing boulders (independent
+    // instances of one mesh and material) scattered around the clearing. The
+    // ordinary path submits one draw each; the indirect path batches them
+    // into one. 0 is off.
+    int crowd_count = 0;
     // 4096, MEASURED against an 8192 render of the same frame. The fraction of
     // pixels more than 20 of 255 away from that reference:
     //
@@ -207,6 +219,7 @@ int main(int argc, char** argv) {
             ssao_radius = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--nossao") == 0) ssao_start = false;
         else if (std::strcmp(argv[i], "--noshafts") == 0) shafts_start = false;
+        else if (std::strcmp(argv[i], "--nosparks") == 0) sparks_start = false;
         else if (std::strcmp(argv[i], "--shaft") == 0 && i + 1 < argc)
             shaft_ext = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--noik") == 0)
@@ -231,6 +244,9 @@ int main(int argc, char** argv) {
             exposure_comp = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--scale") == 0 && i + 1 < argc)
             render_scale = float(std::atof(argv[++i]));
+        else if (std::strcmp(argv[i], "--indirect") == 0) indirect_on = true;
+        else if (std::strcmp(argv[i], "--crowd") == 0 && i + 1 < argc)
+            crowd_count = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--size") == 0 && i + 2 < argc) {
             shot_w = std::atoi(argv[++i]);
             shot_h = std::atoi(argv[++i]);
@@ -1105,6 +1121,48 @@ int main(int argc, char** argv) {
     std::printf("districts: %zu instances, %zu lights\n", scene.instances.size(),
                 scene.lights.size());
 
+    // --- the crowd -------------------------------------------------------------
+    //
+    // The GPU-driven showcase (#3): free-standing boulders as INDEPENDENT
+    // instances of the one sphere mesh and one stone material, scattered in
+    // rings around the clearing. The ordinary path submits one draw per
+    // boulder; CullScene puts the whole lot into one batch and the scene pass
+    // draws it with one indirect draw. Fixed seed, so --crowd 600 looks the
+    // same every run and screenshots compare.
+    if (crowd_count > 0) {
+        eng::MaterialDesc crowd_md;
+        crowd_md.shading = eng::Shading::Lit;
+        crowd_md.base_color = eng::Vec4{0.42f, 0.41f, 0.38f, 1.0f};
+        crowd_md.roughness = 0.92f;
+        const eng::MaterialHandle crowd_mat =
+            app->Draw().CreateMaterial(crowd_md, error);
+        if (!eng::Valid(crowd_mat)) return Fail(error);
+        std::mt19937 rng(1234);
+        std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+        const float kPi = 3.14159265f;
+        for (int i = 0; i < crowd_count; ++i) {
+            // Area-uniform rings: the clearing centre stays walkable, the
+            // boulders thicken toward the treeline.
+            const float angle = unit(rng) * 2.0f * kPi;
+            const float radius =
+                8.0f + 26.0f * std::sqrt(unit(rng));
+            const float x = std::cos(angle) * radius;
+            const float z = std::sin(angle) * radius;
+            const float s = 0.5f + 1.6f * unit(rng);
+            eng::Instance b;
+            b.mesh = unit_sphere;
+            b.material = crowd_mat;
+            const float ground = terrain.HeightAt(x, z);
+            b.model = eng::Mat4::Translation(
+                          eng::Vec3{x, ground + 0.5f * s * 0.55f, z}) *
+                      eng::Mat4::Scale(s);
+            const float shade = 0.82f + 0.30f * unit(rng);
+            b.tint = eng::Vec4{shade, shade, shade * 0.99f, 1.0f};
+            scene.instances.push_back(b);
+        }
+        std::printf("crowd: %d boulders\n", crowd_count);
+    }
+
     // --- the character -------------------------------------------------------
     //
     // A skinned figure, generated the way everything else here is. It replaced
@@ -1491,7 +1549,7 @@ int main(int argc, char** argv) {
     float baked_az = 1e9f, baked_el = 1e9f;
     bool ssao_on = ssao_start;
     bool shafts_on = shafts_start;
-    bool sparks_on = true;
+    bool sparks_on = sparks_start;
     int here = tour_start;      // which stop was last jumped to, for the HUD
     int goto_stop = tour_start; // -1 when there is nothing to jump to
     bool gi_stale = false;
@@ -1524,6 +1582,11 @@ int main(int argc, char** argv) {
     // Allocated lazily on the first frame, when the framebuffer size is known.
     eng::rhi::TextureId shot_target;
 
+    // GPU-DRIVEN snapshots, outside the frame loop on purpose: the HUD draws
+    // before the passes run, so it reads LAST frame's numbers -- same as the
+    // LastStats it used to read. Declared here, assigned in the scene pass.
+    eng::Scene rem_scene;
+    int indirect_batches = 0, indirect_draws = 0, rem_draws = 0;
     while (app->Running()) {
         if (!app->BeginFrame()) continue;
         const eng::app::Frame& f = app->Current();
@@ -2048,17 +2111,37 @@ int main(int argc, char** argv) {
         const int rw = post->RenderWidth(), rh = post->RenderHeight();
         scene_targets.Resize(rw, rh);
 
+        // GPU-DRIVEN remainder: everything CullScene did NOT batch (skinned,
+        // transparent), collected ahead of Execute and drawn the ordinary way
+        // in the same pass. A whole-scene copy is cheap -- the vectors hold
+        // handles, not geometry -- and it keeps lights, camera and the joint
+        // palette identical, so the remainder draws exactly what DrawScene
+        // would have drawn for it. rem_scene and the snapshot ints live
+        // outside the frame loop, so the HUD below reads last frame's.
+
         // --- HUD ----------------------------------------------------------------
         ui->Begin(f.width, f.height);
         ui->Rect(12, 12, 500, 228, eng::Vec4{0.05f, 0.06f, 0.08f, 0.72f});
         ui->Outline(12, 12, 500, 228, 1.0f, eng::Vec4{0.35f, 0.40f, 0.48f, 0.9f});
         char line[192];
         const eng::RenderStats& rs = app->Draw().LastStats();
-        std::snprintf(line, sizeof(line),
-                      "%zu chunks lod %d/%d/%d   forest %d/%d/%d   %d draws, %d culled",
-                      chunks.size(), lod_counts[0], lod_counts[1], lod_counts[2],
-                      forest_lod_counts[0], forest_lod_counts[1],
-                      forest_lod_counts[2], rs.draws, rs.culled);
+        // In indirect mode LastStats is the REMAINDER's (the forward pass runs
+        // last), so the HUD reads the snapshots the scene pass took instead.
+        // They are one frame old -- everything on this HUD is, it draws before
+        // the passes run -- same as rs.
+        if (indirect_on)
+            std::snprintf(line, sizeof(line),
+                          "%zu chunks lod %d/%d/%d   forest %d/%d/%d   %d draws (%d gpu + %d rem)",
+                          chunks.size(), lod_counts[0], lod_counts[1], lod_counts[2],
+                          forest_lod_counts[0], forest_lod_counts[1],
+                          forest_lod_counts[2],
+                          indirect_draws + rem_draws, indirect_draws, rem_draws);
+        else
+            std::snprintf(line, sizeof(line),
+                          "%zu chunks lod %d/%d/%d   forest %d/%d/%d   %d draws, %d culled",
+                          chunks.size(), lod_counts[0], lod_counts[1], lod_counts[2],
+                          forest_lod_counts[0], forest_lod_counts[1],
+                          forest_lod_counts[2], rs.draws, rs.culled);
         ui->Text(26, 26, line, eng::Vec4{0.92f, 0.94f, 0.98f, 1.0f});
         std::snprintf(line, sizeof(line),
                       "sun %.0f deg   gi %s (%.0f ms, %d buried)",
@@ -2163,7 +2246,18 @@ int main(int argc, char** argv) {
             p.reads = {shadow_map};
             p.timer = "scene";
             p.execute = [&](eng::rhi::Encoder& e) {
-                app->Draw().DrawScene(e, scene, rw, rh, shadow_map);
+                if (indirect_on) {
+                    app->Draw().DrawSceneIndirect(e, scene, rw, rh, shadow_map);
+                    indirect_batches = app->Draw().LastBatchCount();
+                    indirect_draws = app->Draw().LastStats().draws;
+                    rem_draws = 0;
+                    if (!rem_scene.instances.empty()) {
+                        app->Draw().DrawScene(e, rem_scene, rw, rh, shadow_map);
+                        rem_draws = app->Draw().LastStats().draws;
+                    }
+                } else {
+                    app->Draw().DrawScene(e, scene, rw, rh, shadow_map);
+                }
                 env->DrawSky(e, scene.camera, rw, rh);
                 // After the opaque geometry and the sky, so they test against
                 // both. `depth` is the prepass copy -- the pass's own depth is
@@ -2350,6 +2444,22 @@ int main(int argc, char** argv) {
             app->Draw().BinLights(e, scene, rw, rh, 90.0f);
             app->Gpu().EndCompute();
         }
+        // GPU-DRIVEN cull, outside the graph for the same reason as skinning:
+        // the scene pass lambda above reads rem_scene, which is only known
+        // after this runs. The cull itself is a compute dispatch (frustum on
+        // the GPU); the remainder collection is plain CPU.
+        if (indirect_on) {
+            {
+                auto e = app->Gpu().BeginCompute("cull");
+                (void)app->Draw().CullScene(e, scene, rw, rh);
+                app->Gpu().EndCompute();
+            }
+            rem_scene = scene;
+            rem_scene.instances.clear();
+            for (std::size_t i = 0; i < scene.instances.size(); ++i)
+                if (!app->Draw().WasBatched(int(i)))
+                    rem_scene.instances.push_back(scene.instances[i]);
+        }
         graph.Execute(app->Gpu());
 
         // METERING RUNS OUTSIDE THE GRAPH, and the graph is what insisted:
@@ -2373,11 +2483,18 @@ int main(int argc, char** argv) {
         // Every frame during a capture, because the two things most likely to
         // be wrong in a screenshot are an exposure that has not settled and a
         // camera that is not where it was asked to be.
-        if (!shot_path.empty())
-            std::printf("  frame %3d  gpu %.3f ms  %d draws (%d transparent), %d culled, %d sparks\n",
-                        int(f.index), app->Gpu().LastFrameGpuMilliseconds(),
-                        app->Draw().LastStats().draws, app->Draw().LastStats().transparent_draws, app->Draw().LastStats().culled,
-                        sparks->LiveCountSlow());
+        if (!shot_path.empty()) {
+            if (indirect_on)
+                std::printf("  frame %3d  gpu %.3f ms  indirect %d draws over %d batches + %d remainder, %d sparks\n",
+                            int(f.index), app->Gpu().LastFrameGpuMilliseconds(),
+                            indirect_draws, indirect_batches, rem_draws,
+                            sparks->LiveCountSlow());
+            else
+                std::printf("  frame %3d  gpu %.3f ms  %d draws (%d transparent), %d culled, %d sparks\n",
+                            int(f.index), app->Gpu().LastFrameGpuMilliseconds(),
+                            app->Draw().LastStats().draws, app->Draw().LastStats().transparent_draws, app->Draw().LastStats().culled,
+                            sparks->LiveCountSlow());
+        }
 
         if (!shot_path.empty() && int(f.index) >= shot_frames) {
             std::vector<std::uint8_t> px(std::size_t(f.width) * f.height * 4);
