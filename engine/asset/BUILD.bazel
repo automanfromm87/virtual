@@ -136,6 +136,20 @@ cc_library(
     deps = ["//engine/core"],
 )
 
+cc_library(
+    name = "soundgen",
+    srcs = ["soundgen.cc"],
+    hdrs = ["soundgen.h"],
+    deps = ["//engine/audio"],
+)
+
+cc_test(
+    name = "soundgen_test",
+    size = "small",
+    srcs = ["soundgen_test.cc"],
+    deps = [":soundgen"],
+)
+
 cc_test(
     name = "texgen_test",
     size = "small",

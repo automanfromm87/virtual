@@ -28,6 +28,8 @@ cc_binary(
         "//engine/anim",
         "//engine/app",
         "//engine/asset:png",
+        "//engine/asset:soundgen",
+        "//engine/audio:system",
         "//engine/asset:texgen",
         "//engine/geometry",
         "//engine/nav",

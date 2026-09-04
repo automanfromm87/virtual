@@ -34,6 +34,8 @@
 #include "engine/geometry/terrain.h"
 #include "engine/geometry/tree.h"
 #include "apps/world/humanoid.h"
+#include "engine/asset/soundgen.h"
+#include "engine/audio/system.h"
 #include "engine/anim/anim.h"
 #include "engine/anim/blend.h"
 #include "engine/anim/ik.h"
@@ -1093,6 +1095,77 @@ int main(int argc, char** argv) {
     const std::size_t body_instance = scene.instances.size();
     scene.instances.push_back(body);
 
+    // --- sound ---------------------------------------------------------------
+    //
+    // Generated, like everything else. A forest that makes no sound is not
+    // quiet, it is switched off -- silence is the one thing a real place never
+    // is, and the absence reads as the world not being finished rather than as
+    // a missing feature.
+    //
+    // SILENT MODE FOR CAPTURES, rather than skipping audio entirely. The mixer
+    // still runs and the voices are still counted, so a headless shot can
+    // report that the fire is audible and the footsteps are triggering -- which
+    // is the only way to check any of this without sitting and listening.
+    std::string audio_error;
+    std::unique_ptr<eng::audio::AudioSystem> audio =
+        shot_path.empty() ? eng::audio::AudioSystem::Create(audio_error)
+                          : eng::audio::AudioSystem::CreateSilent(48000);
+    const int audio_rate = audio ? audio->SampleRate() : 48000;
+    // FOUR footsteps, not one. A single step replayed at a constant interval is
+    // heard as a machine however good the sample is, and the ear picks it out
+    // from under everything else in the mix.
+    std::vector<eng::audio::Clip> steps;
+    for (std::uint32_t i = 0; i < 4; ++i)
+        steps.push_back(eng::soundgen::Footstep(audio_rate, 101u + i * 37u, 0.8f));
+    const eng::audio::Clip fire_clip = eng::soundgen::Fire(audio_rate, 13);
+    const eng::audio::Clip wind_clip = eng::soundgen::Wind(audio_rate, 21, 6.0f, 0.30f);
+    if (audio) {
+        eng::audio::PlayDesc d;
+        d.clip = &fire_clip;
+        d.loop = true;
+        d.spatial = true;
+        d.gain = 2.6f;
+        d.position = eng::Vec3{world::kFirePit.x,
+                               terrain.HeightAt(world::kFirePit.x, world::kFirePit.z) + 0.4f,
+                               world::kFirePit.z};
+        // A fire is audible from further away than it is bright, and the near
+        // radius is what stops the inverse square going to infinity when you
+        // walk into it.
+        d.min_distance = 2.5f;
+        d.max_distance = 34.0f;
+        audio->Play(d);
+
+        // The wind is NOT spatial. It has no source -- it is the whole canopy
+        // at once -- and giving it a position puts the entire forest's rustle
+        // at one point that you can walk away from.
+        eng::audio::PlayDesc w;
+        w.clip = &wind_clip;
+        w.loop = true;
+        w.spatial = false;
+        w.gain = 1.05f;
+        audio->Play(w);
+    }
+    // SAY SO WHEN THERE IS NO SOUND. A failed device and a silent mix are the
+    // same experience, and both are the same experience as a trigger that never
+    // fires -- so the one thing that must not happen here is failing quietly.
+    // Not fatal: a demo with no speaker should still run.
+    if (!audio)
+        std::printf("audio: unavailable (%s) -- running silent\n",
+                    audio_error.empty() ? "no device" : audio_error.c_str());
+    else
+        std::printf("audio: %d Hz, %.2f s of fire, %.2f s of wind, %zu footsteps\n",
+                    audio_rate, fire_clip.Seconds(), wind_clip.Seconds(), steps.size());
+
+    int step_rotation = 0;
+    bool was_planted[2] = {false, false};
+    std::vector<float> audio_scratch;
+    // COUNTED, not sampled. A footstep is a fifth of a second long, so whether
+    // one happens to be sounding at the instant a screenshot is taken says
+    // almost nothing -- and "no voices" would read as "the trigger is broken"
+    // when it means "between steps".
+    int steps_taken = 0;
+    float audio_peak = 0.0f;
+
     eng::anim::Animator animator(skeleton);
     eng::anim::StateDesc idle_state;
     idle_state.name = "idle";
@@ -1744,6 +1817,36 @@ int main(int argc, char** argv) {
                     hit[i].point = eng::Vec3{sole.x, ground, sole.z};
                     hit[i].normal = terrain.NormalAt(sole.x, sole.z);
                     cfg[i].limb.weight = world::FootPlantWeight(sole.y - ground);
+
+                    // A FOOTSTEP IS A FOOT LANDING, and the plant weight is
+                    // already the answer to "is this foot on the ground". Using
+                    // it means the sound cannot disagree with what the legs are
+                    // doing -- triggering off the clip's phase instead would be
+                    // a second copy of the same fact, and the two drift the
+                    // moment the blend space is between clips.
+                    const bool planted = cfg[i].limb.weight > 0.5f;
+                    if (planted && !was_planted[i] && audio && ground_speed > 0.2f) {
+                        eng::audio::PlayDesc d;
+                        d.clip = &steps[std::size_t(step_rotation++ % steps.size())];
+                        d.spatial = true;
+                        d.position = eng::Vec3{sole.x, ground, sole.z};
+                        d.min_distance = 1.2f;
+                        d.max_distance = 22.0f;
+                        // Louder and a touch lower when running, because a run
+                        // lands harder. Pitch, not a second set of clips: the
+                        // difference between a walk and a run landing is mostly
+                        // that it is bigger, and generating four more clips to
+                        // say so would be four more things to keep in step.
+                        const float effort =
+                            std::clamp((ground_speed - world::kWalkSpeed) /
+                                           (world::kRunSpeed - world::kWalkSpeed),
+                                       0.0f, 1.0f);
+                        d.gain = 1.5f + effort * 1.4f;
+                        d.pitch = 1.06f - effort * 0.16f;
+                        audio->Play(d);
+                        ++steps_taken;
+                    }
+                    was_planted[i] = planted;
                 }
                 // Three passes. Lowering the pelvis by the shortfall changes
                 // the geometry, so each solve asks for a little less and the
@@ -1766,6 +1869,30 @@ int main(int argc, char** argv) {
                 }
             }
 
+            if (audio) {
+                // The listener rides the CAMERA, not the character. The camera
+                // is what the player is looking through, so a sound to the
+                // right of the character but behind the camera has to come from
+                // behind -- attaching the listener to the body puts the whole
+                // mix a couple of metres out whenever the camera orbits.
+                const eng::Vec3 fwd = scene.camera.target - scene.camera.eye;
+                audio->SetListener(scene.camera.eye, fwd, eng::Vec3{0.0f, 1.0f, 0.0f});
+            }
+            // DRIVE THE MIXER IN CAPTURE MODE. With no device nothing pulls
+            // samples, so the command queue never drains and every Play above
+            // is a no-op -- which would look exactly like working audio from
+            // the outside. Rendering the block the frame would have consumed
+            // makes the voice count and the peak below mean something.
+            if (audio && !shot_path.empty()) {
+                const int frames = std::max(1, int(dt * float(audio_rate)));
+                audio_scratch.resize(std::size_t(frames) * 2);
+                audio->RenderForTest(audio_scratch.data(), frames);
+            }
+            // THE WHOLE RUN'S PEAK, not the last block's. Clipping is a thing
+            // that happens once, when two loud things coincide, and a reading
+            // taken at the moment a screenshot is written will almost never be
+            // the moment it happened.
+            if (audio) audio_peak = std::max(audio_peak, audio->LastPeak());
             eng::anim::ComputeJointMatrices(skeleton, pose, &scene.joint_matrices);
             scene.instances[body_instance].palette = 0;
             scene.instances[body_instance].model = to_world;
@@ -1911,10 +2038,20 @@ int main(int argc, char** argv) {
         const eng::Renderer::ClusterStats cs =
             app->Draw().ClusteredLighting() ? app->Draw().ReadClusterStats()
                                             : eng::Renderer::ClusterStats{};
+        // AUDIO ON THE HUD, because there is no other way to see it. A sound
+        // that never triggered and a sound that triggered into a full voice
+        // table are indistinguishable from the listener's chair, and both are
+        // indistinguishable from a bug in the trigger. Peak above 1 is the mix
+        // clipping, which is audible as distortion and shows up nowhere else.
         std::snprintf(line, sizeof(line),
-                      "%zu lights, %d cells lit, %d max per cell%s",
+                      "%zu lights, %d cells lit, %d max per cell%s | %d voices, "
+                      "%d steps, peak %.2f%s%s",
                       scene.lights.size(), cs.occupied_cells, cs.max_per_cell,
-                      cs.overflowed_cells ? "  OVERFLOW" : "");
+                      cs.overflowed_cells ? "  OVERFLOW" : "",
+                      audio ? audio->ActiveVoices() : 0, steps_taken,
+                      audio_peak,
+                      audio && audio->StarvedVoices() ? "  STARVED" : "",
+                      audio_peak > 1.0f ? "  CLIPPING" : "");
         ui->Text(26, 176, line,
                  cs.overflowed_cells ? eng::Vec4{1.0f, 0.72f, 0.35f, 1.0f}
                                      : eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
