@@ -128,6 +128,26 @@ int main() {
         Check(bad_trunk == 0 && bad_leaf == 0,
               "every triangle's winding agrees with its vertex normals");
 
+        // TANGENTS, which a normal-mapped bark needs and which are easy to
+        // ship missing: the shader falls back to the geometric normal when the
+        // frame is degenerate, so a tree with no tangents renders as a tree
+        // whose normal map did not load.
+        int no_tangent = 0, not_perpendicular = 0;
+        for (const VertexIn& v : t.trunk.vertices) {
+            const Vec3 tg{v.tangent.x, v.tangent.y, v.tangent.z};
+            const Vec3 n{v.normal.x, v.normal.y, v.normal.z};
+            if (Length(tg) < 0.5f) { ++no_tangent; continue; }
+            if (std::fabs(Dot(Normalize(tg), n)) > 0.02f) ++not_perpendicular;
+        }
+        std::printf("    %d trunk vertices without a tangent, %d not perpendicular\n",
+                    no_tangent, not_perpendicular);
+        Check(no_tangent == 0, "every trunk vertex has a tangent frame");
+        Check(not_perpendicular == 0, "and each one is perpendicular to its normal");
+        bool handed = true;
+        for (const VertexIn& v : t.trunk.vertices)
+            if (std::fabs(std::fabs(v.tangent.w) - 1.0f) > 1e-3f) handed = false;
+        Check(handed, "and records a handedness of plus or minus one");
+
         bool unit = true;
         for (const VertexIn& v : t.foliage.vertices) {
             const Vec3 n{v.normal.x, v.normal.y, v.normal.z};

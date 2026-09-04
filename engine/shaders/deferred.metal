@@ -43,16 +43,27 @@ fragment GBufferOut fs_gbuffer(VSOut in [[stage_in]],
     if (in.worldPos.y > u.surface.w) discard_fragment();
 
     GBufferOut o;
+    // THE MATERIAL'S OWN UV. The mesh's uv describes the surface; the maps
+    // describe the material, and the two are rarely at the same scale -- a
+    // terrain chunk lays 0..1 across 128 metres and grass repeats every few.
+    //
+    // Applied in the FRAGMENT and not the vertex on purpose: the depth and
+    // shadow passes share the vertex shader and never bind a material, so
+    // scaling there would hand them a uvScale of zero and collapse every UV
+    // they interpolate. Nothing reads it in those passes today, which is
+    // exactly the kind of thing that stops being true quietly.
+    const float2 uv = in.uv * u.uvScale.xy + u.uvScale.zw;
+
     o.albedoRough.rgb =
-        in.color.rgb * u.baseColor.rgb * albedoMap.sample(smp, in.uv).rgb;
-    o.albedoRough.a = saturate(u.surface.x * roughnessMap.sample(smp, in.uv).r);
+        in.color.rgb * u.baseColor.rgb * albedoMap.sample(smp, uv).rgb;
+    o.albedoRough.a = saturate(u.surface.x * roughnessMap.sample(smp, uv).r);
     // The normal map is applied HERE, not in the lighting pass. The G-buffer's
     // whole contract is that it holds what the surface IS, and after a normal
     // map the surface faces somewhere else -- the lighting pass has no tangent
     // frame to apply one with, because a fullscreen triangle has no mesh.
-    o.normalMetal.rgb = ApplyNormalMap(normalize(in.normalW), in.tangentW, in.uv,
+    o.normalMetal.rgb = ApplyNormalMap(normalize(in.normalW), in.tangentW, uv,
                                        normalMap, smp, u.emissive.w);
-    o.normalMetal.a = saturate(u.surface.y * metallicMap.sample(smp, in.uv).r);
+    o.normalMetal.a = saturate(u.surface.y * metallicMap.sample(smp, uv).r);
     return o;
 }
 

@@ -126,3 +126,22 @@ cc_test(
     srcs = ["pack_test.cc"],
     deps = [":pack"],
 )
+
+# Procedural surface textures. Depends on nothing but the maths: it computes
+# pixels, and whoever wants them on the GPU uploads them.
+cc_library(
+    name = "texgen",
+    srcs = ["texgen.cc"],
+    hdrs = ["texgen.h"],
+    deps = ["//engine/core"],
+)
+
+cc_test(
+    name = "texgen_test",
+    size = "small",
+    srcs = ["texgen_test.cc"],
+    deps = [
+        ":png",
+        ":texgen",
+    ],
+)

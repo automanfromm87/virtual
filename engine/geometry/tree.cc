@@ -285,8 +285,12 @@ Tree MakeTree(const TreeParams& params) {
     Recurse(tree, p, rng, Vec3{0, 0, 0}, Vec3{0, 1, 0}, p.height, p.trunk_radius,
             0);
 
+    // TANGENT FRAMES, so bark can carry a normal map. Without them the shader's
+    // degenerate-frame guard returns the geometric normal and the map silently
+    // does nothing -- which looks exactly like a texture that failed to load.
     GenerateTangents(tree.trunk);
     GenerateTangents(tree.foliage);
+
     FitBounds(tree.trunk);
     FitBounds(tree.foliage);
 

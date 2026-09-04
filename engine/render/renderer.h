@@ -121,6 +121,15 @@ struct MaterialDesc {
     // instead would rotate it toward the surface normal and saturate.
     float normal_strength = 1.0f;
 
+    // How many times every map above repeats across the mesh's 0..1 UV, and
+    // where the repeat starts. Applies to ALL of them at once: an albedo and
+    // its normal map that tile at different rates are not the same surface.
+    //
+    // Two components rather than one because a tube's UV runs around it in u
+    // and along it in v, and those are rarely the same distance.
+    Vec2 uv_scale{1.0f, 1.0f};
+    Vec2 uv_offset{0.0f, 0.0f};
+
     // Alpha blended, drawn after every opaque object, back to front, and NOT
     // writing depth. Glass needs all four of those or it stops looking like
     // glass — or worse, stops the room behind it from drawing at all.

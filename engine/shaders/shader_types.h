@@ -105,6 +105,14 @@ struct FrameUniforms {
     // vertex amplification is that there IS only one draw.
     ENG_MAT4 viewProjRight;
     ENG_VEC4 eyePosRight;
+    // UV TILING for this material. .xy multiplies the mesh's uv, .zw offsets it.
+    //
+    // Needed because mesh UVs describe the SURFACE and a detail texture
+    // describes the MATERIAL, and the two have no reason to be at the same
+    // scale. A terrain chunk lays 0..1 across 128 metres; grass repeats every
+    // few metres. Without this the only options are to bake the tiling into
+    // every mesh that uses the material or to give up on detail textures.
+    ENG_VEC4 uvScale;
 };
 
 // A local light. Sixteen bytes times four, so the array packs with no padding

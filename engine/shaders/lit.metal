@@ -278,14 +278,25 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
 
     // Both maps default to 1x1 white, so an untextured material multiplies by
     // one and needs no branch here.
-    const float3 albedo =
-        in.color.rgb * u.baseColor.rgb * albedoMap.sample(smp, in.uv).rgb;
-    const float roughness =
-        saturate(u.surface.x * roughnessMap.sample(smp, in.uv).r);
-    const float metallic = saturate(u.surface.y * metallicMap.sample(smp, in.uv).r);
-    const float ao = occlusionMap.sample(smp, in.uv).r;
+    // THE MATERIAL'S OWN UV. The mesh's uv describes the surface; the maps
+    // describe the material, and the two are rarely at the same scale -- a
+    // terrain chunk lays 0..1 across 128 metres and grass repeats every few.
+    //
+    // Applied in the FRAGMENT and not the vertex on purpose: the depth and
+    // shadow passes share the vertex shader and never bind a material, so
+    // scaling there would hand them a uvScale of zero and collapse every UV
+    // they interpolate. Nothing reads it in those passes today, which is
+    // exactly the kind of thing that stops being true quietly.
+    const float2 uv = in.uv * u.uvScale.xy + u.uvScale.zw;
 
-    const float3 N = ApplyNormalMap(normalize(in.normalW), in.tangentW, in.uv,
+    const float3 albedo =
+        in.color.rgb * u.baseColor.rgb * albedoMap.sample(smp, uv).rgb;
+    const float roughness =
+        saturate(u.surface.x * roughnessMap.sample(smp, uv).r);
+    const float metallic = saturate(u.surface.y * metallicMap.sample(smp, uv).r);
+    const float ao = occlusionMap.sample(smp, uv).r;
+
+    const float3 N = ApplyNormalMap(normalize(in.normalW), in.tangentW, uv,
                                     normalMap, smp, u.emissive.w);
 
     // LINEAR HDR out, un-tone-mapped and un-gamma-corrected. The scene target
@@ -312,6 +323,6 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
     // EMISSION last and unlit. It is radiance the surface produces, so nothing
     // shadows it, no light affects it and ambient occlusion does not dim it --
     // a glowing sign in a dark alcove is exactly as bright as one in the open.
-    const float3 emit = u.emissive.rgb * emissiveMap.sample(smp, in.uv).rgb;
+    const float3 emit = u.emissive.rgb * emissiveMap.sample(smp, uv).rgb;
     return float4(lit + emit, in.color.a);
 }

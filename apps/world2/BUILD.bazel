@@ -12,6 +12,7 @@ cc_binary(
     deps = [
         "//engine/app",
         "//engine/asset:png",
+        "//engine/asset:texgen",
         "//engine/geometry",
         "//engine/nav",
         "//engine/physics",

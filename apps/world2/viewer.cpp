@@ -24,6 +24,7 @@
 #include "engine/asset/png.h"
 #include "engine/geometry/mesh.h"
 #include "engine/geometry/simplify.h"
+#include "engine/asset/texgen.h"
 #include "engine/geometry/terrain.h"
 #include "engine/geometry/tree.h"
 #include "engine/nav/navmesh.h"
@@ -146,10 +147,56 @@ int main(int argc, char** argv) {
     const eng::Terrain terrain = eng::Terrain::Generate(tc, Landscape);
     if (!terrain.Valid()) return Fail("terrain");
 
+    // --- procedural surfaces ---------------------------------------------------
+    //
+    // Generated, not loaded, because this engine ships no assets -- and an
+    // untextured world is the biggest single thing between a correct render and
+    // a photograph. Flat albedo has nothing for the shading to act on, so every
+    // surface reads as the same plastic whatever its roughness says.
+    //
+    // UPLOADED AS LINEAR, not sRGB. These maps MULTIPLY the material's base
+    // colour, so they are ratios rather than colours, and a ratio has no gamma
+    // -- decoding one as sRGB would turn a 0.87 modulation into 0.73 and darken
+    // everything they touch.
+    std::printf("generating textures...\n");
+    const eng::texgen::Surface grass_tex = eng::texgen::Ground(512, 7);
+    const eng::texgen::Surface bark_tex = eng::texgen::Bark(512, 23);
+    const eng::texgen::Image leaf_tex = eng::texgen::Foliage(256, 41);
+    const auto upload = [&](const eng::texgen::Image& im) {
+        return app->Gpu().CreateTexture2D(im.width, im.height, im.rgba.data(),
+                                          /*mips=*/true, /*srgb=*/false);
+    };
+    const eng::rhi::TextureId grass_albedo = upload(grass_tex.albedo);
+    const eng::rhi::TextureId grass_normal = upload(grass_tex.normal);
+    const eng::rhi::TextureId bark_albedo = upload(bark_tex.albedo);
+    const eng::rhi::TextureId bark_normal = upload(bark_tex.normal);
+    const eng::rhi::TextureId leaf_albedo = upload(leaf_tex);
+    if (!eng::rhi::Valid(grass_albedo) || !eng::rhi::Valid(bark_normal))
+        return Fail("texture upload");
+
     eng::MaterialDesc ground_md;
     ground_md.shading = eng::Shading::Lit;
-    ground_md.base_color = eng::Vec4{0.34f, 0.40f, 0.26f, 1.0f};
+    // A PHYSICALLY PLAUSIBLE ALBEDO, which this was not. It was
+    // {0.34, 0.40, 0.26} -- 34 to 40 percent reflectance, which is concrete or
+    // dry sand, not grass. Living vegetation reflects 10 to 20 percent in the
+    // visible band, and the terrain's vertex colour is white so nothing else
+    // was bringing it down.
+    //
+    // This is why the sunlit ground read as straw no matter what the tone map
+    // did: a surface three times too bright and half as saturated as grass is
+    // not grass, and no amount of exposure or curve fixes the albedo. The meter
+    // simply opens up to compensate, which lifts the shadows too -- so the
+    // scene gets MORE contrast range out of the correction, not less.
+    ground_md.base_color = eng::Vec4{0.11f, 0.17f, 0.07f, 1.0f};
     ground_md.roughness = 0.92f;
+    ground_md.albedo = grass_albedo;
+    ground_md.normal_map = grass_normal;
+    ground_md.normal_strength = 0.9f;
+    // A terrain chunk lays uv 0..1 across the WHOLE 128 m terrain, so without a
+    // scale one blade of grass would be four metres wide. 40 repeats puts the
+    // tile at about three metres, which is the scale a clump of grass actually
+    // is and is fine enough that the repeat is not the first thing seen.
+    ground_md.uv_scale = eng::Vec2{40.0f, 40.0f};
     const eng::MaterialHandle ground_mat = app->Draw().CreateMaterial(ground_md, error);
     if (!eng::Valid(ground_mat)) return Fail(error);
 
@@ -235,6 +282,15 @@ int main(int argc, char** argv) {
     bark_md.shading = eng::Shading::Lit;
     bark_md.base_color = eng::Vec4{0.30f, 0.22f, 0.16f, 1.0f};
     bark_md.roughness = 0.88f;
+    bark_md.albedo = bark_albedo;
+    bark_md.normal_map = bark_normal;
+    // Deep, because bark is: the grooves are the whole reason a trunk does not
+    // read as a brown cylinder.
+    bark_md.normal_strength = 1.6f;
+    // u runs around the trunk and v along it. One trunk is roughly a metre
+    // around and several long, so v repeats more often than u or the grain
+    // comes out stretched into smears.
+    bark_md.uv_scale = eng::Vec2{1.5f, 3.0f};
     const eng::MaterialHandle bark_mat = app->Draw().CreateMaterial(bark_md, error);
     if (!eng::Valid(bark_mat)) return Fail(error);
 
@@ -244,6 +300,11 @@ int main(int argc, char** argv) {
     // Leaves are rougher than almost anything else outdoors and not at all
     // metallic; a smooth canopy picks up a sheen that reads as wet plastic.
     leaf_md.roughness = 0.95f;
+    leaf_md.albedo = leaf_albedo;
+    // No normal map: a leaf blob already stands in for a thousand leaves, and
+    // bump detail on it would be detail at the wrong scale pretending to be
+    // detail at the right one.
+    leaf_md.uv_scale = eng::Vec2{2.0f, 2.0f};
     const eng::MaterialHandle leaf_mat = app->Draw().CreateMaterial(leaf_md, error);
     if (!eng::Valid(leaf_mat)) return Fail(error);
 
@@ -259,7 +320,12 @@ int main(int argc, char** argv) {
             // terrain already knows how to produce a coarse version, and it
             // produces one that lines up with its neighbours.
             for (int lod = 0; lod < 3; ++lod) {
-                const eng::Mesh m = terrain.BuildChunk(cx, cz, lod);
+                eng::Mesh m = terrain.BuildChunk(cx, cz, lod);
+                // The terrain builder does not make tangents, and the ground
+                // now has a normal map. Without a frame the shader falls back
+                // to the geometric normal and the map does nothing at all --
+                // silently, which is the worst way for it to not work.
+                eng::GenerateTangents(m);
                 if (m.vertices.empty()) break;
                 chunk.lods[lod] = app->Draw().UploadMesh(m);
                 if (!eng::Valid(chunk.lods[lod])) break;
