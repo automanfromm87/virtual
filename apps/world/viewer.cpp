@@ -361,7 +361,7 @@ int main(int argc, char** argv) {
     // distant pixel. That is a generation parameter, not a mesh operation, so
     // the cheap versions are grown rather than crushed.
     constexpr int kForestLods = 3;
-    struct ForestCell { eng::Mesh trunk, leaves; };
+    struct ForestCell { eng::Mesh trunk, leaves, ground; };
     std::vector<ForestCell> cells(kForestLods * kForestCells * kForestCells);
     // ONE SPHERE PER CANOPY, kept for the light bake below. The forest is 2.5M
     // triangles and tracing rays against that is hopeless, but GI does not need
@@ -455,7 +455,23 @@ int main(int argc, char** argv) {
             // Sunk slightly, so the trunk's flat base is never visible above a
             // terrain triangle that slopes away from it.
             const eng::Vec3 at{x, terrain.HeightAt(x, z) - 0.15f * scale, z};
+            // A LEAN, per tree, in the model matrix.
+            //
+            // Every trunk was exactly vertical, which is one of the clearest
+            // marks of a generated forest -- real trees lean, toward light and
+            // away from weather and downhill on a slope, and a stand of perfect
+            // verticals reads as a diagram of a wood.
+            //
+            // Here rather than in TreeParams because the six skeletons are
+            // generated once and shared by two hundred trees: putting it in the
+            // generator would mean a generation per tree. Rotating about the
+            // base leaves the trunk planted where it was and tilts everything
+            // above it, which is what leaning is.
+            const float lean = rnd() * 0.13f;
+            const float lean_dir = rnd() * 6.2831853f;
             const eng::Mat4 model = eng::Mat4::Translation(at) *
+                                    eng::Mat4::RotationY(lean_dir) *
+                                    eng::Mat4::RotationX(lean) *
                                     eng::Mat4::RotationY(rnd() * 6.2831853f) *
                                     eng::Mat4::Scale(scale);
             // A tint per tree, so the canopy is not one flat green across the
@@ -499,6 +515,66 @@ int main(int argc, char** argv) {
             trunks.push_back({at, 0.17f * scale * 1.25f, 4.4f * scale});
             ++planted;
         }
+        // --- undergrowth ---------------------------------------------------
+        //
+        // Into the SAME cells as the trees, so it culls and drops detail with
+        // them for free rather than needing a second system that does the same
+        // thing.
+        //
+        // LEVEL 0 ONLY. A tuft is a few centimetres across; past thirty metres
+        // it is smaller than a pixel and all it can do is alias. Carrying it
+        // into the far levels would be tens of thousands of triangles a cell
+        // producing nothing but shimmer.
+        {
+            std::uint32_t gs = 918273u;
+            const auto grnd = [&] {
+                gs ^= gs << 13; gs ^= gs >> 17; gs ^= gs << 5;
+                return float(gs & 0xFFFFFFu) / float(0x1000000u);
+            };
+            world::Rng rng(5573u);
+            int tufts = 0, rocks = 0;
+            for (int attempt = 0; attempt < 52000; ++attempt) {
+                const float x = (grnd() - 0.5f) * 124.0f;
+                const float z = (grnd() - 0.5f) * 124.0f;
+                const eng::Vec3 nrm = terrain.NormalAt(x, z);
+                const float y = terrain.HeightAt(x, z);
+                const int gx = std::clamp(int((x + 64.0f) / 128.0f * kForestCells), 0,
+                                          kForestCells - 1);
+                const int gz = std::clamp(int((z + 64.0f) / 128.0f * kForestCells), 0,
+                                          kForestCells - 1);
+                eng::Mesh& into = cells[std::size_t(gz * kForestCells + gx)].ground;
+                if (grnd() < 0.88f) {
+                    // Grass thins out on anything steep, for the same reason
+                    // the ground goes bare there.
+                    if (nrm.y < 0.90f) continue;
+                    // A little below the surface, so a tuft on a slope has its
+                    // base buried rather than floating at one corner.
+                    world::AppendTuft(into, rng, eng::Vec3{x, y - 0.03f, z},
+                                      0.26f + rng.Unit() * 0.22f,
+                                      eng::Vec4{0.62f, 1.05f, 0.42f, 1.0f});
+                    ++tufts;
+                } else {
+                    if (nrm.y < 0.55f) continue;
+                    const float size = 0.10f + rng.Unit() * 0.30f;
+                    // Sunk by a third: a boulder resting exactly on the surface
+                    // looks dropped, one partly in the ground looks weathered.
+                    // The vertex colour has to UNDO the material's green. One
+                    // material serves grass and stone, and its base colour is
+                    // tuned for grass -- multiplying a grey through it gave
+                    // dark green pebbles. These numbers put stone back at a
+                    // neutral 0.17-ish whatever the base is.
+                    const float grey = 0.85f + rng.Unit() * 0.5f;
+                    world::AppendRock(into, rng, eng::Vec3{x, y - size * 0.33f, z}, size,
+                                      eng::Vec4{grey * 1.38f, grey * 1.13f,
+                                                grey * 1.78f, 1.0f});
+                    ++rocks;
+                }
+            }
+            std::size_t gtris = 0;
+            for (const ForestCell& c : cells) gtris += c.ground.indices.size() / 3;
+            std::printf("  %d tufts and %d rocks, %zu tris\n", tufts, rocks, gtris);
+        }
+
         std::size_t per_lod[kForestLods] = {0, 0, 0}, used = 0;
         for (int lod = 0; lod < kForestLods; ++lod)
             for (int c = 0; c < kForestCells * kForestCells; ++c) {
@@ -529,6 +605,16 @@ int main(int argc, char** argv) {
     bark_md.uv_scale = eng::Vec2{1.5f, 3.0f};
     const eng::MaterialHandle bark_mat = app->Draw().CreateMaterial(bark_md, error);
     if (!eng::Valid(bark_mat)) return Fail(error);
+
+    // ONE MATERIAL for grass and stone both. They differ in vertex colour, and
+    // the shader multiplies that into the albedo -- two materials would be two
+    // draws per cell for two things that shade identically.
+    eng::MaterialDesc scatter_md;
+    scatter_md.shading = eng::Shading::Lit;
+    scatter_md.base_color = eng::Vec4{0.13f, 0.15f, 0.09f, 1.0f};
+    scatter_md.roughness = 0.93f;
+    const eng::MaterialHandle scatter_mat = app->Draw().CreateMaterial(scatter_md, error);
+    if (!eng::Valid(scatter_mat)) return Fail(error);
 
     eng::MaterialDesc leaf_md;
     leaf_md.shading = eng::Shading::Lit;
@@ -860,8 +946,9 @@ int main(int argc, char** argv) {
     // up. That is the whole reason for splitting the mesh.
     struct ForestChunk {
         std::vector<eng::MeshHandle> trunk_lods, leaf_lods;
+        eng::MeshHandle ground;  // undergrowth, level 0 only
         eng::Vec3 centre;
-        std::size_t trunk_instance = 0, leaf_instance = 0;
+        std::size_t trunk_instance = 0, leaf_instance = 0, ground_instance = 0;
     };
     std::vector<ForestChunk> forest;
     {
@@ -892,6 +979,14 @@ int main(int argc, char** argv) {
             li.material = leaf_mat;
             chunk.leaf_instance = scene.instances.size();
             scene.instances.push_back(li);
+            if (!base.ground.vertices.empty()) {
+                chunk.ground = app->Draw().UploadMesh(base.ground);
+                eng::Instance gi;
+                gi.mesh = chunk.ground;
+                gi.material = scatter_mat;
+                chunk.ground_instance = scene.instances.size();
+                scene.instances.push_back(gi);
+            }
             forest.push_back(std::move(chunk));
         }
         std::printf("  %zu cells, %zu draws, canopy %zu tris at level 0 and %zu "
@@ -1378,6 +1473,13 @@ int main(int argc, char** argv) {
             const int l_lod = std::min(lod, int(chunk.leaf_lods.size()) - 1);
             scene.instances[chunk.trunk_instance].mesh = chunk.trunk_lods[std::size_t(t_lod)];
             scene.instances[chunk.leaf_instance].mesh = chunk.leaf_lods[std::size_t(l_lod)];
+            // The undergrowth is level 0 or nothing: parked underground rather
+            // than removed, because every index into the instance list is held
+            // by something and compacting it would invalidate them all.
+            if (eng::Valid(chunk.ground))
+                scene.instances[chunk.ground_instance].model =
+                    lod == 0 ? eng::Mat4::Identity()
+                             : eng::Mat4::Translation(eng::Vec3{0.0f, -1000.0f, 0.0f});
             ++forest_lod_counts[lod];
         }
 

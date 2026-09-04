@@ -49,6 +49,8 @@
 
 namespace world {
 
+constexpr float kPi = 3.14159265358979f;
+
 // Where each district sits, in metres from the middle of the valley.
 //
 // All of them are outside the 26 m spawn clearing and inside the 46 m rim where
@@ -590,6 +592,128 @@ inline void PoseBanner(const Banner& b, eng::Scene& scene, float time) {
         scene.joint_matrices[std::size_t(b.joint_offset + j)] =
             eng::Mat4::Translation(offset);
     }
+}
+
+// --- undergrowth ------------------------------------------------------------
+//
+// The nought-to-two-metre band was empty. That is the distance the eye looks
+// hardest at, and a landscape with detailed ground texture, trees at head
+// height and NOTHING in between reads as a diorama -- the texture says the
+// ground is grass and the silhouette says it is a painted floor.
+//
+// SOLID GEOMETRY, not alpha cards. A card needs an alpha cutout, a cutout needs
+// the same test in the shadow pass or every tuft casts a rectangle, and edge-on
+// a card disappears. Actual little blades cost more triangles and none of that:
+// they are opaque, they shadow correctly, and they look the same from every
+// direction because they are the same from every direction.
+
+// One blade: a tapered strip that bends over as it rises.
+inline void AppendBlade(eng::Mesh& m, eng::Vec3 base, float angle, float height,
+                        float width, float bend, eng::Vec4 colour) {
+    const eng::Vec3 out{std::cos(angle), 0.0f, std::sin(angle)};
+    // Perpendicular to the blade's lean, so the strip faces outward rather than
+    // edge-on to whoever is looking along it.
+    const eng::Vec3 side{-out.z * width, 0.0f, out.x * width};
+
+    // Three levels: full width at the base, half at the middle, a point at the
+    // tip. A single triangle from base to tip is cheaper and reads as a spike.
+    const eng::Vec3 mid = base + eng::Vec3{out.x * bend * 0.35f, height * 0.55f,
+                                           out.z * bend * 0.35f};
+    const eng::Vec3 tip = base + eng::Vec3{out.x * bend, height, out.z * bend};
+    const eng::Vec3 nrm = Normalize(Cross(eng::Vec3{0.0f, height, 0.0f}, side));
+
+    const auto push = [&](eng::Vec3 p, float u, float v) {
+        VertexIn out_v{};
+        out_v.position = eng::Vec4{p.x, p.y, p.z, 0.0f};
+        out_v.normal = eng::Vec4{nrm.x, nrm.y, nrm.z, 0.0f};
+        out_v.color = colour;
+        out_v.uv = eng::Vec4{u, v, 0.0f, 0.0f};
+        m.vertices.push_back(out_v);
+    };
+    const auto base_i = std::uint32_t(m.vertices.size());
+    push(base - side, 0.0f, 0.0f);
+    push(base + side, 1.0f, 0.0f);
+    push(mid - side * 0.55f, 0.15f, 0.55f);
+    push(mid + side * 0.55f, 0.85f, 0.55f);
+    push(tip, 0.5f, 1.0f);
+    const std::uint32_t f[9] = {0, 2, 1, 1, 2, 3, 2, 4, 3};
+    for (int i = 0; i < 9; i += 3) {
+        // Both windings. A blade is a surface with no inside, and back-face
+        // culling would make half of every tuft vanish depending on where you
+        // stood.
+        m.indices.insert(m.indices.end(),
+                         {base_i + f[i], base_i + f[i + 1], base_i + f[i + 2]});
+        m.indices.insert(m.indices.end(),
+                         {base_i + f[i], base_i + f[i + 2], base_i + f[i + 1]});
+    }
+}
+
+inline void AppendTuft(eng::Mesh& m, Rng& rng, eng::Vec3 base, float scale,
+                       eng::Vec4 colour) {
+    const int blades = 4 + int(rng.Unit() * 3.0f);
+    const float roll = rng.Unit() * 6.2831853f;
+    for (int i = 0; i < blades; ++i) {
+        const float a = roll + float(i) / float(blades) * 6.2831853f +
+                        rng.Signed() * 0.5f;
+        // Darker toward the base, which is what a clump of anything looks like
+        // and what stops a field of tufts reading as one flat colour.
+        const float shade = 0.72f + rng.Unit() * 0.5f;
+        AppendBlade(m, base + eng::Vec3{rng.Signed() * 0.04f, 0.0f, rng.Signed() * 0.04f},
+                    a, scale * (0.7f + rng.Unit() * 0.6f), scale * 0.055f,
+                    scale * (0.25f + rng.Unit() * 0.4f),
+                    eng::Vec4{colour.x * shade, colour.y * shade, colour.z * shade, 1.0f});
+    }
+}
+
+// A boulder: a low sphere pushed about, so no two are the same and none of them
+// is a ball.
+inline void AppendRock(eng::Mesh& m, Rng& rng, eng::Vec3 centre, float size,
+                       eng::Vec4 colour) {
+    // 5 by 8, not 4 by 6. Four stacks is a 45 degree step, and with the poles
+    // as fans that makes the top a six-sided cone -- the rocks came out looking
+    // like little pyramids rather than boulders.
+    constexpr int kStacks = 5, kSlices = 8;
+    const auto base = std::uint32_t(m.vertices.size());
+    const float wob_a = rng.Unit() * 6.2831853f, wob_b = rng.Unit() * 6.2831853f;
+    const float squash = 0.55f + rng.Unit() * 0.3f;
+    const auto point = [&](float phi, float theta) {
+        const float sp = std::sin(phi);
+        const eng::Vec3 u{sp * std::cos(theta), std::cos(phi), sp * std::sin(theta)};
+        const float lump = 1.0f + 0.15f * std::sin(theta * 2.0f + wob_a) +
+                           0.11f * std::sin(phi * 3.0f + wob_b);
+        return eng::Vec3{u.x * size * lump, u.y * size * lump * squash,
+                         u.z * size * lump};
+    };
+    for (int i = 0; i <= kStacks; ++i) {
+        const float phi = float(i) / float(kStacks) * kPi;
+        for (int j = 0; j <= kSlices; ++j) {
+            const float theta = float(j) / float(kSlices) * 2.0f * kPi;
+            const eng::Vec3 p = point(phi, theta);
+            constexpr float h = 1e-3f;
+            eng::Vec3 n = Cross(point(phi, theta + h) - point(phi, theta - h),
+                                point(phi + h, theta) - point(phi - h, theta));
+            if (Length(n) < 1e-9f) n = p;
+            n = Normalize(n);
+            VertexIn v{};
+            v.position = eng::Vec4{centre.x + p.x, centre.y + p.y, centre.z + p.z, 0.0f};
+            v.normal = eng::Vec4{n.x, n.y, n.z, 0.0f};
+            v.color = colour;
+            v.uv = eng::Vec4{float(j) / float(kSlices), float(i) / float(kStacks), 0, 0};
+            m.vertices.push_back(v);
+        }
+    }
+    for (int i = 0; i < kStacks; ++i)
+        for (int j = 0; j < kSlices; ++j) {
+            const auto a = std::uint32_t(base + i * (kSlices + 1) + j);
+            const auto b = std::uint32_t(a + 1);
+            const auto c = std::uint32_t(a + kSlices + 1);
+            const auto dd = std::uint32_t(c + 1);
+            // Pole rows as fans, for the same reason the leaf blobs are: half of
+            // each quad there has zero area and a face normal made of rounding
+            // noise.
+            if (i > 0) m.indices.insert(m.indices.end(), {a, b, c});
+            if (i < kStacks - 1) m.indices.insert(m.indices.end(), {b, dd, c});
+        }
 }
 
 }  // namespace world
