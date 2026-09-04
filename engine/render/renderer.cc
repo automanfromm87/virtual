@@ -82,7 +82,7 @@ constexpr char kMeshletSrc[] = {
     , 0};
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
-static_assert(sizeof(FrameUniforms) == 640, "FrameUniforms layout drifted");
+static_assert(sizeof(FrameUniforms) == 656, "FrameUniforms layout drifted");
 static_assert(sizeof(GpuClusters) == 64, "GpuClusters layout drifted");
 static_assert(sizeof(GpuLight) == 144, "GpuLight layout drifted");
 static_assert(sizeof(GpuCascades) == 288, "GpuCascades layout drifted");
@@ -225,6 +225,8 @@ struct GpuMaterial {
     float normal_strength = 1.0f;
     Vec2 uv_scale{1.0f, 1.0f};
     Vec2 uv_offset{0.0f, 0.0f};
+    float transmission = 0.0f;
+    Vec3 transmission_color{0.45f, 0.75f, 0.25f};
 };
 
 // A survivor of culling, with the keys it gets sorted on.
@@ -897,6 +899,8 @@ MaterialHandle Renderer::CreateMaterial(const MaterialDesc& desc,
     m.normal_strength = desc.normal_strength;
     m.uv_scale = desc.uv_scale;
     m.uv_offset = desc.uv_offset;
+    m.transmission = desc.transmission;
+    m.transmission_color = desc.transmission_color;
     m.albedo = Valid(desc.albedo) ? desc.albedo : impl_->white;
     m.roughness_map =
         Valid(desc.roughness_map) ? desc.roughness_map : impl_->white;
@@ -1959,6 +1963,8 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
                           mat.normal_strength};
         u.uvScale = Vec4{mat.uv_scale.x, mat.uv_scale.y, mat.uv_offset.x,
                          mat.uv_offset.y};
+        u.transmission = Vec4{mat.transmission_color.x, mat.transmission_color.y,
+                              mat.transmission_color.z, mat.transmission};
         u.giOrigin = gi_origin;
         u.giSpacing = gi_spacing;
         u.giCounts = gi_counts;
@@ -2608,6 +2614,8 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
                           mat.normal_strength};
         u.uvScale = Vec4{mat.uv_scale.x, mat.uv_scale.y, mat.uv_offset.x,
                          mat.uv_offset.y};
+        u.transmission = Vec4{mat.transmission_color.x, mat.transmission_color.y,
+                              mat.transmission_color.z, mat.transmission};
         u.giOrigin = impl_->gi_origin;
         u.giSpacing = impl_->gi_spacing;
         u.giCounts = impl_->gi_counts;

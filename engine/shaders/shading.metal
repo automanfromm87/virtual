@@ -452,6 +452,36 @@ static inline float3 ShadeSurface(float3 worldPos, float3 Nin, float3 albedo,
                     u.lightColor.rgb * saturate(dot(N, Lsun)) * shadow *
                     energy_compensation;
 
+    // TRANSMISSION through a thin surface: the light the sun puts through a
+    // leaf and out the side you are looking at.
+    //
+    // The reflective term above is multiplied by saturate(dot(N, Lsun)), so it
+    // is exactly ZERO when the sun is behind the surface -- which is the case
+    // this exists for. A backlit leaf is the brightest thing in a forest and a
+    // BRDF alone renders it black.
+    //
+    // FORWARD-BIASED, not isotropic. Light that crosses a thin scatterer keeps
+    // most of its direction, so it is brightest when you are looking almost
+    // straight into the source through the leaf and falls away quickly as you
+    // move off that line. dot(V, -Lsun) is exactly that angle: 1 when the sun
+    // is directly behind what you are looking at.
+    //
+    // NOT gated on dot(N, Lsun) being negative. A leaf near edge-on to the sun
+    // transmits and reflects at the same time, and a hard switch between the
+    // two puts a visible line across every leaf at the terminator.
+    if (u.transmission.w > 0.0f) {
+        const float back = saturate(dot(V, -Lsun));
+        // The exponent is the tightness of the forward lobe. 4 is broad enough
+        // that a whole canopy lights up rather than a few pixels aimed exactly
+        // at the sun, which is what it looks like in a wood.
+        const float lobe = back * back * back * back;
+        // Attenuated by the SHADOW as well: a leaf in the shade of the tree in
+        // front of it has no sun to transmit, and without this the far side of
+        // a canopy glows as brightly as the near one.
+        direct += u.transmission.rgb * (u.transmission.w * lobe) *
+                  u.lightColor.rgb * shadow;
+    }
+
     // --- local lights --------------------------------------------------------
     //
     // Two ways in, and the loop body is shared. Without clustering the fragment

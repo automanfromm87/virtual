@@ -130,6 +130,25 @@ struct MaterialDesc {
     Vec2 uv_scale{1.0f, 1.0f};
     Vec2 uv_offset{0.0f, 0.0f};
 
+    // TRANSMISSION: light that goes THROUGH a thin surface and comes out the
+    // other side. Zero for anything solid; a leaf is somewhere around 0.5.
+    //
+    // This is the one thing missing from foliage that no amount of correct
+    // opaque shading substitutes for. A leaf with the sun behind it GLOWS --
+    // it is the brightest thing in a forest and the single most identifiable
+    // property of the subject -- and a purely reflective BRDF renders it
+    // black, because the sun is on the far side and N dot L is negative.
+    //
+    // NOT subsurface scattering. That is a diffusion problem inside a thick
+    // medium and needs the thickness and a profile; this is the thin-surface
+    // case, where the light crosses in one step and the only thing to model is
+    // how much and how forward-biased it comes out.
+    float transmission = 0.0f;
+    // The colour it comes out. A leaf transmits green far better than red --
+    // that is why a backlit leaf is a more saturated green than a lit one, and
+    // using the albedo instead loses exactly that.
+    Vec3 transmission_color{0.45f, 0.75f, 0.25f};
+
     // Alpha blended, drawn after every opaque object, back to front, and NOT
     // writing depth. Glass needs all four of those or it stops looking like
     // glass — or worse, stops the room behind it from drawing at all.

@@ -121,6 +121,9 @@ int main(int argc, char** argv) {
     // the haze has to leave the trees in it.
     float shaft_ext = 0.004f;
     int tour_start = 0;
+    float pitch_start = 0.26f;
+    float focus_start = 1.0f;
+    float leaf_transmission = 0.55f;
     // 4096, MEASURED against an 8192 render of the same frame. The fraction of
     // pixels more than 20 of 255 away from that reference:
     //
@@ -170,6 +173,11 @@ int main(int argc, char** argv) {
             shaft_ext = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--look") == 0 && i + 1 < argc)
             tour_start = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--pitch") == 0 && i + 1 < argc)
+            pitch_start = float(std::atof(argv[++i]));
+        else if (std::strcmp(argv[i], "--focush") == 0 && i + 1 < argc)
+            focus_start = float(std::atof(argv[++i]));
+        else if (std::strcmp(argv[i], "--noleaf") == 0) leaf_transmission = 0.0f;
         else if (std::strcmp(argv[i], "--size") == 0 && i + 2 < argc) {
             shot_w = std::atoi(argv[++i]);
             shot_h = std::atoi(argv[++i]);
@@ -508,6 +516,15 @@ int main(int argc, char** argv) {
     // bump detail on it would be detail at the wrong scale pretending to be
     // detail at the right one.
     leaf_md.uv_scale = eng::Vec2{2.0f, 2.0f};
+    // THE THING THAT MAKES FOLIAGE FOLIAGE. A leaf with the sun behind it is
+    // the brightest object in a forest; a purely reflective BRDF renders it
+    // black, because dot(N, L) is negative there. Until this existed the whole
+    // canopy was flat green from every angle and read as plastic.
+    leaf_md.transmission = leaf_transmission;
+    // Green, and much more saturated than the albedo. A leaf passes green far
+    // better than red -- which is why a backlit leaf is a more vivid green than
+    // a lit one, and using the albedo here would lose exactly that.
+    leaf_md.transmission_color = eng::Vec3{0.22f, 0.62f, 0.10f};
     const eng::MaterialHandle leaf_mat = app->Draw().CreateMaterial(leaf_md, error);
     if (!eng::Valid(leaf_mat)) return Fail(error);
 
@@ -917,7 +934,8 @@ int main(int argc, char** argv) {
     // a scene photographed straight down has nothing in it to judge the light
     // by. Looking ACROSS the clearing puts the treeline and the sky in frame,
     // which is what the trees were added for.
-    float camera_yaw = 0.7f + yaw_offset, camera_pitch = 0.26f,
+    float focus_height = focus_start;
+    float camera_yaw = 0.7f + yaw_offset, camera_pitch = pitch_start,
           camera_distance = 13.0f;
     float baked_az = 1e9f, baked_el = 1e9f;
     bool ssao_on = ssao_start;
@@ -948,6 +966,8 @@ int main(int argc, char** argv) {
     app->Actions().Bind("left", 'a');
     app->Actions().Bind("right", 'd');
     app->Actions().Bind("run", ' ');
+    app->Actions().Bind("raise", 'e');
+    app->Actions().Bind("lower", 'q');
 
     eng::RenderGraph graph;
     // Allocated lazily on the first frame, when the framebuffer size is known.
@@ -960,7 +980,12 @@ int main(int argc, char** argv) {
         // --- camera ----------------------------------------------------------
         if (app->Actions().Down("orbit")) {
             camera_yaw += f.mouse_dx * 0.006f;
-            camera_pitch = std::clamp(camera_pitch - f.mouse_dy * 0.004f, 0.15f, 1.35f);
+            // DOWN TO -0.55, so the camera can get below the focus and look
+            // UP. It was clamped at 0.15 and could only ever look down -- in a
+            // forest, where the canopy is the most interesting thing in the
+            // scene and the one place backlit leaves are visible, there was no
+            // way to point at it at all.
+            camera_pitch = std::clamp(camera_pitch - f.mouse_dy * 0.004f, -1.20f, 1.35f);
         }
         camera_distance = std::clamp(camera_distance - f.scroll * 1.2f, 6.0f, 60.0f);
         // 0 goes back to the character, 1-5 to the districts.
@@ -970,6 +995,10 @@ int main(int argc, char** argv) {
             if (app->Actions().Pressed(kStopAction[k])) goto_stop = k;
         if (app->Actions().Pressed("fog")) post->config.fog = !post->config.fog;
         if (app->Actions().Pressed("taa")) post->config.taa = !post->config.taa;
+        if (app->Actions().Down("raise"))
+            focus_height = std::min(focus_height + f.dt * 9.0f, 22.0f);
+        if (app->Actions().Down("lower"))
+            focus_height = std::max(focus_height - f.dt * 9.0f, 0.4f);
         if (app->Actions().Pressed("ssao")) ssao_on = !ssao_on;
         if (app->Actions().Pressed("shafts")) shafts_on = !shafts_on;
 
@@ -1042,14 +1071,24 @@ int main(int argc, char** argv) {
             // Looking back OUT at the district. The camera sits at focus +
             // offset and looks along -offset, so the offset is the inward
             // direction and the yaw is its angle.
-            camera_yaw = std::atan2(inward.z, inward.x);
+            // Plus whatever --yaw asked for. It is an offset on the arrival
+            // angle, and without adding it here the teleport silently discards
+            // it -- which made every capture face wherever the district
+            // happened to be rather than where it was asked to face.
+            camera_yaw = std::atan2(inward.z, inward.x) + yaw_offset;
             camera_distance = 9.0f;
             path.clear();
             path_at = 0;
             here = goto_stop;
             goto_stop = -1;
         }
-        const eng::Vec3 focus = player.Feet() + eng::Vec3{0.0f, 1.0f, 0.0f};
+        // LOOK-AT HEIGHT, and it is not cosmetic. The camera always looks AT
+        // the focus, so with the focus pinned a metre above the character's
+        // feet there is no combination of pitch and distance that points it at
+        // the canopy -- tilting only moves the camera, it does not aim it. In a
+        // forest that means the most interesting thing in the scene, and the
+        // only place a backlit leaf can be seen, was unreachable.
+        const eng::Vec3 focus = player.Feet() + eng::Vec3{0.0f, focus_height, 0.0f};
 
         const eng::Vec3 offset{std::cos(camera_yaw) * std::cos(camera_pitch),
                                std::sin(camera_pitch),
@@ -1328,7 +1367,7 @@ int main(int argc, char** argv) {
         std::snprintf(line, sizeof(line), "at: %s   (0-5 to travel)",
                       kStopList[std::clamp(here, 0, kStops - 1)].name);
         ui->Text(26, 152, line, eng::Vec4{0.92f, 0.94f, 0.98f, 1.0f});
-        ui->Text(26, 200, "wasd: walk   space: run   f t o v: effects   [ ]: sun   r: reset",
+        ui->Text(26, 200, "wasd: walk  space: run  qe: look down/up  f t o v: effects  [ ]: sun  r: reset",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
 
         // --- passes --------------------------------------------------------------

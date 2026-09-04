@@ -113,6 +113,9 @@ struct FrameUniforms {
     // few metres. Without this the only options are to bake the tiling into
     // every mesh that uses the material or to give up on detail textures.
     ENG_VEC4 uvScale;
+    // .rgb the colour transmitted through a thin surface, .w how much. Zero w
+    // is opaque, which is everything that is not a leaf.
+    ENG_VEC4 transmission;
 };
 
 // A local light. Sixteen bytes times four, so the array packs with no padding

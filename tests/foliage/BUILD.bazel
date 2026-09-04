@@ -1,0 +1,19 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Transmission through a thin surface. Its own test because every other
+# lighting check puts the sun in FRONT of the thing it measures, and this term
+# is exactly zero there -- so none of them could have caught its absence.
+cc_test(
+    name = "foliage_test",
+    size = "small",
+    srcs = ["main.cpp"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+    ],
+)
