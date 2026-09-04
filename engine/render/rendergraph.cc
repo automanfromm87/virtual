@@ -225,7 +225,7 @@ void RenderGraph::Execute(rhi::Device& dev) {
     for (int i : order_) {
         const Pass& p = passes_[i];
         if (p.compute) {
-            rhi::ComputeEncoder enc = dev.BeginCompute(p.timer);
+            rhi::ComputeEncoder enc = dev.BeginCompute(p.timer, p.name.c_str());
             p.compute(enc);
             dev.EndCompute();
             continue;
@@ -233,6 +233,10 @@ void RenderGraph::Execute(rhi::Device& dev) {
 
         rhi::PassDesc desc;
         desc.timer = p.timer;
+        // The graph already knows every pass's name; a capture may as well use
+        // it. Valid for the duration of Execute, which is the only place the
+        // descriptor lives.
+        desc.label = p.name.c_str();
         // A modification IS the colour attachment, loaded rather than cleared.
         desc.color = Valid(p.modifies) ? p.modifies : p.color;
         desc.load = p.load || Valid(p.modifies);

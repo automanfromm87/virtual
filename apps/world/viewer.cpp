@@ -930,7 +930,7 @@ int main(int argc, char** argv) {
             constexpr int kFace = 4;
             app->Gpu().BeginFrame();
             {
-                auto e = app->Gpu().BeginCompute();
+                auto e = app->Gpu().BeginCompute("skybake");
                 env->BakeSky(e, sky);
                 env->ReadCube(e, eng::Environment::Probe::Irradiance, kFace, 0.0f);
                 app->Gpu().EndCompute();
@@ -2202,14 +2202,19 @@ int main(int argc, char** argv) {
         // looks. DROPPED is the number that was shown nowhere at all: the
         // uniform ring is shared by every pass, and when it runs dry the passes
         // AFTER the one that drained it draw nothing. A black frame, no error.
-        const int dropped = rs.overflowed + app->Draw().ShadowOverflowCount();
+        const int dropped = app->Draw().DroppedThisFrame();
+        const int faults = app->Gpu().GpuFaultCount();
+        char tail[80] = "";
+        if (dropped)
+            std::snprintf(tail, sizeof(tail), "   %d DRAWS DROPPED: RING FULL", dropped);
+        else if (faults)
+            std::snprintf(tail, sizeof(tail), "   %d GPU FAULTS (see stderr)", faults);
         std::snprintf(line, sizeof(line), "shadow %d draws, %d culled%s",
                       app->Draw().ShadowDrawCount(),
-                      app->Draw().ShadowCulledCount(),
-                      dropped ? "   DRAWS DROPPED: RING FULL" : "");
+                      app->Draw().ShadowCulledCount(), tail);
         ui->Text(26, 50, line,
-                 dropped ? eng::Vec4{1.0f, 0.45f, 0.35f, 1.0f}
-                         : eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
+                 (dropped || faults) ? eng::Vec4{1.0f, 0.45f, 0.35f, 1.0f}
+                                     : eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
         std::snprintf(line, sizeof(line),
                       "sun %.0f deg   gi %s (%.0f ms, %d buried)",
                       sun_elevation * 57.2958f,
@@ -2608,7 +2613,7 @@ int main(int argc, char** argv) {
         // first, and one frame of lag in a value already smoothed over half a
         // second is invisible.
         {
-            auto e = app->Gpu().BeginCompute();
+            auto e = app->Gpu().BeginCompute("meter");
             post->MeterExposure(e, color);
             app->Gpu().EndCompute();
         }
@@ -2621,6 +2626,11 @@ int main(int argc, char** argv) {
                      std::chrono::steady_clock::now() - cpu_begin)
                      .count();
         pass_ms = app->Gpu().LastFrameTimings();
+        // A GPU FAULT IS NOT A BLACK FRAME ANY MORE. The description names the
+        // encoders that faulted; printed once each because the read clears it,
+        // and the count stays on the HUD after the text is gone.
+        if (const std::string fault = app->Gpu().TakeGpuFault(); !fault.empty())
+            std::fprintf(stderr, "GPU FAULT %s\n", fault.c_str());
         // Every frame during a capture, because the two things most likely to
         // be wrong in a screenshot are an exposure that has not settled and a
         // camera that is not where it was asked to be.
@@ -2638,15 +2648,13 @@ int main(int argc, char** argv) {
                             "shadow %d/%d culled, %d dropped, %d sparks\n",
                             indirect_draws, indirect_batches, rem_draws,
                             app->Draw().ShadowDrawCount(), app->Draw().ShadowCulledCount(),
-                            app->Draw().LastStats().overflowed + app->Draw().ShadowOverflowCount(),
-                            sparks->LiveCountSlow());
+                            app->Draw().DroppedThisFrame(), sparks->LiveCountSlow());
             else
                 std::printf("             %d draws (%d transparent), %d culled, "
                             "shadow %d/%d culled, %d dropped, %d sparks\n",
                             app->Draw().LastStats().draws, app->Draw().LastStats().transparent_draws, app->Draw().LastStats().culled,
                             app->Draw().ShadowDrawCount(), app->Draw().ShadowCulledCount(),
-                            app->Draw().LastStats().overflowed + app->Draw().ShadowOverflowCount(),
-                            sparks->LiveCountSlow());
+                            app->Draw().DroppedThisFrame(), sparks->LiveCountSlow());
         }
 
         if (!shot_path.empty() && int(f.index) >= shot_frames) {

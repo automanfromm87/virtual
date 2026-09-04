@@ -156,6 +156,20 @@ struct Device::Impl {
     std::vector<GpuTiming> timings;
     std::uint64_t timings_frame = 0;
 
+    // --- GPU faults -------------------------------------------------------
+    //
+    // A command buffer that fails on the GPU sets `error` and produces NOTHING
+    // -- no draws, no error return, no exception. Commit() never looked, so the
+    // only symptom reaching a person was a black or stale frame, and three
+    // recent commit messages say exactly that in three different
+    // investigations. The buffer is created asking for
+    // EncoderExecutionStatus, so the fault can name the encoder that faulted
+    // rather than only the frame, which is the difference between a bug report
+    // and a bisect.
+    std::mutex fault_mutex;
+    std::string last_fault;
+    int fault_count = 0;
+
     // Throttles the CPU to kFramesInFlight outstanding frames. Signalled from
     // each command buffer's completion handler.
     dispatch_semaphore_t frame_sem = nil;
@@ -190,15 +204,47 @@ struct Device::Impl {
     }
 
     // Never recycles slot 0 (null) or kDrawableSlot.
+    //
+    // LABELS EVERY TEXTURE ON THE WAY THROUGH, which is why the label is set
+    // here and not at the twenty call sites: this is the one funnel they all
+    // pass through, and the description is read off the texture itself rather
+    // than passed in, so no creation signature has to grow a name. Without it
+    // an Xcode capture of this engine is a list of numbered resources, and the
+    // one thing a capture is for -- finding out which target a pass is reading
+    // -- takes longer than reading the source.
     std::uint32_t AllocTextureSlot(id<MTLTexture> t) {
+        std::uint32_t slot;
         if (!free_textures.empty()) {
-            const std::uint32_t slot = free_textures.back();
+            slot = free_textures.back();
             free_textures.pop_back();
             textures[slot] = t;
-            return slot;
+        } else {
+            textures.push_back(t);
+            slot = std::uint32_t(textures.size() - 1);
         }
-        textures.push_back(t);
-        return std::uint32_t(textures.size() - 1);
+        if (t.label == nil) {
+            NSMutableString* n = [NSMutableString
+                stringWithFormat:@"tex%u %lux%lu", slot,
+                                 (unsigned long)t.width, (unsigned long)t.height];
+            if (t.depth > 1) [n appendFormat:@"x%lu", (unsigned long)t.depth];
+            if (t.arrayLength > 1) [n appendFormat:@"[%lu]", (unsigned long)t.arrayLength];
+            if (t.mipmapLevelCount > 1) [n appendFormat:@" %lumip", (unsigned long)t.mipmapLevelCount];
+            if (t.sampleCount > 1) [n appendFormat:@" %lux", (unsigned long)t.sampleCount];
+            [n appendFormat:@" fmt%lu", (unsigned long)t.pixelFormat];
+            t.label = n;
+        }
+        return slot;
+    }
+    // Same reason as AllocTextureSlot: the label is what makes a capture
+    // readable, and there is no reason for a creation signature to grow a name
+    // when the kind and the size already say which buffer this is.
+    std::uint32_t AllocBufferSlot(id<MTLBuffer> b, const char* kind) {
+        if (b.label == nil)
+            b.label = [NSString stringWithFormat:@"%s%zu %zuB", kind,
+                                                 buffers.size(),
+                                                 std::size_t(b.length)];
+        buffers.push_back(b);
+        return std::uint32_t(buffers.size() - 1);
     }
     std::vector<PipelineObj> pipelines{PipelineObj{}};
     std::vector<id<MTLComputePipelineState>> compute_pipelines{nil};
@@ -468,8 +514,7 @@ BufferId Device::CreateBuffer(const void* data, std::size_t bytes) {
                                               length:bytes
                                              options:MTLResourceStorageModeShared];
     if (!b) return {};
-    impl_->buffers.push_back(b);
-    return BufferId{std::uint32_t(impl_->buffers.size() - 1)};
+    return BufferId{impl_->AllocBufferSlot(b, "static")};
 }
 
 BufferId Device::CreateStorageBuffer(std::size_t bytes) {
@@ -480,8 +525,7 @@ BufferId Device::CreateStorageBuffer(std::size_t bytes) {
     id<MTLBuffer> b = [impl_->dev newBufferWithLength:bytes
                                               options:MTLResourceStorageModeShared];
     if (!b) return {};
-    impl_->buffers.push_back(b);
-    return BufferId{std::uint32_t(impl_->buffers.size() - 1)};
+    return BufferId{impl_->AllocBufferSlot(b, "storage")};
 }
 
 ComputePipelineId Device::CreateComputePipeline(const std::string& source,
@@ -504,8 +548,18 @@ ComputePipelineId Device::CreateComputePipeline(const std::string& source,
             error = "compute kernel '" + fn + "' not found in the source";
             return {};
         }
+        // A DESCRIPTOR, only so the pipeline can carry a label -- the state
+        // object's own label is read-only, and an unnamed compute pipeline in a
+        // capture is indistinguishable from every other one.
+        MTLComputePipelineDescriptor* cpd =
+            [[MTLComputePipelineDescriptor alloc] init];
+        cpd.label = [NSString stringWithUTF8String:fn.c_str()];
+        cpd.computeFunction = kernel;
         id<MTLComputePipelineState> pso =
-            [impl_->dev newComputePipelineStateWithFunction:kernel error:&err];
+            [impl_->dev newComputePipelineStateWithDescriptor:cpd
+                                                      options:MTLPipelineOptionNone
+                                                   reflection:nil
+                                                        error:&err];
         if (!pso) {
             error = std::string("compute pipeline creation failed: ") +
                     (err ? err.localizedDescription.UTF8String : "unknown error");
@@ -517,7 +571,7 @@ ComputePipelineId Device::CreateComputePipeline(const std::string& source,
     }
 }
 
-ComputeEncoder Device::BeginCompute(const char* timer) { @autoreleasepool {
+ComputeEncoder Device::BeginCompute(const char* timer, const char* label) { @autoreleasepool {
     const int slot = impl_->BeginTiming(timer);
     if (slot < 0) {
         impl_->compute_enc = [impl_->cb computeCommandEncoder];
@@ -530,6 +584,8 @@ ComputeEncoder Device::BeginCompute(const char* timer) { @autoreleasepool {
         cp.sampleBufferAttachments[0].endOfEncoderSampleIndex = NSUInteger(slot * 2 + 1);
         impl_->compute_enc = [impl_->cb computeCommandEncoderWithDescriptor:cp];
     }
+    const char* name = label ? label : timer;
+    if (name) impl_->compute_enc.label = [NSString stringWithUTF8String:name];
     impl_->compute_group_max = 64;
     return ComputeEncoder(this);
 }}
@@ -627,8 +683,7 @@ BufferId Device::CreateDynamicBuffer(std::size_t bytes) {
     id<MTLBuffer> b = [impl_->dev newBufferWithLength:bytes
                                               options:MTLResourceStorageModeShared];
     if (!b) return {};
-    impl_->buffers.push_back(b);
-    return BufferId{std::uint32_t(impl_->buffers.size() - 1)};
+    return BufferId{impl_->AllocBufferSlot(b, "dynamic")};
 }
 
 void* Device::MapBuffer(BufferId b) {
@@ -1097,6 +1152,10 @@ PipelineId Device::CreatePipeline(const PipelineDesc& desc, std::string& error) 
     }
 
     MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
+    // Named by its entry points, which is how a capture identifies a draw.
+    pd.label = [NSString stringWithFormat:@"%s/%s", desc.vertex_fn.c_str(),
+                                          desc.depth_only ? "depth-only"
+                                                          : desc.fragment_fn.c_str()];
     pd.vertexFunction = vs;
     pd.fragmentFunction = fs;
     // A depth-only pipeline has NO colour attachment. Declaring one that the
@@ -1222,6 +1281,9 @@ PipelineId Device::CreateMeshPipeline(const MeshPipelineDesc& desc,
     }
     MTLMeshRenderPipelineDescriptor* pd =
         [[MTLMeshRenderPipelineDescriptor alloc] init];
+    pd.label = [NSString stringWithFormat:@"%s/%s/%s", desc.object_fn.c_str(),
+                                          desc.mesh_fn.c_str(),
+                                          desc.fragment_fn.c_str()];
     pd.objectFunction =
         [lib newFunctionWithName:[NSString stringWithUTF8String:desc.object_fn.c_str()]];
     pd.meshFunction =
@@ -1323,8 +1385,16 @@ void Device::BeginFrame() { @autoreleasepool {
     while (now > prev && !impl_->peak_in_flight.compare_exchange_weak(prev, now)) {
     }
 
-    impl_->cb = [impl_->queue commandBuffer];
+    // A DESCRIPTOR, for errorOptions. Without EncoderExecutionStatus a GPU
+    // fault reports only that the buffer failed; with it, done.error carries an
+    // MTLCommandBufferEncoderInfo per encoder saying which one was affected and
+    // whether it completed, started, or never ran.
+    MTLCommandBufferDescriptor* cbd = [[MTLCommandBufferDescriptor alloc] init];
+    cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+    impl_->cb = [impl_->queue commandBufferWithDescriptor:cbd];
     ++impl_->frame_index;
+    impl_->cb.label = [NSString stringWithFormat:@"frame %llu",
+                                                 (unsigned long long)impl_->frame_index];
     impl_->timed_this_frame = 0;
     impl_->timing_labels.clear();
 
@@ -1364,6 +1434,30 @@ void Device::InstallFrameCompletion() { @autoreleasepool {
         // work of one pass with the fragment work of the last.
         impl->gpu_ms.store((done.GPUEndTime - done.GPUStartTime) * 1000.0,
                            std::memory_order_relaxed);
+        if (done.error) {
+            // Name the encoders, not just the frame. Metal reports one info
+            // record per encoder; the ones that did not complete are the
+            // interesting ones and are listed first in the message.
+            std::string msg = std::string("frame ") + std::to_string(frame) +
+                              ": " + done.error.localizedDescription.UTF8String;
+            NSArray<id<MTLCommandBufferEncoderInfo>>* infos =
+                done.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+            for (id<MTLCommandBufferEncoderInfo> info in infos) {
+                if (info.errorState == MTLCommandEncoderErrorStateCompleted)
+                    continue;
+                const char* state =
+                    info.errorState == MTLCommandEncoderErrorStateAffected  ? "affected"
+                    : info.errorState == MTLCommandEncoderErrorStateFaulted ? "FAULTED"
+                    : info.errorState == MTLCommandEncoderErrorStatePending ? "pending"
+                                                                            : "unknown";
+                msg += std::string("\n    encoder '") +
+                       (info.label ? info.label.UTF8String : "(unnamed)") + "' " +
+                       state;
+            }
+            std::lock_guard<std::mutex> guard(impl->fault_mutex);
+            impl->last_fault = std::move(msg);
+            ++impl->fault_count;
+        }
         if (timed > 0 && counters) {
             NSData* data = [counters
                 resolveCounterRange:NSMakeRange(NSUInteger(base * 2),
@@ -1440,6 +1534,18 @@ std::vector<GpuTiming> Device::LastFrameTimings() const {
     return impl_->timings;
 }
 
+std::string Device::TakeGpuFault() {
+    std::lock_guard<std::mutex> guard(impl_->fault_mutex);
+    std::string out;
+    out.swap(impl_->last_fault);
+    return out;
+}
+
+int Device::GpuFaultCount() const {
+    std::lock_guard<std::mutex> guard(impl_->fault_mutex);
+    return impl_->fault_count;
+}
+
 double Device::LastFrameGpuMilliseconds() const {
     return impl_->gpu_ms.load(std::memory_order_relaxed);
 }
@@ -1501,6 +1607,10 @@ Encoder Device::BeginPass(const PassDesc& desc) { @autoreleasepool {
     // The encoder is held by a strong ivar, so it outlives this pool.
     impl_->pass_has_depth = Valid(desc.depth);
     impl_->enc = [impl_->cb renderCommandEncoderWithDescriptor:rp];
+    // NAMED, which PassDesc::timer's comment has always claimed and the code
+    // never did. A capture of this engine was fourteen numbered encoders.
+    const char* name = desc.label ? desc.label : desc.timer;
+    if (name) impl_->enc.label = [NSString stringWithUTF8String:name];
     impl_->pass_views = desc.views > 8 ? 8 : (desc.views < 1 ? 1 : desc.views);
     return Encoder(this);
 }}

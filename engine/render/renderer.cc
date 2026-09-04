@@ -494,6 +494,32 @@ struct Renderer::Impl {
         return off;
     }
 
+    // ONE COUNTER FOR THE WHOLE FRAME, because the ring is one ring.
+    //
+    // Every pass allocates from it and there are twenty-six places that give up
+    // when it is dry -- a `break` out of a submit loop, a `continue` past a
+    // palette, and thirteen fullscreen passes that simply `return`. Each of
+    // those was individually reasonable and collectively invisible: the frame
+    // that exhausted the ring in the shadow pass came out BLACK, because the
+    // composite asked for a slice, got none, and drew nothing.
+    //
+    // RenderStats cannot hold this. Every Draw* call resets it, so the count
+    // would be whichever pass happened to run last. Keyed on the monotonic
+    // frame index for the same reason AllocUniform is, and reset the same way.
+    std::uint64_t drop_frame = ~std::uint64_t{0};
+    int dropped = 0;
+    void NoteDrop(int n) {
+        const std::uint64_t frame = dev->FrameIndex();
+        if (frame != drop_frame) {
+            drop_frame = frame;
+            dropped = 0;
+        }
+        dropped += n;
+    }
+    [[nodiscard]] int DroppedThisFrame() const {
+        return dev->FrameIndex() == drop_frame ? dropped : 0;
+    }
+
     // Which of the three geometry passes is running. A bool was enough for
     // two; a third makes every call site read `false, true` and mean nothing.
     enum class GeometryPass { Forward, GBuffer, Oit, Stereo, Meshlet };
@@ -713,6 +739,7 @@ int Renderer::PipelineCount() const { return int(impl_->pipeline_cache.size()); 
 int Renderer::ShadowDrawCount() const { return impl_->shadow_draws; }
 int Renderer::ShadowCulledCount() const { return impl_->shadow_culled; }
 int Renderer::ShadowOverflowCount() const { return impl_->shadow_overflowed; }
+int Renderer::DroppedThisFrame() const { return impl_->DroppedThisFrame(); }
 
 std::uint32_t Renderer::PipelineOf(MaterialHandle m) const {
     if (!Valid(m) || m.v >= impl_->materials.size()) return 0;
@@ -1541,9 +1568,10 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
             // comes out black with nothing to point at, so count what was lost
             // and let the caller see it: the rest of this cascade, and all of
             // every cascade after it.
-            impl_->shadow_overflowed +=
-                int(scene.instances.size() - n) +
-                int(scene.instances.size()) * (cascades - 1 - cascade);
+            const int lost = int(scene.instances.size() - n) +
+                             int(scene.instances.size()) * (cascades - 1 - cascade);
+            impl_->shadow_overflowed += lost;
+            impl_->NoteDrop(lost);
             ring_dry = true;
             break;
         }
@@ -1551,7 +1579,7 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
         std::size_t palette_offset = Impl::kNoSpace;
         if (skinned) {
             palette_offset = impl_->AllocPalette();
-            if (palette_offset == Impl::kNoSpace) continue;  // ring full: skip
+            if (palette_offset == Impl::kNoSpace) { impl_->NoteDrop(1); continue; }
             std::memcpy(impl_->palette_map + palette_offset,
                         scene.joint_matrices.data() + inst.palette,
                         sizeof(Mat4) * std::size_t(gm.joint_count));
@@ -1654,13 +1682,13 @@ void Renderer::DrawLightShadows(rhi::Encoder& enc, const Scene& scene) {
                     continue;
                 const GpuMesh& gm = impl_->meshes[inst.mesh.v];
                 const std::size_t offset = impl_->AllocUniform();
-                if (offset == Impl::kNoSpace) break;
+                if (offset == Impl::kNoSpace) { impl_->NoteDrop(1); break; }
 
                 const bool skinned = IsSkinned(gm, inst, scene);
                 std::size_t palette_offset = Impl::kNoSpace;
                 if (skinned) {
                     palette_offset = impl_->AllocPalette();
-                    if (palette_offset == Impl::kNoSpace) continue;
+                    if (palette_offset == Impl::kNoSpace) { impl_->NoteDrop(1); continue; }
                     std::memcpy(impl_->palette_map + palette_offset,
                                 scene.joint_matrices.data() + inst.palette,
                                 sizeof(Mat4) * std::size_t(gm.joint_count));
@@ -1733,12 +1761,12 @@ void Renderer::DrawSceneDepth(rhi::Encoder& enc, const Scene& scene, int width,
                 continue;
         }
         const std::size_t offset = impl_->AllocUniform();
-        if (offset == Impl::kNoSpace) break;
+        if (offset == Impl::kNoSpace) { impl_->NoteDrop(1); break; }
 
         std::size_t palette_offset = Impl::kNoSpace;
         if (skinned) {
             palette_offset = impl_->AllocPalette();
-            if (palette_offset == Impl::kNoSpace) continue;
+            if (palette_offset == Impl::kNoSpace) { impl_->NoteDrop(1); continue; }
             std::memcpy(impl_->palette_map + palette_offset,
                         scene.joint_matrices.data() + inst.palette,
                         sizeof(Mat4) * std::size_t(gm.joint_count));
@@ -1971,8 +1999,8 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
         if (offset == Impl::kNoSpace) {
             // Ring slot full. Drop the rest rather than overrun, and SAY so —
             // a silently short frame is the worst possible failure here.
-            stats.overflowed =
-                int(visible.size()) - stats.draws;
+            stats.overflowed = int(visible.size()) - stats.draws;
+            NoteDrop(stats.overflowed);
             break;
         }
 
@@ -1985,6 +2013,7 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
             palette_offset = AllocPalette();
             if (palette_offset == Impl::kNoSpace) {
                 ++stats.overflowed;
+                NoteDrop(1);
                 continue;
             }
             std::memcpy(palette_map + palette_offset,
@@ -2191,7 +2220,7 @@ void Renderer::DrawTriangle(rhi::Encoder& enc, int width, int height) {
     // DrawScene and DrawTriangle in the same frame would make the triangle
     // stomp the uniforms the first instance had already encoded a draw against.
     const std::size_t offset = impl_->AllocUniform();
-    if (offset == Impl::kNoSpace) return;
+    if (offset == Impl::kNoSpace) { impl_->NoteDrop(1); return; }
     std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
 
     const GpuMaterial& mat = impl_->materials[kMaterialFlat.v];
@@ -2284,7 +2313,7 @@ void Renderer::DrawComposite(rhi::Encoder& enc, rhi::TextureId src,
     FrameUniforms u{};
     u.lighting = Vec4{0.0f, Valid(bloom) ? bloom_strength : 0.0f, vignette, 0.0f};
     const std::size_t offset = impl_->AllocUniform();
-    if (offset == Impl::kNoSpace) return;
+    if (offset == Impl::kNoSpace) { impl_->NoteDrop(1); return; }
     std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
 
     const ColorGrade& g = impl_->grade;
@@ -2385,7 +2414,7 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
                            impl_->env.capture_position.z, 0.0f};
 
     const std::size_t offset = impl_->AllocUniform();
-    if (offset == Impl::kNoSpace) return;
+    if (offset == Impl::kNoSpace) { impl_->NoteDrop(1); return; }
     std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
 
     enc.SetPipeline(impl_->deferred_light);
@@ -2692,7 +2721,7 @@ void Renderer::DrawSceneIndirect(rhi::Encoder& enc, const Scene& scene, int widt
         if (!Valid(mat.instanced_pipeline)) { ++impl_->stats.invalid; continue; }
 
         const std::size_t offset = impl_->AllocUniform();
-        if (offset == Impl::kNoSpace) { ++impl_->stats.overflowed; break; }
+        if (offset == Impl::kNoSpace) { ++impl_->stats.overflowed; impl_->NoteDrop(1); break; }
 
         FrameUniforms u{};
         u.viewProj = viewProj;
@@ -2869,7 +2898,7 @@ int Renderer::SkinToBuffers(rhi::ComputeEncoder& enc, const Scene& scene) {
 
         // The palette, into the same ring the draw path uses.
         const std::size_t palette_offset = impl_->AllocPalette();
-        if (palette_offset == Impl::kNoSpace) continue;
+        if (palette_offset == Impl::kNoSpace) { impl_->NoteDrop(1); continue; }
         std::memcpy(impl_->palette_map + palette_offset,
                     scene.joint_matrices.data() + inst.palette,
                     sizeof(Mat4) * std::size_t(gm.joint_count));
@@ -3001,7 +3030,7 @@ void Renderer::DrawRayShadows(rhi::Encoder& enc, const Scene& scene, int width,
                                         : 200.0f};
 
     const std::size_t offset = impl_->AllocUniform();
-    if (offset == Impl::kNoSpace) return;
+    if (offset == Impl::kNoSpace) { impl_->NoteDrop(1); return; }
     std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
 
     enc.SetPipeline(impl_->ray_shadow);
@@ -3020,7 +3049,7 @@ void Renderer::DrawBloomBright(rhi::Encoder& enc, rhi::TextureId src,
     FrameUniforms u{};
     u.ssao = Vec4{threshold, knee, 0.0f, 0.0f};
     const std::size_t offset = impl_->AllocUniform();
-    if (offset == Impl::kNoSpace) return;
+    if (offset == Impl::kNoSpace) { impl_->NoteDrop(1); return; }
     std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
 
     enc.SetPipeline(impl_->bloom_bright);
@@ -3037,7 +3066,7 @@ void Renderer::DrawBloomBlur(rhi::Encoder& enc, rhi::TextureId src,
     FrameUniforms u{};
     u.ssao = Vec4{0.0f, 0.0f, texel_x, texel_y};
     const std::size_t offset = impl_->AllocUniform();
-    if (offset == Impl::kNoSpace) return;
+    if (offset == Impl::kNoSpace) { impl_->NoteDrop(1); return; }
     std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
 
     enc.SetPipeline(impl_->bloom_blur);
@@ -3058,7 +3087,7 @@ void Renderer::DrawSsao(rhi::Encoder& enc, const Camera& cam, int width,
                   float(width) / float(height), radius};
 
     const std::size_t offset = impl_->AllocUniform();
-    if (offset == Impl::kNoSpace) return;
+    if (offset == Impl::kNoSpace) { impl_->NoteDrop(1); return; }
     std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
 
     enc.SetPipeline(impl_->ssao);

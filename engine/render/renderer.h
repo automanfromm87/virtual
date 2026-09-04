@@ -755,6 +755,17 @@ class Renderer {
     // shadow pass that exhausts it leaves the scene pass with nothing and the
     // frame comes out black. Watch it, do not just log it.
     [[nodiscard]] int ShadowOverflowCount() const;
+    // EVERY draw the whole frame lost to the shared uniform ring running dry,
+    // summed over every pass -- the shadow cascades, the depth prepass, the
+    // colour pass, the skinning palettes and the thirteen fullscreen passes
+    // that quietly return when they cannot get a slice.
+    //
+    // One number rather than one per pass because there is one ring, and the
+    // failure it produces is not "a pass drew less": it is that the pass which
+    // drained the ring made every LATER pass draw nothing. Non-zero means the
+    // frame on screen is wrong. Reset per frame, keyed on the device's frame
+    // index, so it is correct whichever pass asks.
+    [[nodiscard]] int DroppedThisFrame() const;
     // Which pipeline a material resolved to. Exposed so a test can assert the
     // cache's actual INVARIANT — that two materials differing only in encoder
     // state share one pipeline — instead of a total count, which goes stale

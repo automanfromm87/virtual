@@ -223,7 +223,7 @@ int main(int argc, char** argv) {
         // The sim first, on a compute encoder: five dispatches per substep,
         // all before any pass reads the particles.
         {
-            auto ce = app->Gpu().BeginCompute();
+            auto ce = app->Gpu().BeginCompute("fluid");
             const int sub = sim->Step(ce, config.headless ? config.fixed_dt
                                                           : std::min(f.dt, 1.0f / 30.0f));
             app->Gpu().EndCompute();

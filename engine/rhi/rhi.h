@@ -241,10 +241,15 @@ struct PassDesc {
     // mapping: view i goes to slice i. Anything else would be a foveated or
     // multi-viewport arrangement this does not do.
     int views = 1;
-    // Names this pass in the GPU timing report and in a frame capture. Null
-    // means untimed, which costs nothing at all -- a sample-buffer attachment
-    // is only added to passes that asked for one.
+    // Names this pass in the GPU timing report. Null means untimed, which
+    // costs nothing at all -- a sample-buffer attachment is only added to
+    // passes that asked for one.
     const char* timer = nullptr;
+    // Names this pass's ENCODER in a frame capture. Falls back to `timer`, so a
+    // timed pass is named without asking. Separate from `timer` because naming
+    // is free and timing is not: a pass can be worth finding in a capture
+    // without being worth two timestamp slots.
+    const char* label = nullptr;
     // Attachments 1..n, paired with PipelineDesc::extra_colors. All are
     // cleared to `clear_color` -- a G-buffer wants every channel cleared to a
     // known value anyway, and a per-attachment clear colour would be four more
@@ -702,13 +707,30 @@ class Device {
     // number: the per-pass timings do not sum to it, because passes overlap.
     [[nodiscard]] double LastFrameGpuMilliseconds() const;
 
+    // --- GPU faults ------------------------------------------------------------
+    //
+    // A command buffer that fails on the GPU produces no image and no error
+    // return: Commit is fire-and-forget, and the failure arrives later on a
+    // driver thread. Nothing looked, so every GPU fault this engine has ever
+    // had presented as a black or stale frame with nothing to point at.
+    //
+    // The most recent fault's description, INCLUDING the labels of the encoders
+    // that faulted or were affected, and cleared by the read -- so a caller
+    // that prints it once prints it once. Empty when there has been none.
+    [[nodiscard]] std::string TakeGpuFault();
+    // How many faults since the device was created. Unlike TakeGpuFault this
+    // does not clear, so a HUD can keep saying that something went wrong after
+    // the description has been logged.
+    [[nodiscard]] int GpuFaultCount() const;
+
     [[nodiscard]] Encoder BeginPass(const PassDesc&);
     void EndPass();
 
     // A compute pass. Must not overlap a render pass on the same device -- see
     // ComputeEncoder for why that is a hardware fact and not a rule this layer
-    // invented. `timer` behaves as PassDesc::timer does.
-    [[nodiscard]] ComputeEncoder BeginCompute(const char* timer = nullptr);
+    // invented. `timer` and `label` behave as PassDesc's do.
+    [[nodiscard]] ComputeEncoder BeginCompute(const char* timer = nullptr,
+                                              const char* label = nullptr);
     void EndCompute();
     // Whether the pass currently open has a depth attachment. A pipeline built
     // without depth cannot be used in a pass that has one, and vice versa —
