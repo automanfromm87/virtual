@@ -271,6 +271,20 @@ int main() {
                 sky_up = eng::Vec3{sky_up.x + v.x, sky_up.y + v.y, sky_up.z + v.z};
             }
             sky_up = sky_up * (1.0f / 16.0f);
+            // TIMES PI. The irradiance cube does not hold irradiance: it holds
+            // the cosine-weighted MEAN RADIANCE, because that is what the
+            // shader wants to multiply an albedo by -- diffuse is albedo * E /
+            // pi and E is pi * Lbar, so the pi cancels and the lookup can be
+            // used directly. cs_irradiance says so where it normalises by the
+            // accumulated weight rather than by pi/N.
+            //
+            // This comparison is against the SUN's irradiance, so the sky's has
+            // to be an irradiance too. Without this the two sides differ by pi
+            // and the ratio comes out three times too small -- which is exactly
+            // what made a sky three times too BRIGHT look correct here, and is
+            // why the multiple-scattering gain was fitted to 3.4 when the
+            // physics wanted about 1.
+            sky_up = sky_up * 3.14159265f;
             const eng::Vec3 sun = eng::Environment::SunColor(tilted_sun);
             const float sun_level = sun.y * std::sin(elevation);
             const float ratio = sun_level / std::max(sky_up.y, 1e-6f);

@@ -61,66 +61,44 @@ constant float kMieG = 0.758;
 // when it is reflected.
 constant float kSunDiscGain = 2000.0;
 
-// MULTIPLE SCATTERING, as an isotropic addition to the single-scatter integral.
+// MULTIPLE SCATTERING, computed rather than fitted.
 //
-// The march below follows each photon exactly once: sun -> one scattering event
-// -> eye. A real photon bounces around the atmosphere many times before it
-// arrives, and the ones that bounce more than once are a large fraction of a
-// clear sky's light. Leaving them out does not make the sky slightly dim, it
-// makes it dim by a factor of four, and it is the single reason a physically
-// correct renderer produces harsh outdoor images: the SUN is right, the sky is
-// a quarter of what it should be, and every shadow is therefore two stops too
+// The march below follows each photon exactly once: sun, one scattering event,
+// eye. A real photon bounces many times before it arrives, and the ones that
+// bounce more than once are most of a clear sky's light -- leaving them out
+// does not make the sky slightly dim, it makes it dim by a factor of four, and
+// that is the whole reason a physically correct renderer produces harsh
+// outdoor images. The sun comes out right and every shadow is two stops too
 // dark.
 //
-// Measured, at 32 degrees of sun elevation, against the irradiance the
-// environment cube actually delivers on a level surface:
+// THE FIRST VERSION OF THIS WAS A FITTED GAIN. An isotropic term times 3.4,
+// with a second constant to whiten it with optical depth, both turned until the
+// sun-to-sky ratio matched the real one. It worked, and it was two numbers with
+// no derivation behind them -- change the turbidity or the scale heights and
+// they would be wrong with nothing to say so.
 //
-//   sun_intensity 22 stands for the 1361 W/m^2 at the top of the atmosphere,
-//   so one unit is 62 W/m^2. Single scattering gave 0.41 units = 25 W/m^2.
-//   A clear sky at that elevation delivers 100 to 130. Direct sun was 9.3
-//   units = 577 W/m^2 against a real 420, so the sun was close and the sky
-//   was not: 23:1 where the world is about 4:1.
+// This is Hillaire's construction instead. Light that has scattered twice is
+// computed directly by integrating over the sphere; light that has scattered
+// three times is that result scaled by the same transfer fraction, four times
+// by the square, and so on. The series is geometric, so the whole infinite tail
+// sums in closed form:
 //
-// ISOTROPIC and not another phase-weighted term, because that is what multiple
-// scattering does -- each additional bounce washes out the direction the light
-// came from, and by the third the sky has forgotten where the sun is. Using the
-// Rayleigh phase again would deepen the glow around the sun instead of lifting
-// the whole dome, which is the opposite of the effect.
+//     Psi = L_2nd / (1 - F)
 //
-// The gain is fitted, and it has to be: getting it from first principles means
-// solving the radiative transfer equation to convergence, which is the thing
-// this approximation exists to avoid. What is NOT fitted is the target -- the
-// sun-to-sky irradiance ratio of a clear sky is a measured property of the
-// atmosphere, and sky_test pins this to it.
-constant float kMultiScatter = 3.4;
+// where F is the fraction of light a point re-scatters rather than loses. Both
+// terms come out of the medium's own coefficients, so turbidity and scale
+// height feed through on their own and there is nothing left to tune.
+//
+// The spectrum falls out too. The first version needed an explicit whitening
+// term because weighting multiple scattering by the single-scatter spectrum
+// made the horizon bluer than the zenith, when it must be whiter; here F is
+// per channel, so blue -- which scatters most -- also has the largest F and the
+// strongest amplification, and the saturation that produces is the same
+// saturation that whitens a deep sky. It is not corrected for, it is what the
+// series does.
+constant int kMsDirections = 64;   // sphere samples per LUT texel
+constant int kMsSteps = 20;        // march steps per direction
 constant float kIsotropicPhase = 0.0795774715;  // 1 / (4 pi)
-// How far the multiply-scattered term is pulled toward grey.
-//
-// Rayleigh scattering goes as 1/lambda^4, so blue scatters about six times as
-// readily as red -- which is why the sky is blue, and why the FIRST version of
-// the term above weighted it by the full Rayleigh coefficient. That is wrong,
-// and it broke a test that was right: the horizon came out marginally BLUER
-// than the zenith when it must be whiter.
-//
-// The reason is that the same 1/lambda^4 that scatters blue in also scatters it
-// back out. After one bounce the light is blue; after many it has been
-// redistributed so often that the spectrum flattens, which is exactly why a
-// hazy sky is white and a deep one is blue. Weighting multiple scattering by
-// the single-scattering spectrum applies the selectivity once per bounce and
-// never applies the saturation.
-//
-// The horizon is where this shows, because it is the direction with the most
-// atmosphere in it and therefore the most multiple scattering.
-//
-// SO THE WHITENING TRACKS OPTICAL DEPTH rather than being a constant. A fixed
-// fraction cannot work: at 0 the horizon comes out bluer than the zenith, and
-// at 0.72 -- enough to fix the horizon -- the zenith's blue/red falls from 2.4
-// to 1.2 and the sky stops being blue at all. They are not the same question.
-// Looking up through a tenth of an atmosphere the light has scattered about
-// once and is blue; looking along the horizon through forty times as much it
-// has scattered many times and is white. This is the optical depth at which it
-// is half way between.
-constant float kWhitenDepth = 1.5;
 
 // THE PRECISION PROBLEM, and why both functions below are written oddly.
 //
@@ -211,7 +189,7 @@ struct SkyParams {
     float4 sun_dir;       // .xyz toward the sun, .w sun angular radius (radians)
     float4 ground;        // .xyz albedo, .w turbidity
     float4 tune;          // .x sun intensity, .y exposure, .z night lift, .w unused
-    uint4 size;           // .x cube face size, .yzw unused
+    uint4 size;           // .x cube face size, .y multi-scatter table size
 };
 
 // The SCATTERED radiance along `dir` -- the sky itself, with no solar disc and
@@ -219,8 +197,103 @@ struct SkyParams {
 // needs to know how bright the sky is in order to work out what it is
 // reflecting, and a ground lit by a hand-picked constant instead is the reason
 // most skies have a lower hemisphere that is either black or glowing.
+// The optical depth from `x` along `dir` to the top of the atmosphere.
+static float3 SunOpticalDepth(float3 x, float3 dir, float mie_scale, int steps) {
+    const float t = RayAtmosphereExit(x, dir, kAtmosphereRadius);
+    if (t <= 0.0) return float3(0.0);
+    const float dt = t / float(steps);
+    float r = 0.0, m = 0.0;
+    for (int i = 0; i < steps; ++i) {
+        const float h = max(length(x + dir * (dt * (float(i) + 0.5))) - kGroundRadius, 0.0);
+        r += exp(-h / kRayleighScaleHeight) * dt;
+        m += exp(-h / kMieScaleHeight) * dt;
+    }
+    return kRayleigh * r + float3(mie_scale * 1.1) * m;
+}
+
+// A Fibonacci sphere, which is the cheapest way to get directions that are
+// evenly spread. Random ones cluster, and a latitude-longitude grid puts most
+// of its samples at the poles -- both show up here as a LUT that is noisy in
+// one place and smooth in another.
+static float3 FibonacciDirection(int i, int n) {
+    const float y = 1.0 - (float(i) + 0.5) / float(n) * 2.0;
+    const float r = sqrt(max(1.0 - y * y, 0.0));
+    const float phi = float(i) * 2.39996323;  // the golden angle
+    return float3(cos(phi) * r, y, sin(phi) * r);
+}
+
+// One texel of the multiple-scattering table: the amplification a point at this
+// altitude, under a sun at this angle, applies to the light it scatters.
+//
+// The isotropic phase everywhere is not a simplification made for speed. After
+// two bounces the light has genuinely forgotten which way it came, and using
+// the Rayleigh phase again would deepen the glow around the sun rather than
+// lifting the whole dome -- which is the opposite of what multiple scattering
+// does.
+static float3 MultiScatterAt(float altitude, float mu_s, constant SkyParams& p) {
+    const float mie_scale = max(p.ground.w, 0.0) * kMie;
+    const float3 pos = float3(0.0, kGroundRadius + altitude, 0.0);
+    const float3 sun = normalize(float3(sqrt(max(1.0 - mu_s * mu_s, 0.0)), mu_s, 0.0));
+
+    float3 second = float3(0.0);    // light arriving after exactly two scatters
+    float3 transfer = float3(0.0);  // the fraction this point re-scatters
+
+    for (int d = 0; d < kMsDirections; ++d) {
+        const float3 w = FibonacciDirection(d, kMsDirections);
+        const float ground_t = RayGroundHit(pos, w, kGroundRadius);
+        const float sky_t = RayAtmosphereExit(pos, w, kAtmosphereRadius);
+        const float end = ground_t > 0.0 ? ground_t : sky_t;
+        if (end <= 0.0) continue;
+        const float dt = end / float(kMsSteps);
+
+        float3 tau = float3(0.0);
+        for (int i = 0; i < kMsSteps; ++i) {
+            const float3 x = pos + w * (dt * (float(i) + 0.5));
+            const float h = max(length(x) - kGroundRadius, 0.0);
+            const float3 sigma_r = kRayleigh * exp(-h / kRayleighScaleHeight);
+            const float3 sigma_m = float3(mie_scale) * exp(-h / kMieScaleHeight);
+            const float3 sigma_s = sigma_r + sigma_m;
+            const float3 sigma_t = sigma_r + sigma_m * 1.1;
+
+            const float3 through = exp(-tau);  // reaching x from pos along w
+            // The sun's contribution at x, if the planet is not in the way.
+            if (RayGroundHit(x, sun, kGroundRadius) <= 0.0) {
+                const float3 to_sun = exp(-SunOpticalDepth(x, sun, mie_scale, 6));
+                second += through * to_sun * sigma_s * (kIsotropicPhase * dt);
+            }
+            // What a point scatters rather than absorbs or passes: this is the
+            // F that makes the series geometric.
+            transfer += through * sigma_s * dt;
+            tau += sigma_t * dt;
+        }
+    }
+
+    const float inv = 1.0 / float(kMsDirections);
+    second *= inv * p.tune.x;
+    transfer *= inv;
+    // 1 / (1 - F), summing every order above the second. Clamped because a
+    // medium that scattered everything and absorbed nothing would give an
+    // infinite series -- physically it cannot, since photons escape, but the
+    // integral above is discrete and can round past it.
+    return second / max(float3(1.0) - transfer, float3(1e-3));
+}
+
+kernel void cs_multiscatter(texture2d<float, access::write> out [[texture(0)]],
+                            constant SkyParams& p [[buffer(0)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    const uint n = p.size.y;
+    if (gid.x >= n || gid.y >= n) return;
+    // x is the sun's cosine from straight up, over the whole range: the sky
+    // has to be right at sunset as well as at noon. y is altitude.
+    const float mu_s = (float(gid.x) + 0.5) / float(n) * 2.0 - 1.0;
+    const float altitude =
+        (float(gid.y) + 0.5) / float(n) * (kAtmosphereRadius - kGroundRadius);
+    out.write(float4(MultiScatterAt(altitude, mu_s, p), 1.0), gid);
+}
+
 static float3 ScatteredRadiance(float3 dir, constant SkyParams& p, thread float3& out_tau,
-                                int view_steps, int sun_steps) {
+                                int view_steps, int sun_steps,
+                                texture2d<float> ms, sampler ms_smp) {
     const float3 sun = normalize(p.sun_dir.xyz);
     const float3 eye = float3(0.0, kGroundRadius + 2.0, 0.0);
     out_tau = float3(0.0);
@@ -263,6 +336,31 @@ static float3 ScatteredRadiance(float3 dir, constant SkyParams& p, thread float3
         mie_sum += attenuation * dm;
     }
 
+    // MULTIPLE SCATTERING, from the table. Walked separately from the loop
+    // above because that one skips any step the planet shadows from the sun --
+    // correct for single scattering, wrong for this: a point in the Earth's
+    // shadow still receives light that bounced its way in, and that is most of
+    // what makes a twilight sky bright rather than black.
+    float3 multi = float3(0.0);
+    if (!is_null_texture(ms)) {
+        const float3 view_att_scale = float3(1.0);
+        float3 view_tau = float3(0.0);
+        for (int i = 0; i < view_steps; ++i) {
+            const float3 pos = eye + dir * (step_len * (float(i) + 0.5));
+            const float h = max(length(pos) - kGroundRadius, 0.0);
+            const float3 sigma_r = kRayleigh * exp(-h / kRayleighScaleHeight);
+            const float3 sigma_m = float3(mie_scale) * exp(-h / kMieScaleHeight);
+            const float mu_s = dot(normalize(pos), sun);
+            const float2 uv =
+                float2(mu_s * 0.5 + 0.5,
+                       clamp(h / (kAtmosphereRadius - kGroundRadius), 0.0, 1.0));
+            const float3 psi = ms.sample(ms_smp, uv).rgb;
+            multi += exp(-view_tau) * psi * (sigma_r + sigma_m) * step_len *
+                     view_att_scale;
+            view_tau += (sigma_r + sigma_m * 1.1) * step_len;
+        }
+    }
+
     // Handed back so the disc can be attenuated by exactly the air the view ray
     // passed through, rather than by a second march that would have to agree.
     out_tau = kRayleigh * optical_r + float3(mie_scale * 1.1) * optical_m;
@@ -270,12 +368,10 @@ static float3 ScatteredRadiance(float3 dir, constant SkyParams& p, thread float3
     const float cos_theta = dot(dir, sun);
     const float3 single = rayleigh_sum * kRayleigh * RayleighPhase(cos_theta) +
                           mie_sum * mie_scale * MiePhase(cos_theta, kMieG);
-    const float3 grey = float3((kRayleigh.x + kRayleigh.y + kRayleigh.z) / 3.0);
-    const float tau_view = grey.x * optical_r;
-    const float3 ms_rayleigh = mix(kRayleigh, grey, tau_view / (tau_view + kWhitenDepth));
-    const float3 multi = (rayleigh_sum * ms_rayleigh + mie_sum * mie_scale) *
-                         (kMultiScatter * kIsotropicPhase);
-    return float3(p.tune.x) * (single + multi);
+    // No gain, no whitening term. Both were fitted; the table carries the
+    // amplification and its spectrum comes out of the medium's own
+    // coefficients, so there is nothing left here to turn.
+    return float3(p.tune.x) * single + multi;
 }
 
 // The irradiance the SKY puts on level ground: a cosine-weighted average over
@@ -297,12 +393,13 @@ static float3 ScatteredRadiance(float3 dir, constant SkyParams& p, thread float3
 // Recomputed per ground texel, which is redundant: it depends only on the sun.
 // Hoisting it would mean a second dispatch and a buffer to carry one float3
 // between them, and the bake happens when the sun moves rather than per frame.
-static float3 SkyIrradianceOnGround(constant SkyParams& p) {
+static float3 SkyIrradianceOnGround(constant SkyParams& p,
+                                    texture2d<float> ms, sampler ms_smp) {
     float3 sum = float3(0.0);
     float weight = 0.0;
     float3 ignored = float3(0.0);
 
-    sum += ScatteredRadiance(float3(0, 1, 0), p, ignored, 6, 3) * 1.0;
+    sum += ScatteredRadiance(float3(0, 1, 0), p, ignored, 6, 3, ms, ms_smp) * 1.0;
     weight += 1.0;
 
     const float theta = 0.96;  // 55 degrees from vertical
@@ -312,7 +409,7 @@ static float3 SkyIrradianceOnGround(constant SkyParams& p) {
         const float3 d = float3(st * cos(phi), ct, st * sin(phi));
         // Weighted by the cosine, which is Lambert's law: a direction 55
         // degrees off vertical delivers cos(55) of what the zenith does.
-        sum += ScatteredRadiance(d, p, ignored, 6, 3) * ct;
+        sum += ScatteredRadiance(d, p, ignored, 6, 3, ms, ms_smp) * ct;
         weight += ct;
     }
     // Mean radiance times pi is the irradiance, because the cosine-weighted
@@ -321,12 +418,13 @@ static float3 SkyIrradianceOnGround(constant SkyParams& p) {
 }
 
 // The radiance arriving from `dir`. This is the whole sky model.
-static float3 SkyRadiance(float3 dir, constant SkyParams& p) {
+static float3 SkyRadiance(float3 dir, constant SkyParams& p,
+                          texture2d<float> ms, sampler ms_smp) {
     const float3 sun = normalize(p.sun_dir.xyz);
     const float3 eye = float3(0.0, kGroundRadius + 2.0, 0.0);
 
     float3 tau = float3(0.0);
-    float3 result = ScatteredRadiance(dir, p, tau, 24, 8);
+    float3 result = ScatteredRadiance(dir, p, tau, 24, 8, ms, ms_smp);
     const bool hits_ground = RayGroundHit(eye, dir, kGroundRadius) > 0.0;
 
     // THE SUN'S DISC, drawn only where the ground does not block it. Its
@@ -380,7 +478,7 @@ static float3 SkyRadiance(float3 dir, constant SkyParams& p) {
     // definition of a Lambertian reflector and is where the factor most
     // implementations fudge actually comes from.
     if (hits_ground) {
-        const float3 sky_irradiance = SkyIrradianceOnGround(p);
+        const float3 sky_irradiance = SkyIrradianceOnGround(p, ms, ms_smp);
         // The sun's, as radiance times the solid angle it subtends times the
         // cosine at the ground. The solid angle is what makes this small: a
         // disc of a quarter degree covers 68 millionths of a steradian, and an
@@ -399,6 +497,8 @@ static float3 SkyRadiance(float3 dir, constant SkyParams& p) {
 // One texel of one cube face. `gid.z` is the face, which is why the output is
 // bound as a 2D array rather than as a cubemap -- see Device::CreateMipView.
 kernel void cs_sky_cube(texture2d_array<float, access::write> out [[texture(0)]],
+                        texture2d<float> ms [[texture(1)]],
+                        sampler ms_smp [[sampler(0)]],
                         constant SkyParams& p [[buffer(0)]],
                         uint3 gid [[thread_position_in_grid]]) {
     const uint n = p.size.x;
@@ -419,7 +519,7 @@ kernel void cs_sky_cube(texture2d_array<float, access::write> out [[texture(0)]]
         default: dir = float3(-uv.x, -uv.y, -1.0); break;
     }
     dir = normalize(dir);
-    out.write(float4(SkyRadiance(dir, p), 1.0), gid.xy, gid.z);
+    out.write(float4(SkyRadiance(dir, p, ms, ms_smp), 1.0), gid.xy, gid.z);
 }
 
 // --- drawing the sky behind the scene ---------------------------------------

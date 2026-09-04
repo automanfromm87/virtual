@@ -125,6 +125,13 @@ struct Environment::Impl {
     rhi::TextureId brdf_view;
 
     rhi::ComputePipelineId sky_cube;
+    // The multiple-scattering table: how much a point at a given altitude,
+    // under a sun at a given angle, amplifies the light it scatters. Small
+    // because it is smooth in both axes -- it is an integral over the whole
+    // sphere, so there is nothing sharp in it to resolve.
+    rhi::ComputePipelineId multiscatter;
+    rhi::TextureId ms_lut;
+    static constexpr int kMsSize = 32;
     rhi::ComputePipelineId equirect;
     rhi::ComputePipelineId irradiance_pass;
     rhi::ComputePipelineId prefilter;
@@ -193,6 +200,15 @@ std::unique_ptr<Environment> Environment::Create(rhi::Device& dev,
     const std::string ibl = IblSource();
     im.sky_cube = dev.CreateComputePipeline(SkySource(), "cs_sky_cube", error);
     if (!Valid(im.sky_cube)) return nullptr;
+    im.multiscatter =
+        dev.CreateComputePipeline(SkySource(), "cs_multiscatter", error);
+    if (!Valid(im.multiscatter)) return nullptr;
+    im.ms_lut = dev.CreateStorageTexture2D(Impl::kMsSize, Impl::kMsSize,
+                                           rhi::Format::RGBA16Float);
+    if (!Valid(im.ms_lut)) {
+        error = "could not allocate the multiple-scattering table";
+        return nullptr;
+    }
     im.equirect = dev.CreateComputePipeline(ibl, "cs_equirect_to_cube", error);
     if (!Valid(im.equirect)) return nullptr;
     im.irradiance_pass = dev.CreateComputePipeline(ibl, "cs_irradiance", error);
@@ -315,8 +331,19 @@ void Environment::BakeSky(rhi::ComputeEncoder& enc, const SkyConfig& sky) {
     // spare, and it moves with sun_intensity instead of being a magic number.
     impl_->diffuse_clamp = sky.sun_intensity * sky.exposure * 4.0f;
 
+    // THE TABLE FIRST. The cube's march samples it at every step, so it has to
+    // exist before the cube is written -- and it depends only on the sun angle
+    // and the turbidity, so it is rebuilt exactly when the sky is.
+    p.size.y = std::uint32_t(Impl::kMsSize);
+    enc.SetPipeline(impl_->multiscatter);
+    enc.SetTexture(impl_->ms_lut, 0);
+    enc.SetBytes(&p, sizeof(p), 0);
+    enc.Dispatch2D(Impl::kMsSize, Impl::kMsSize);
+
     enc.SetPipeline(impl_->sky_cube);
     enc.SetTexture(impl_->radiance_views[0], 0);
+    enc.SetTexture(impl_->ms_lut, 1);
+    enc.SetSampler(impl_->lut_sampler, 0);
     enc.SetBytes(&p, sizeof(p), 0);
     enc.Dispatch3D(impl_->cube_size, impl_->cube_size, 6);
     impl_->BakeChain(enc);

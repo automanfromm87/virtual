@@ -703,11 +703,20 @@ int main(int argc, char** argv) {
                 sky_down = face_mean(3);  // -Y
             }
         }
-        std::printf("    sun %.2f, sky %.2f (%.1f:1) at %.0f degrees\n",
-                    scene.lightColor.y * std::max(sky.sun_direction.y, 0.0f), sky_up.y,
-                    double(scene.lightColor.y * std::max(sky.sun_direction.y, 0.0f) /
-                           std::max(sky_up.y, 1e-4f)),
-                    sun_elevation * 57.2958f);
+        // TIMES PI for the printed sky figure. The cube holds cosine-weighted
+        // MEAN RADIANCE, which is what the shader wants to multiply an albedo
+        // by; irradiance is pi times it. The GI bake below is fed the raw value
+        // on purpose -- its own convention is that a constant environment
+        // integrates to itself -- but comparing it against the SUN, which is an
+        // irradiance, needs the conversion or the ratio comes out three times
+        // too small.
+        {
+            const float sun_e = scene.lightColor.y * std::max(sky.sun_direction.y, 0.0f);
+            const float sky_e = sky_up.y * 3.14159265f;
+            std::printf("    sun %.2f, sky %.2f (%.1f:1) at %.0f degrees\n", sun_e,
+                        sky_e, double(sun_e / std::max(sky_e, 1e-4f)),
+                        sun_elevation * 57.2958f);
+        }
         std::vector<eng::GiTriangle> soup;
         const eng::Vec3 grass{ground_md.base_color.x, ground_md.base_color.y,
                               ground_md.base_color.z};
