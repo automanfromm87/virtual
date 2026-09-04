@@ -70,7 +70,8 @@ float ValueNoise(float x, float z) {
     return (a + (b - a) * sx) + ((c + (d - c) * sx) - (a + (b - a) * sx)) * sz;
 }
 
-float Landscape(float x, float z) {
+// The raw ground: noise plus the bowl that keeps the character in the world.
+float Wilderness(float x, float z) {
     float height = 0.0f, amplitude = 6.0f, frequency = 0.012f;
     for (int octave = 0; octave < 4; ++octave) {
         height += (ValueNoise(x * frequency, z * frequency) - 0.5f) * amplitude;
@@ -82,6 +83,27 @@ float Landscape(float x, float z) {
     // to do for itself.
     const float r = std::sqrt(x * x + z * z);
     height += std::max(0.0f, (r - 46.0f) * 0.55f);
+    return height;
+}
+
+// The ground the world is actually built on: the wilderness, with a level pad
+// cut under each district. See world::kPads for why this is not optional.
+//
+// The terrain mesh, the physics heightfield and every ground_y the builders use
+// all come through here, so they cannot disagree about where the ground is --
+// which is the failure this replaced, in the other direction.
+float Landscape(float x, float z) {
+    float height = Wilderness(x, z);
+    for (const world::Pad& pad : world::kPads) {
+        const float dx = x - pad.centre.x, dz = z - pad.centre.z;
+        const float d = std::sqrt(dx * dx + dz * dz);
+        const float level = Wilderness(pad.centre.x, pad.centre.z);
+        // Inside the pad it is flat; outside, it may pull away from pad level
+        // at kPadSlope and no faster. Clamping rather than blending is what
+        // bounds the join's steepness by construction -- see world::kPadSlope.
+        const float room = std::max(0.0f, d - pad.radius) * world::kPadSlope;
+        height = std::clamp(height, level - room, level + room);
+    }
     return height;
 }
 
@@ -1063,27 +1085,161 @@ int main(int argc, char** argv) {
 
     // A COLLISION SELF-CHECK, on a scratch controller so nothing real moves.
     //
-    // The forest and every district were render-only for their whole existence
-    // and the symptom was silence: the physics world had one body in it, so
-    // there was nothing to hit and nothing to report. A count of colliders does
-    // not prove they stop anything -- a capsule at the wrong height or a box
-    // with zero extent adds to the count and blocks nothing -- so this walks
-    // into one and looks at where it ends up.
+    // IT WALKS INTO THE BODIES THEMSELVES, sampled out of the physics world,
+    // rather than toward the districts. Two earlier versions were wrong in ways
+    // worth keeping written down:
+    //
+    //   - the first probed only the banner pole and reported "blocked". It was
+    //     right; the pole did have a collider. The GALLERY'S SPHERES did not,
+    //     so the character stood in the middle of them overlapping four at
+    //     once, and a check that passes while that is true checks nothing.
+    //
+    //   - the second probed each district's CENTRE and reported four of five
+    //     walked through. Also wrong, in the other direction: the gallery has
+    //     no sphere on its centre line, the pillars are at +/-1.7 and +/-5.1,
+    //     and every glass pane is on the far side. It was walking down the
+    //     gaps. A district is not an object and cannot be collided with.
+    //
+    // A count of colliders settles none of it either -- a capsule at the wrong
+    // height or a sphere of the wrong radius adds to the count and stops
+    // nothing. Walking into the actual body is the only thing that does.
+    //   - the third WALKED the character at each body from a few metres out.
+    //     Wrong for a reason specific to this scene: the approach runs through
+    //     two hundred trees, so the probe stops on a DIFFERENT trunk and either
+    //     reports a pass it did not earn or, having been deflected sideways,
+    //     slides past the target and reports a failure that is not real. A
+    //     shape test on flat ground (engine/physics/heightfield_test.cc) shows
+    //     box, sphere and capsule all stop a character, so those failures were
+    //     the probe's, not the engine's.
+    //
+    // What the user actually reported was standing INSIDE the gallery spheres,
+    // and that is a property with no path in it: put the character where the
+    // body is, take one step, and it must no longer be inside. That is the
+    // depenetration path, it needs no clear approach lane, and it costs one
+    // step per body instead of several hundred -- so this checks every body
+    // rather than a sample of two dozen.
     {
-        eng::physics::CharacterController probe(cc);
-        const float px = world::kFlag.x + 3.0f, pz = world::kFlag.z;
-        probe.Teleport(eng::Vec3{px, terrain.HeightAt(px, pz) + 0.5f, pz});
-        for (int i = 0; i < 240; ++i)
-            probe.Move(world, eng::Vec3{-0.025f, -cc.skin * (2.0f / 3.0f), 0.0f});
-        // SIGNED, and that is the whole check. The first version took the
-        // unsigned distance and reported "blocked, 3.00 m" for a character that
-        // had walked from three metres in front of the pole clean through to
-        // three metres behind it -- both are three metres away. A test that
-        // cannot tell "stopped short" from "went straight through" is not
-        // testing collision at all.
-        const float dx = probe.Feet().x - world::kFlag.x;
-        std::printf("  walked 6 m at the banner pole from x+3: ended at x%+.2f (%s)\n",
-                    dx, dx > cc.radius * 0.8f ? "blocked" : "WALKED THROUGH");
+        const eng::physics::Shape body_shape = eng::physics::Shape::MakeCapsule(
+            cc.radius, std::max(0.01f, (cc.height - 2.0f * cc.radius) * 0.5f));
+        const eng::Quat upright{0.0f, 0.0f, 0.0f, 1.0f};
+        std::vector<int> hits;
+        int tested = 0, stuck = 0, phantom = 0;
+        const int n = world.Count();
+        for (int i = 1; i < n; ++i) {
+            const eng::physics::Body& body = world[i];
+            const float ground = terrain.HeightAt(body.position.x, body.position.z);
+            // Out of a walking character's reach -- a lantern four metres up is
+            // not something you can stand inside, and counting it would make
+            // the check impossible to satisfy.
+            if (body.position.y - ground > cc.height) continue;
+            // Feet on the ground, centred on the body: the pose a player ends
+            // up in by walking at something that turns out not to be there.
+            const eng::Vec3 centre{body.position.x, ground + cc.height * 0.5f,
+                                   body.position.z};
+            hits.clear();
+            world.OverlapShape(body_shape, centre, upright, &hits, {});
+            // A body at head height whose own centre the character can stand
+            // on WITHOUT touching it is a collider that is too small or in the
+            // wrong place -- which is the other half of the bug, and skipping
+            // it quietly is how a check like this passes while the scene is
+            // broken. Counted, not ignored.
+            if (std::find(hits.begin(), hits.end(), i) == hits.end()) {
+                ++phantom;
+                if (phantom <= 6)
+                    std::printf("    body %d: r=%.2f at (%.1f, %.1f), nothing to "
+                                "touch at its own centre (y=%.2f, ground=%.2f)\n", i, body.shape.bounds_radius,
+                                body.position.x, body.position.z, body.position.y, ground);
+                continue;
+            }
+            ++tested;
+            eng::physics::CharacterController probe(cc);
+            probe.Teleport(eng::Vec3{body.position.x, ground, body.position.z});
+            // SEVERAL steps, not one. Depenetration moves a bounded distance
+            // per call on purpose -- teleporting a character out of a deep
+            // overlap launches it through whatever is on the other side -- so
+            // one step is not enough to clear a two-metre trunk and asking for
+            // it would fail a controller that is behaving correctly. Half a
+            // second is the honest bar: you may clip in, you may not stay in.
+            for (int k = 0; k < 30; ++k)
+                probe.Move(world, eng::Vec3{0.0f, -cc.skin * (2.0f / 3.0f), 0.0f});
+            const eng::Vec3 f = probe.Feet();
+            hits.clear();
+            world.OverlapShape(body_shape, eng::Vec3{f.x, f.y + cc.height * 0.5f, f.z},
+                               upright, &hits, {});
+            if (std::find(hits.begin(), hits.end(), i) != hits.end()) {
+                ++stuck;
+                if (stuck <= 6)
+                    std::printf("    body %d: r=%.2f, still inside after a step, "
+                                "moved %.2f m\n", i, body.shape.bounds_radius,
+                                Length(f - eng::Vec3{body.position.x, ground,
+                                                     body.position.z}));
+            }
+        }
+        // AND YOU CAN STILL WALK IN. Cutting a level pad into a hillside
+        // steepens the ground at the join -- smoothstep's slope peaks at 1.5x
+        // the linear ramp, and the bowl wall is already 0.55 m per metre -- so
+        // the fix for "the district is buried" has an obvious way to become
+        // "the district is a plateau with a cliff round it".
+        //
+        // ASKING THE NAVMESH DOES NOT ANSWER THIS. That was the first version
+        // here, and squeezing the blend from 9 m to 0.5 m -- which turns the
+        // rim into a wall -- still reported all five reachable, because the
+        // navmesh is voxelised from the terrain's COARSEST lod and a half-metre
+        // cliff falls between its samples. A check that cannot fail is worse
+        // than no check: it reads as evidence. The slope itself is one
+        // subtraction and it is exact at any width.
+        {
+            const float limit = std::tan(cc.slope_limit_degrees * world::kPi / 180.0f);
+            float worst = 0.0f, raw_worst = 0.0f;
+            int blocked = 0;
+            for (const world::Pad& pad : world::kPads) {
+                float pad_worst = 0.0f, pad_raw = 0.0f;
+                // Through the whole blend annulus, finely enough to land inside
+                // a narrow one -- the step is what sets the smallest cliff this
+                // can see, so it is a fraction of a metre and not of the blend.
+                // Out well past where the clamp can still be biting: it
+                // releases where the terrain comes back within kPadSlope of pad
+                // level, which for a several-metre drop is tens of metres.
+                for (float d = pad.radius - 1.0f; d < pad.radius + 30.0f; d += 0.25f)
+                    for (int a = 0; a < 48; ++a) {
+                        const float th = float(a) / 48.0f * 2.0f * world::kPi;
+                        const float x = pad.centre.x + std::cos(th) * d;
+                        const float z = pad.centre.z + std::sin(th) * d;
+                        // Sampled radially, the direction the pad's own slope
+                        // runs; a gradient in x and z would average it away.
+                        const float h0 = terrain.HeightAt(x, z);
+                        const float h1 = terrain.HeightAt(pad.centre.x + std::cos(th) * (d + 0.25f),
+                                                          pad.centre.z + std::sin(th) * (d + 0.25f));
+                        pad_worst = std::max(pad_worst, std::fabs(h1 - h0) / 0.25f);
+                        // THE CONTROL. Terrain this size has steep ground in it
+                        // anyway -- the forest already rejects 31 degrees for
+                        // planting -- so an absolute number says nothing about
+                        // whether the PAD did it. This is the same ring on the
+                        // ground that would be there without one.
+                        pad_raw = std::max(
+                            pad_raw,
+                            std::fabs(Wilderness(pad.centre.x + std::cos(th) * (d + 0.25f),
+                                                 pad.centre.z + std::sin(th) * (d + 0.25f)) -
+                                      Wilderness(x, z)) / 0.25f);
+                    }
+                worst = std::max(worst, pad_worst);
+                raw_worst = std::max(raw_worst, pad_raw);
+                if (pad_worst > limit) ++blocked;
+                std::printf("    pad at (%4.0f, %4.0f): rim %2.0f deg, bare ground %2.0f deg%s\n",
+                            pad.centre.x, pad.centre.z,
+                            std::atan(pad_worst) * 180.0f / world::kPi,
+                            std::atan(pad_raw) * 180.0f / world::kPi,
+                            pad_worst > limit ? "   WALLED OFF" : "");
+            }
+            std::printf("  %zu district pads, steepest rim %.0f degrees (bare ground "
+                        "there is %.0f) against a %.0f degree limit, %d walled off\n",
+                        std::size(world::kPads), std::atan(worst) * 180.0f / world::kPi,
+                        std::atan(raw_worst) * 180.0f / world::kPi,
+                        cc.slope_limit_degrees, blocked);
+        }
+        std::printf("  stood inside %d of the world's %d bodies: %d did not push "
+                    "back, %d were not where they claim to be\n", tested, n, stuck,
+                    phantom);
     }
 
 

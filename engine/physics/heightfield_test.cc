@@ -343,6 +343,57 @@ int main() {
     }
 
     {
+        std::printf("\na character is stopped by every shape, not just boxes\n");
+        // Found in the demo: the banner pole, a BOX, blocked; the gallery's
+        // spheres and the tree trunks, capsules and spheres, did not. Whether
+        // that is the shape or something about how they were placed is exactly
+        // what a demo cannot tell you, so here it is on flat ground with one
+        // obstacle at a time.
+        const auto field = MakeFieldFrom(65, 0.5f, Vec3{-16.0f, 0.0f, -16.0f},
+                                         [](float, float) { return 0.0f; });
+        eng::physics::CharacterConfig cc;
+        cc.radius = 0.4f;
+        cc.height = 1.8f;
+        cc.slope_limit_degrees = 45.0f;
+        cc.step_height = 0.4f;
+
+        const auto walk_into = [&](const eng::physics::Shape& shape, float centre_y) {
+            eng::physics::World w;
+            eng::physics::Body ground;
+            ground.shape = eng::physics::Shape::MakeHeightfield(field);
+            ground.inverse_mass = 0.0f;
+            w.Add(ground);
+            eng::physics::Body obstacle;
+            obstacle.shape = shape;
+            obstacle.position = Vec3{0.0f, centre_y, 0.0f};
+            obstacle.SetMass(0.0f);
+            w.Add(obstacle);
+
+            eng::physics::CharacterController p(cc);
+            p.Teleport(Vec3{4.0f, 0.5f, 0.0f});
+            for (int i = 0; i < 320; ++i)
+                p.Move(w, Vec3{-0.025f, -cc.skin * (2.0f / 3.0f), 0.0f});
+            return p.Feet().x;
+        };
+
+        // A wall, which is the case that already worked.
+        const float box = walk_into(eng::physics::Shape::MakeBox(Vec3{0.3f, 1.5f, 3.0f}),
+                                    1.5f);
+        // A boulder at chest height, like the gallery's display spheres.
+        const float sphere = walk_into(eng::physics::Shape::MakeSphere(0.7f), 1.1f);
+        // A trunk, which is what two hundred of the colliders in the demo are.
+        const float capsule =
+            walk_into(eng::physics::Shape::MakeCapsule(0.3f, 1.6f), 1.6f);
+        std::printf("    walked from x=4 toward the origin: box stopped at %.2f, "
+                    "sphere at %.2f, capsule at %.2f\n", box, sphere, capsule);
+        // Positive means it stopped on the near side. Negative means it went
+        // through, and an unsigned distance would call both of them "stopped".
+        Check(box > 0.0f, "a box stops it");
+        Check(sphere > 0.0f, "and so does a sphere");
+        Check(capsule > 0.0f, "and so does a capsule");
+    }
+
+    {
         std::printf("\nthe ground stick has a window, and it is narrow\n");
         // THE MECHANISM behind a character that bounced forever in world2, and
         // it needed world2's OWN terrain to show: the smooth valley above does

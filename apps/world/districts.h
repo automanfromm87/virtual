@@ -51,16 +51,104 @@ namespace world {
 
 constexpr float kPi = 3.14159265358979f;
 
+// EVERY PIECE OF GEOMETRY GOES IN THROUGH ONE OF THESE TWO, and
+// scene.instances.push_back is not called anywhere else in this file.
+//
+// The first version added colliders "beside the geometry", which sounds like
+// enough and is not: eleven things were drawn and five were collided, and the
+// six that were missed included the gallery's display spheres -- so the
+// character walked into the middle of them and stood there overlapping four at
+// once. Nothing reported it, because a missing collider is an absence.
+//
+// Naming the two cases makes the choice explicit at every call. A decoration is
+// a deliberate statement that this thing has no substance -- a mark painted on
+// the ground, a hanging cloth -- and it reads as one. Forgetting is no longer
+// available.
+inline void AddSolid(eng::Scene& scene, eng::physics::World& world,
+                     const eng::Instance& in, const eng::physics::Shape& shape,
+                     eng::Vec3 at, eng::Quat orient = eng::Quat{0, 0, 0, 1}) {
+    scene.instances.push_back(in);
+    eng::physics::Body b;
+    b.shape = shape;
+    b.position = at;
+    b.orientation = orient;
+    b.SetMass(0.0f);
+    world.Add(b);
+}
+
+// Drawn and not solid, on purpose.
+inline void AddDecoration(eng::Scene& scene, const eng::Instance& in) {
+    scene.instances.push_back(in);
+}
+
 // Where each district sits, in metres from the middle of the valley.
 //
 // All of them are outside the 26 m spawn clearing and inside the 46 m rim where
 // the bowl starts climbing. They are far enough apart that no two are ever the
 // only thing in frame, which is the arrangement that makes them useful.
-inline constexpr eng::Vec3 kGallery{34.0f, 0.0f, -26.0f};
-inline constexpr eng::Vec3 kLanternHall{-36.0f, 0.0f, -28.0f};
-inline constexpr eng::Vec3 kGlassPavilion{30.0f, 0.0f, 30.0f};
-inline constexpr eng::Vec3 kFirePit{-26.0f, 0.0f, 28.0f};
+// PLACED INSIDE THE BOWL, not on its rim.
+//
+// These were at radius 42 to 46, and the bowl wall in Landscape() starts at 46
+// and climbs 0.55 m per metre: the lantern hall's far corner was 4.6 m up it,
+// with its pillars buried to the capital. Flattening a pad under each district
+// fixes the burying wherever they are, but on the rim the pad has several
+// metres of hillside to cut away and reads as a crater. Ten metres further in
+// costs nothing -- the playable area is 46 m of radius and the character walks
+// it in twenty seconds -- and the pads become a levelling touch rather than
+// earthworks.
+inline constexpr eng::Vec3 kGallery{27.0f, 0.0f, -21.0f};
+inline constexpr eng::Vec3 kLanternHall{-28.0f, 0.0f, -22.0f};
+inline constexpr eng::Vec3 kGlassPavilion{24.0f, 0.0f, 24.0f};
+inline constexpr eng::Vec3 kFirePit{-22.0f, 0.0f, 23.0f};
 inline constexpr eng::Vec3 kFlag{14.0f, 0.0f, 6.0f};
+
+// A DISTRICT IS BUILT ON A LEVEL PAD, and the terrain function has to cut it.
+//
+// Each builder below takes one `ground_y`, sampled once at the district's
+// centre, and places every pillar and plinth at that height. That is right for
+// architecture -- a colonnade whose bases follow a hillside is not a colonnade
+// -- but it is only right if the ground under it is actually level. The lantern
+// hall is 17 by 20 metres and its centre sits at r=45.6, one metre inside the
+// bowl rim at r=46 where the ground climbs 0.55 m per metre: its far corner was
+// 4.6 m up the wall, so the pillars there were buried to the capital and their
+// lanterns were underground. Nothing complained, because a collider inside a
+// hill is still a collider -- you simply cannot reach it, and it never stops
+// anyone. The self-check in the viewer counts exactly that case.
+//
+// So the flattening lives here, next to the coordinates it depends on, rather
+// than in the terrain function where it would be five magic circles that
+// silently stop matching when a district moves.
+struct Pad {
+    eng::Vec3 centre;
+    float radius;  // level out to here, then blend back over kPadBlend metres
+};
+inline constexpr Pad kPads[] = {
+    {kGallery, 8.0f},        // plinth is 6.1 x 6.1
+    {kLanternHall, 13.5f},   // 5x6 pillars at 3.4 m spacing
+    {kGlassPavilion, 6.5f},  // a fan of panes at radius 4.2
+    {kFirePit, 7.0f},        // stones at radius 3.4, embers out to 5
+    {kFlag, 4.0f},           // one pole and its shadow
+};
+// HOW FAST THE GROUND MAY CLIMB AWAY from a pad, as a gradient.
+//
+// The first version blended the pad back into the terrain over a fixed nine
+// metres with a smoothstep, and it walled off four of the five districts: the
+// pad has to absorb the whole height change across its radius into the blend,
+// so the join came out at about twice the natural slope -- 67 degrees where the
+// bare ground was 34 -- against a character that can climb 45. Widening the
+// blend enough to fix that made the pads overlap each other.
+//
+// So the join is a CONE CLAMP instead: past the pad's edge the ground may
+// differ from pad level by this gradient times the distance, and is otherwise
+// left alone. The slope of the result is then either the terrain's own or
+// exactly this, never a product of the two, and a deep drop simply takes
+// further to reach instead of turning into a wall. There is nothing to tune
+// against the pad radius, which is what made the blend width fragile.
+//
+// 0.55 is 29 degrees, comfortably inside the character's 45 and inside the 31
+// the forest requires to plant a tree, so a pad skirt stays walkable and
+// plantable rather than becoming a ring of bare steep ground.
+inline constexpr float kPadSlope = 0.55f;
 
 // A deterministic little generator, so a district is the same every run and two
 // screenshots can be compared. Same xorshift the tree generator uses.
@@ -110,14 +198,8 @@ inline void BuildGallery(eng::Renderer& r, eng::Scene& scene,
     plinth.material = stone_mat;
     const eng::Vec3 plinth_at{kGallery.x, ground_y + kTop * 0.5f, kGallery.z};
     plinth.model = eng::Mat4::Translation(plinth_at);
-    scene.instances.push_back(plinth);
-    {
-        eng::physics::Body b;
-        b.shape = eng::physics::Shape::MakeBox(eng::Vec3{w, kTop * 0.5f, d});
-        b.position = plinth_at;
-        b.SetMass(0.0f);
-        world.Add(b);
-    }
+    AddSolid(scene, world, plinth,
+             eng::physics::Shape::MakeBox(eng::Vec3{w, kTop * 0.5f, d}), plinth_at);
 
     for (int row = 0; row < Gallery::kRows; ++row)
         for (int col = 0; col < Gallery::kCols; ++col) {
@@ -135,14 +217,18 @@ inline void BuildGallery(eng::Renderer& r, eng::Scene& scene,
             const eng::MaterialHandle m = r.CreateMaterial(md, error);
             if (!eng::Valid(m)) return;
 
+            const eng::Vec3 at{
+                kGallery.x + (float(col) - float(Gallery::kCols - 1) * 0.5f) * kStep,
+                ground_y + kTop + 0.6f,
+                kGallery.z + (float(row) - float(Gallery::kRows - 1) * 0.5f) * kStep};
             eng::Instance in;
             in.mesh = sphere;
             in.material = m;
-            in.model = eng::Mat4::Translation(eng::Vec3{
-                kGallery.x + (float(col) - float(Gallery::kCols - 1) * 0.5f) * kStep,
-                ground_y + kTop + 0.6f,
-                kGallery.z + (float(row) - float(Gallery::kRows - 1) * 0.5f) * kStep});
-            scene.instances.push_back(in);
+            in.model = eng::Mat4::Translation(at);
+            // The mesh is a unit sphere of radius 0.5 drawn unscaled, so the
+            // collider is that and not the grid spacing -- getting this wrong
+            // is how a collider ends up the right count and the wrong size.
+            AddSolid(scene, world, in, eng::physics::Shape::MakeSphere(0.5f), at);
         }
 }
 
@@ -200,14 +286,11 @@ inline LanternHall BuildLanternHall(eng::Renderer& r, eng::Scene& scene,
             eng::Instance p;
             p.mesh = pillar_mesh;
             p.material = pillar_mat;
-            p.model = eng::Mat4::Translation(base + eng::Vec3{0, kHeight * 0.5f, 0});
-            scene.instances.push_back(p);
-            eng::physics::Body solid;
-            solid.shape = eng::physics::Shape::MakeBox(
-                eng::Vec3{0.22f, kHeight * 0.5f, 0.22f});
-            solid.position = base + eng::Vec3{0, kHeight * 0.5f, 0};
-            solid.SetMass(0.0f);
-            world.Add(solid);
+            const eng::Vec3 pillar_at = base + eng::Vec3{0, kHeight * 0.5f, 0};
+            p.model = eng::Mat4::Translation(pillar_at);
+            AddSolid(scene, world, p,
+                     eng::physics::Shape::MakeBox(eng::Vec3{0.22f, kHeight * 0.5f, 0.22f}),
+                     pillar_at);
 
             // Two lanterns per pillar at different heights, which is what takes
             // this past a hundred lights and into the range where clustering is
@@ -218,7 +301,10 @@ inline LanternHall BuildLanternHall(eng::Renderer& r, eng::Scene& scene,
                 bulb.mesh = sphere;
                 bulb.material = glass_mat;
                 bulb.model = eng::Mat4::Translation(at) * eng::Mat4::Scale(0.34f);
-                scene.instances.push_back(bulb);
+                // The lower lantern hangs at head height, so it is solid. The
+                // unit sphere is radius 0.5 and the scale is 0.34.
+                AddSolid(scene, world, bulb,
+                         eng::physics::Shape::MakeSphere(0.5f * 0.34f), at);
 
                 eng::Light light;
                 light.type = eng::LightType::Point;
@@ -316,10 +402,16 @@ inline void BuildGlassPavilion(eng::Renderer& r, eng::Scene& scene,
             eng::Instance post;
             post.mesh = frame_mesh;
             post.material = frame_mat;
+            const float c2 = std::cos(-angle), s2 = std::sin(-angle);
+            const eng::Vec3 off{float(side) * kW * 0.5f, 0.0f, 0.0f};
+            const eng::Vec3 post_at =
+                at + eng::Vec3{off.x * c2 + off.z * s2, -0.05f, -off.x * s2 + off.z * c2};
             post.model = eng::Mat4::Translation(at + eng::Vec3{0, -0.05f, 0}) *
                          eng::Mat4::RotationY(-angle) *
-                         eng::Mat4::Translation(eng::Vec3{float(side) * kW * 0.5f, 0, 0});
-            scene.instances.push_back(post);
+                         eng::Mat4::Translation(off);
+            AddSolid(scene, world, post,
+                     eng::physics::Shape::MakeBox(eng::Vec3{0.05f, kH * 0.55f, 0.05f}),
+                     post_at);
         }
 
         eng::Instance pane;
@@ -327,17 +419,12 @@ inline void BuildGlassPavilion(eng::Renderer& r, eng::Scene& scene,
         pane.material = glass[std::size_t(i % 3)];
         pane.tint = eng::Vec4{1.0f, 1.0f, 1.0f, tints[std::size_t(i % 3)].w};
         pane.model = eng::Mat4::Translation(at) * eng::Mat4::RotationY(-angle);
-        scene.instances.push_back(pane);
         // Glass is SOLID. Being able to see through a thing is not the same as
         // being able to walk through it, and a transparent material is exactly
         // where that gets forgotten.
-        eng::physics::Body col;
-        col.shape = eng::physics::Shape::MakeBox(eng::Vec3{kW * 0.5f, kH * 0.5f, 0.06f});
-        col.position = at;
-        col.orientation = eng::Quat{0.0f, std::sin(-angle * 0.5f), 0.0f,
-                                    std::cos(-angle * 0.5f)};
-        col.SetMass(0.0f);
-        world.Add(col);
+        AddSolid(scene, world, pane,
+                 eng::physics::Shape::MakeBox(eng::Vec3{kW * 0.5f, kH * 0.5f, 0.06f}), at,
+                 eng::Quat{0.0f, std::sin(-angle * 0.5f), 0.0f, std::cos(-angle * 0.5f)});
     }
 }
 
@@ -392,14 +479,9 @@ inline void BuildFirePit(eng::Renderer& r, eng::Scene& scene,
                                  ground_y + size * 0.35f,
                                  kFirePit.z + std::sin(a) * radius}) *
                    eng::Mat4::Scale(size * 2.0f);
-        scene.instances.push_back(in);
-        eng::physics::Body col;
-        col.shape = eng::physics::Shape::MakeSphere(size);
-        col.position = eng::Vec3{kFirePit.x + std::cos(a) * radius,
-                                 ground_y + size * 0.35f,
-                                 kFirePit.z + std::sin(a) * radius};
-        col.SetMass(0.0f);
-        world.Add(col);
+        AddSolid(scene, world, in, eng::physics::Shape::MakeSphere(size),
+                 eng::Vec3{kFirePit.x + std::cos(a) * radius, ground_y + size * 0.35f,
+                           kFirePit.z + std::sin(a) * radius});
     }
     // Embers in the middle, so the fire has a source when the particles are off.
     for (int i = 0; i < 5; ++i) {
@@ -411,7 +493,9 @@ inline void BuildFirePit(eng::Renderer& r, eng::Scene& scene,
                        eng::Vec3{kFirePit.x + std::cos(a) * d, ground_y + 0.10f,
                                  kFirePit.z + std::sin(a) * d}) *
                    eng::Mat4::Scale(0.20f + rng.Unit() * 0.12f);
-        scene.instances.push_back(in);
+        // Embers are ash and charcoal in the fire's middle. Nothing to walk
+        // into that the stone ring does not already stop.
+        AddDecoration(scene, in);
     }
 
     // A light in the fire. Without one the pit glows and lights nothing, which
@@ -446,7 +530,8 @@ inline void BuildFirePit(eng::Renderer& r, eng::Scene& scene,
             eng::Instance in;
             in.mesh = r.UploadMesh(eng::MakeGroundDecal(gd, height));
             in.material = soot_mat;
-            scene.instances.push_back(in);
+            // A mark painted on the ground has no substance.
+            AddDecoration(scene, in);
         }
     }
 
@@ -490,16 +575,11 @@ inline Banner BuildBanner(eng::Renderer& r, eng::Scene& scene,
     pole.mesh = r.UploadMesh(eng::MakeBox(eng::Vec3{0.07f, (b.kTop + 0.4f) * 0.5f, 0.07f},
                                           eng::Vec4{1, 1, 1, 1}));
     pole.material = pole_mat;
-    pole.model = eng::Mat4::Translation(b.root + eng::Vec3{0, (b.kTop + 0.4f) * 0.5f, 0});
-    scene.instances.push_back(pole);
-    {
-        eng::physics::Body col;
-        col.shape = eng::physics::Shape::MakeBox(
-            eng::Vec3{0.07f, (b.kTop + 0.4f) * 0.5f, 0.07f});
-        col.position = b.root + eng::Vec3{0, (b.kTop + 0.4f) * 0.5f, 0};
-        col.SetMass(0.0f);
-        world.Add(col);
-    }
+    const eng::Vec3 pole_at = b.root + eng::Vec3{0, (b.kTop + 0.4f) * 0.5f, 0};
+    pole.model = eng::Mat4::Translation(pole_at);
+    AddSolid(scene, world, pole,
+             eng::physics::Shape::MakeBox(eng::Vec3{0.07f, (b.kTop + 0.4f) * 0.5f, 0.07f}),
+             pole_at);
 
     // The cloth: a grid, finer along the wave than across it, because that is
     // the axis it bends on and a coarse grid there shows the wave as facets.
@@ -563,7 +643,8 @@ inline Banner BuildBanner(eng::Renderer& r, eng::Scene& scene,
     b.joint_offset = int(scene.joint_matrices.size());
     in.palette = b.joint_offset;
     b.instance = scene.instances.size();
-    scene.instances.push_back(in);
+    // Cloth. It moves every frame and nothing should stop on it.
+    AddDecoration(scene, in);
     scene.joint_matrices.resize(scene.joint_matrices.size() + Banner::kJoints,
                                 eng::Mat4::Identity());
     return b;
