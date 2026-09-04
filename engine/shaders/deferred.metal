@@ -54,8 +54,12 @@ fragment GBufferOut fs_gbuffer(VSOut in [[stage_in]],
     // exactly the kind of thing that stops being true quietly.
     const float2 uv = in.uv * u.uvScale.xy + u.uvScale.zw;
 
-    o.albedoRough.rgb =
-        in.color.rgb * u.baseColor.rgb * albedoMap.sample(smp, uv).rgb;
+    // SAMPLED ONCE, and its ALPHA is used. It used to read .rgb and throw the
+    // fourth channel away, so an albedo map's alpha did nothing at all -- no
+    // cutout foliage, no soft-edged decal, and no error to say why. The default
+    // binding is a 1x1 white texel, so every existing material is unchanged.
+    const float4 albedoBase = albedoMap.sample(smp, uv);
+    o.albedoRough.rgb = in.color.rgb * u.baseColor.rgb * albedoBase.rgb;
     o.albedoRough.a = saturate(u.surface.x * roughnessMap.sample(smp, uv).r);
     // The normal map is applied HERE, not in the lighting pass. The G-buffer's
     // whole contract is that it holds what the surface IS, and after a normal

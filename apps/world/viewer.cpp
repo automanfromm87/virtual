@@ -123,7 +123,9 @@ int main(int argc, char** argv) {
     int tour_start = 0;
     float pitch_start = 0.26f;
     float focus_start = 1.0f;
+    float dist_start = 0.0f;  // 0 = whatever the stop chooses
     float leaf_transmission = 0.55f;
+    bool decals_on = true;
     // 4096, MEASURED against an 8192 render of the same frame. The fraction of
     // pixels more than 20 of 255 away from that reference:
     //
@@ -177,7 +179,10 @@ int main(int argc, char** argv) {
             pitch_start = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--focush") == 0 && i + 1 < argc)
             focus_start = float(std::atof(argv[++i]));
+        else if (std::strcmp(argv[i], "--dist") == 0 && i + 1 < argc)
+            dist_start = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--noleaf") == 0) leaf_transmission = 0.0f;
+        else if (std::strcmp(argv[i], "--nodecal") == 0) decals_on = false;
         else if (std::strcmp(argv[i], "--size") == 0 && i + 2 < argc) {
             shot_w = std::atoi(argv[++i]);
             shot_h = std::atoi(argv[++i]);
@@ -280,6 +285,12 @@ int main(int argc, char** argv) {
     const eng::rhi::TextureId bark_albedo = upload(bark_tex.albedo);
     const eng::rhi::TextureId bark_normal = upload(bark_tex.normal);
     const eng::rhi::TextureId leaf_albedo = upload(leaf_tex);
+    // sRGB and NOT the linear upload the others get: this one is a COLOUR laid
+    // over a surface, not a ratio multiplying one, so it goes through the same
+    // transfer function any painted texture would.
+    const eng::texgen::Image soot_img = eng::texgen::Soot(256, 12);
+    const eng::rhi::TextureId soot_tex = app->Gpu().CreateTexture2D(
+        soot_img.width, soot_img.height, soot_img.rgba.data(), true, true);
     if (!eng::rhi::Valid(grass_albedo) || !eng::rhi::Valid(bark_normal))
         return Fail("texture upload");
 
@@ -419,7 +430,11 @@ int main(int argc, char** argv) {
                                       world::kGlassPavilion, world::kFirePit,
                                       world::kFlag}) {
                     const float dx = x - d.x, dz = z - d.z;
-                    if (dx * dx + dz * dz < 15.0f * 15.0f) in_district = true;
+                    // 20 m, not 15. A stop leaves the character 9 m from the
+                    // middle of a district and the camera 9 m behind that, so
+                    // the CAMERA sits 18 m out -- outside a 15 m clearing, with
+                    // a trunk in front of it as often as not.
+                    if (dx * dx + dz * dz < 20.0f * 20.0f) in_district = true;
                 }
                 if (in_district) { ++rejected_clearing; continue; }
             }
@@ -838,7 +853,9 @@ int main(int argc, char** argv) {
         app->Draw(), scene,
         terrain.HeightAt(world::kGlassPavilion.x, world::kGlassPavilion.z), error);
     world::BuildFirePit(app->Draw(), scene, unit_sphere,
-                        terrain.HeightAt(world::kFirePit.x, world::kFirePit.z), error);
+                        decals_on ? soot_tex : eng::rhi::TextureId{},
+                        terrain.HeightAt(world::kFirePit.x, world::kFirePit.z),
+                        [&](float x, float z) { return terrain.HeightAt(x, z); }, error);
     const world::Banner banner = world::BuildBanner(
         app->Draw(), scene, terrain.HeightAt(world::kFlag.x, world::kFlag.z), error);
     if (!error.empty()) return Fail(error);
@@ -1076,7 +1093,7 @@ int main(int argc, char** argv) {
             // it -- which made every capture face wherever the district
             // happened to be rather than where it was asked to face.
             camera_yaw = std::atan2(inward.z, inward.x) + yaw_offset;
-            camera_distance = 9.0f;
+            camera_distance = dist_start > 0.0f ? dist_start : 9.0f;
             path.clear();
             path_at = 0;
             here = goto_stop;
@@ -1630,9 +1647,9 @@ int main(int argc, char** argv) {
         // be wrong in a screenshot are an exposure that has not settled and a
         // camera that is not where it was asked to be.
         if (!shot_path.empty())
-            std::printf("  frame %3d  gpu %.3f ms  %d draws, %d culled, %d sparks\n",
+            std::printf("  frame %3d  gpu %.3f ms  %d draws (%d transparent), %d culled, %d sparks\n",
                         int(f.index), app->Gpu().LastFrameGpuMilliseconds(),
-                        app->Draw().LastStats().draws, app->Draw().LastStats().culled,
+                        app->Draw().LastStats().draws, app->Draw().LastStats().transparent_draws, app->Draw().LastStats().culled,
                         sparks->LiveCountSlow());
 
         if (!shot_path.empty() && int(f.index) >= shot_frames) {

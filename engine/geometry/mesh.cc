@@ -267,4 +267,72 @@ void GenerateTangents(Mesh& m) {
     }
 }
 
+Mesh MakeGroundDecal(const GroundDecalDesc& d,
+                     const std::function<float(float, float)>& height) {
+    Mesh m;
+    const int n = std::max(d.segments, 2);
+    const float c = std::cos(d.rotation), s = std::sin(d.rotation);
+
+    for (int j = 0; j <= n; ++j)
+        for (int i = 0; i <= n; ++i) {
+            const float u = float(i) / float(n), v = float(j) / float(n);
+            // Local, in [-1, 1], then rotated. The rotation is applied to the
+            // PLACEMENT and not to the uv, so a rotated decal samples its
+            // texture the same way -- rotating the uv instead would spin the
+            // texture inside a patch that stayed square to the world.
+            const float lx = (u * 2.0f - 1.0f) * d.radius;
+            const float lz = (v * 2.0f - 1.0f) * d.radius;
+            const float wx = d.centre.x + lx * c - lz * s;
+            const float wz = d.centre.z + lx * s + lz * c;
+
+            VertexIn out{};
+            out.position = Vec4{wx, height(wx, wz) + d.lift, wz, 0.0f};
+            // The surface normal by central differences, so the decal is lit
+            // like the ground it lies on. Taking +y instead makes a decal on a
+            // slope brighter than the slope, which reads as it glowing.
+            const float e = d.radius / float(n);
+            const float dx = height(wx + e, wz) - height(wx - e, wz);
+            const float dz = height(wx, wz + e) - height(wx, wz - e);
+            const Vec3 nrm = Normalize(Vec3{-dx, 2.0f * e, -dz});
+            out.normal = Vec4{nrm.x, nrm.y, nrm.z, 0.0f};
+
+            // RADIAL falloff, in the local square. Squared distance so the
+            // fade is gentle near the middle and quick at the rim, which is
+            // what a scorch or a stain looks like.
+            const float r = std::sqrt(lx * lx + lz * lz) / std::max(d.radius, 1e-6f);
+            const float t =
+                std::clamp((1.0f - r) / std::max(1.0f - d.fade_from, 1e-6f), 0.0f, 1.0f);
+            out.color = Vec4{d.tint.x, d.tint.y, d.tint.z, d.tint.w * t * t};
+            out.uv = Vec4{u, v, 0.0f, 0.0f};
+            m.vertices.push_back(out);
+        }
+
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < n; ++i) {
+            const auto a = std::uint32_t(j * (n + 1) + i);
+            const auto b = std::uint32_t(a + 1);
+            const auto cc = std::uint32_t(a + n + 1);
+            const auto dd = std::uint32_t(cc + 1);
+            m.indices.insert(m.indices.end(), {a, cc, b, b, cc, dd});
+        }
+    GenerateTangents(m);
+    // The bounds have to be computed, not assumed: the patch follows the ground,
+    // so its vertical extent is whatever the terrain does across it and there is
+    // no closed form. Without this the renderer culls it by a zero-radius sphere
+    // at the origin and it vanishes everywhere but the middle of the world.
+    Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+    for (const VertexIn& v : m.vertices) {
+        lo = Vec3{std::min(lo.x, v.position.x), std::min(lo.y, v.position.y),
+                  std::min(lo.z, v.position.z)};
+        hi = Vec3{std::max(hi.x, v.position.x), std::max(hi.y, v.position.y),
+                  std::max(hi.z, v.position.z)};
+    }
+    m.bounds.center = (lo + hi) * 0.5f;
+    float far2 = 0.0f;
+    for (const VertexIn& v : m.vertices)
+        far2 = std::max(far2, Length(Vec3{v.position.x, v.position.y, v.position.z} -
+                                     m.bounds.center));
+    m.bounds.radius = far2;
+    return m;
+}
 }  // namespace eng

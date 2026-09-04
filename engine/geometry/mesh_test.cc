@@ -308,7 +308,91 @@ int main() {
             sphere_perp = std::max(sphere_perp, std::fabs(Dot(Normalize(nv), t)));
             sphere_len = std::max(sphere_len, std::fabs(Length(t) - 1.0f));
         }
-        std::printf("  sphere: worst |dot(N,T)| = %.2e, worst |T|-1 = %.2e\n",
+        {
+        std::printf("ground decals lie on the ground\n");
+        // A ramp with a bump in it, so "follows the surface" has something to
+        // follow. A flat plane would pass for a mesh that ignored the height
+        // function entirely.
+        const auto height = [](float x, float z) {
+            return 0.15f * x + 0.6f * std::sin(x * 0.7f) * std::cos(z * 0.5f);
+        };
+        eng::GroundDecalDesc d;
+        d.centre = eng::Vec3{3.0f, 0.0f, -2.0f};
+        d.radius = 2.5f;
+        d.rotation = 0.7f;
+        d.lift = 0.05f;
+        d.segments = 16;
+        const eng::Mesh m = eng::MakeGroundDecal(d, height);
+
+        float worst = 0.0f;
+        for (const VertexIn& v : m.vertices)
+            worst = std::max(worst, std::fabs(v.position.y -
+                                              (height(v.position.x, v.position.z) + d.lift)));
+        std::printf("    %zu verts, worst height error %.6f m\n", m.vertices.size(), worst);
+        // EVERY vertex, not the average. One vertex left behind on a bump is a
+        // corner of the decal sticking through the ground, and that is the one
+        // thing this construction exists to avoid.
+        CHECK(worst < 1e-5f);
+
+        // ALPHA IS THE SHAPE. Full in the middle, zero at the rim: the mesh
+        // owns the falloff because the texture cannot -- a clamped sampler
+        // gives a decal a hard rectangular edge, which is the most obvious way
+        // to get this wrong.
+        float centre_a = 0.0f, rim_a = -1.0f;
+        for (const VertexIn& v : m.vertices) {
+            const float dx = v.position.x - d.centre.x, dz = v.position.z - d.centre.z;
+            const float r = std::sqrt(dx * dx + dz * dz);
+            if (r < 0.2f) centre_a = std::max(centre_a, v.color.w);
+            if (r > d.radius * 0.98f) rim_a = std::max(rim_a, v.color.w);
+        }
+        std::printf("    alpha: %.3f at the centre, %.3f at the rim\n", centre_a, rim_a);
+        CHECK(centre_a > 0.95f);
+        CHECK(rim_a >= 0.0f && rim_a < 0.02f);
+
+        // NORMALS FOLLOW THE SLOPE. Taking +y instead lights a decal on a bank
+        // differently from the bank, which reads as it glowing.
+        int upright = 0;
+        for (const VertexIn& v : m.vertices)
+            if (v.normal.y > 0.999f) ++upright;
+        std::printf("    %d of %zu normals are exactly vertical\n", upright,
+                    m.vertices.size());
+        CHECK(upright * 4 < int(m.vertices.size()));
+
+        // BOUNDS have to be measured, not assumed: the patch follows the ground
+        // so its vertical extent is whatever the terrain does. A zero radius at
+        // the origin culls it everywhere but the middle of the world.
+        float outside = 0.0f;
+        for (const VertexIn& v : m.vertices)
+            outside = std::max(outside,
+                               eng::Length(eng::Vec3{v.position.x, v.position.y,
+                                                     v.position.z} - m.bounds.center) -
+                                   m.bounds.radius);
+        std::printf("    bounds centre (%.2f %.2f %.2f) r=%.2f, worst overhang %.6f\n",
+                    m.bounds.center.x, m.bounds.center.y, m.bounds.center.z,
+                    m.bounds.radius, outside);
+        CHECK(m.bounds.radius > 1.0f);
+        CHECK(outside < 1e-4f);
+
+        // ROTATION MOVES THE PATCH, NOT THE TEXTURE. Rotating the uv instead
+        // would spin the image inside a footprint that stayed square to the
+        // world, which is the wrong half of the transform.
+        eng::GroundDecalDesc turned = d;
+        turned.rotation = d.rotation + 1.2f;
+        const eng::Mesh n2 = eng::MakeGroundDecal(turned, height);
+        bool uv_same = n2.vertices.size() == m.vertices.size();
+        bool pos_moved = false;
+        for (std::size_t i = 0; i < m.vertices.size() && uv_same; ++i) {
+            if (std::fabs(n2.vertices[i].uv.x - m.vertices[i].uv.x) > 1e-6f ||
+                std::fabs(n2.vertices[i].uv.y - m.vertices[i].uv.y) > 1e-6f)
+                uv_same = false;
+            if (std::fabs(n2.vertices[i].position.x - m.vertices[i].position.x) > 0.1f)
+                pos_moved = true;
+        }
+        CHECK(uv_same);
+        CHECK(pos_moved);
+    }
+
+    std::printf("  sphere: worst |dot(N,T)| = %.2e, worst |T|-1 = %.2e\n",
                     double(sphere_perp), double(sphere_len));
         CHECK(sphere_perp < 1e-5f);
         CHECK(sphere_len < 1e-5f);

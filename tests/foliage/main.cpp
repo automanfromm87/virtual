@@ -220,6 +220,76 @@ int main() {
               "a front-lit surface is unchanged, so nothing else needs re-tuning");
     }
 
+    {
+        std::printf("\nan albedo map's alpha reaches the output\n");
+        // It used to be thrown away: the shader read .rgb and nothing else, so
+        // a cutout texture cut nothing out and a soft-edged decal had a hard
+        // edge. There was no error to say so -- the alpha simply had no effect.
+        //
+        // A 2x2 texture that is opaque on one side and half transparent on the
+        // other, on a transparent material over a known background. Reading the
+        // two halves says whether the channel is connected.
+        const std::uint8_t texels[16] = {
+            255, 255, 255, 255,   255, 255, 255, 128,
+            255, 255, 255, 255,   255, 255, 255, 128,
+        };
+        const rhi::TextureId tex =
+            dev->CreateTexture2D(2, 2, texels, /*mips=*/false, /*srgb=*/false);
+        if (!rhi::Valid(tex)) { std::fprintf(stderr, "FAIL: texture\n"); return 1; }
+
+        Scene s;
+        s.camera.eye = Vec3{0.0f, 0.0f, 3.0f};
+        s.camera.target = Vec3{0.0f, 0.0f, 0.0f};
+        s.lightDir = Vec4{0.0f, 0.0f, 1.0f, 0.0f};
+        s.lightColor = Vec4{3.0f, 3.0f, 3.0f, 1.0f};
+        s.ambientSky = Vec3{0.0f, 0.0f, 0.0f};
+        s.ambientGround = Vec3{0.0f, 0.0f, 0.0f};
+        s.shadowExtent = 0.0f;
+        MaterialDesc md;
+        md.shading = Shading::Lit;
+        md.base_color = Vec4{1.0f, 1.0f, 1.0f, 1.0f};
+        md.roughness = 0.9f;
+        md.albedo = tex;
+        md.transparent = true;
+        Instance in;
+        in.mesh = leaf;
+        in.material = r->CreateMaterial(md, error);
+        s.instances.push_back(in);
+
+        dev->BeginFrame();
+        {
+            rhi::PassDesc pd;
+            pd.color = hdr;
+            pd.depth = depth;
+            pd.clear_depth = 0.0f;
+            // A black background, so what survives the blend is the surface's
+            // own contribution scaled by its alpha and nothing else.
+            pd.clear_color[0] = pd.clear_color[1] = pd.clear_color[2] = 0.0f;
+            auto e = dev->BeginPass(pd);
+            r->DrawScene(e, s, kW, kH);
+            dev->EndPass();
+        }
+        {
+            rhi::PassDesc pd;
+            pd.color = out;
+            auto e = dev->BeginPass(pd);
+            r->DrawComposite(e, hdr, {}, {}, 0.0f, 0.0f);
+            dev->EndPass();
+        }
+        if (!dev->CommitAndWait(error)) { std::fprintf(stderr, "FAIL\n"); return 1; }
+        if (!dev->ReadPixels(out, kW, kH, px)) { std::fprintf(stderr, "FAIL\n"); return 1; }
+        const auto column = [&](int x) {
+            double sum = 0.0;
+            for (int y = kH / 2 - 20; y < kH / 2 + 20; ++y)
+                sum += px[(std::size_t(y) * kW + x) * 4];
+            return float(sum / 40.0);
+        };
+        const float opaque = column(kW / 2 - 40), half = column(kW / 2 + 40);
+        std::printf("    texel alpha 255 -> %.1f, texel alpha 128 -> %.1f\n", opaque, half);
+        Check(half < opaque * 0.85f,
+              "the half-transparent side blends and the opaque side does not");
+    }
+
     std::printf(g_failures == 0 ? "\nfoliage_test: all checks passed\n"
                                 : "\nfoliage_test: %d FAILED\n",
                 g_failures);

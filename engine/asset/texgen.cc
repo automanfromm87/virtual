@@ -244,4 +244,38 @@ Image Foliage(int size, std::uint32_t seed) {
     return im;
 }
 
+Image Soot(int size, std::uint32_t seed) {
+    size = std::max(size, 4);
+    Image im = Blank(size);
+    // Two scales: blotches, and a fine grain that keeps the edge from reading
+    // as a smooth gradient. Tileability is irrelevant here -- a decal is placed
+    // once and never repeats -- so the periods are chosen for looks.
+    const std::vector<float> blotch = Fbm(size, seed, 5, 5, 3, 0.55f);
+    const std::vector<float> grain = Fbm(size, seed + 61u, 24, 24, 3, 0.6f);
+
+    for (int y = 0; y < size; ++y)
+        for (int x = 0; x < size; ++x) {
+            const std::size_t i = std::size_t(y) * std::size_t(size) + std::size_t(x);
+            const float u = (float(x) + 0.5f) / float(size) * 2.0f - 1.0f;
+            const float v = (float(y) + 0.5f) / float(size) * 2.0f - 1.0f;
+            const float r = std::sqrt(u * u + v * v);
+
+            // NO RADIAL FALLOFF HERE. The mesh already has one -- vertex alpha
+            // fading toward its rim -- and two of them multiply: a decal built
+            // for a 3.1 m radius came out visible across 1.5 m of it, because
+            // each was down to a third by half way. The mesh owns the SHAPE and
+            // this owns the RAGGEDNESS, which is what makes the product's edge
+            // irregular instead of a clean circle.
+            float a = 0.80f + (blotch[i] - 0.5f) * 0.85f + (grain[i] - 0.5f) * 0.35f;
+            a = std::clamp(a, 0.0f, 1.0f);
+
+            // Warmer and lighter toward the outside, black in the middle: ash
+            // at the edge of a burn, char in the centre.
+            const float ash = std::clamp(r * 0.8f, 0.0f, 1.0f);
+            Put(im, x, y, Vec3{0.05f + ash * 0.22f, 0.045f + ash * 0.19f,
+                               0.04f + ash * 0.16f}, a);
+        }
+    return im;
+}
+
 }  // namespace eng::texgen

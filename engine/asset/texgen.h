@@ -97,4 +97,15 @@ struct Surface {
 // one.
 [[nodiscard]] Image Foliage(int size, std::uint32_t seed);
 
+// A soot mark, for painting onto ground. Dark in the middle, ragged at the
+// edge, and its ALPHA carries the shape.
+//
+// Unlike everything else here this is NOT a modulation with a mean of one: it
+// is a thing laid over a surface rather than a variation of that surface, so it
+// is dark and mostly transparent. The lit shader multiplies this alpha by the
+// mesh's vertex alpha, so the mesh gives the overall falloff and this gives the
+// raggedness -- a decal whose edge is a clean circle is the giveaway that it
+// came from a formula.
+[[nodiscard]] Image Soot(int size, std::uint32_t seed);
+
 }  // namespace eng::texgen

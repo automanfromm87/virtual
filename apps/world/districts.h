@@ -29,6 +29,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -308,15 +310,19 @@ inline void BuildGlassPavilion(eng::Renderer& r, eng::Scene& scene, float ground
 // scene's own depth so the sparks fade against the ground instead of cutting
 // into it.
 //
-// NO DECALS HERE, and that is not an omission. decals.h says why in its first
-// paragraph: a projected decal writes into the G-buffer's albedo, and a
-// forward renderer shades each surface once as it draws it, so there is no
-// moment between "the surface exists" and "the surface is lit" at which to
-// intervene. This world is forward. The decal system works and has a test; it
-// belongs to the other path, and pretending otherwise by painting a dark quad
-// on the ground would be a picture of a decal rather than a decal.
+// SCORCH MARKS, and they are GROUND DECALS rather than projected ones.
+//
+// The projected kind writes into the G-buffer's albedo and cannot work on a
+// forward path -- decals.h says so in its first paragraph, and this world is
+// forward. What a forward path can do is build geometry that follows the
+// receiving surface and draw it as an ordinary transparent object, which is
+// what MakeGroundDecal is. It has to know what it lands on and be rebuilt if
+// that changes; in exchange it works here, sorts like anything else, and is lit
+// by the same sun as the ground under it.
 inline void BuildFirePit(eng::Renderer& r, eng::Scene& scene, eng::MeshHandle sphere,
-                         float ground_y, std::string& error) {
+                         eng::rhi::TextureId soot, float ground_y,
+                         const std::function<float(float, float)>& height,
+                         std::string& error) {
     eng::MaterialDesc stone_md;
     stone_md.shading = eng::Shading::Lit;
     stone_md.base_color = eng::Vec4{0.16f, 0.15f, 0.145f, 1.0f};
@@ -366,6 +372,39 @@ inline void BuildFirePit(eng::Renderer& r, eng::Scene& scene, eng::MeshHandle sp
     // A light in the fire. Without one the pit glows and lights nothing, which
     // is the same failure the lanterns had -- and here it is worse, because a
     // fire that does not light the stones around it reads as a decal.
+    // The burn, under the stones and spreading past them. Drawn before the
+    // stones are added to the scene would put it in front of them in the
+    // transparent sort; after is where it belongs.
+    eng::MaterialDesc soot_md;
+    soot_md.shading = eng::Shading::Lit;
+    soot_md.base_color = eng::Vec4{1.0f, 1.0f, 1.0f, 1.0f};
+    soot_md.roughness = 0.95f;
+    soot_md.albedo = soot;
+    soot_md.transparent = true;
+    const eng::MaterialHandle soot_mat = r.CreateMaterial(soot_md, error);
+    if (eng::Valid(soot_mat) && eng::rhi::Valid(soot)) {
+        // Three overlapping marks at different sizes and angles rather than one
+        // big one: a single circular scorch is the most obvious way to look
+        // procedural, and three at odd rotations read as a fire that has been
+        // lit more than once.
+        const float kR[3] = {3.1f, 2.2f, 1.6f};
+        const float kAng[3] = {0.0f, 1.9f, 4.1f};
+        const float kOff[3][2] = {{0.0f, 0.0f}, {0.8f, -0.5f}, {-0.6f, 0.7f}};
+        for (int i = 0; i < 3; ++i) {
+            eng::GroundDecalDesc gd;
+            gd.centre = eng::Vec3{kFirePit.x + kOff[i][0], 0.0f, kFirePit.z + kOff[i][1]};
+            gd.radius = kR[i];
+            gd.rotation = kAng[i];
+            gd.lift = 0.04f;
+            gd.segments = 22;
+            gd.tint = eng::Vec4{1.0f, 1.0f, 1.0f, 1.0f};
+            eng::Instance in;
+            in.mesh = r.UploadMesh(eng::MakeGroundDecal(gd, height));
+            in.material = soot_mat;
+            scene.instances.push_back(in);
+        }
+    }
+
     eng::Light fire;
     fire.type = eng::LightType::Point;
     fire.position = eng::Vec3{kFirePit.x, ground_y + 0.6f, kFirePit.z};

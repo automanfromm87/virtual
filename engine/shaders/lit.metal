@@ -289,8 +289,12 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
     // exactly the kind of thing that stops being true quietly.
     const float2 uv = in.uv * u.uvScale.xy + u.uvScale.zw;
 
-    const float3 albedo =
-        in.color.rgb * u.baseColor.rgb * albedoMap.sample(smp, uv).rgb;
+    // SAMPLED ONCE, and its ALPHA is used. It used to read .rgb and throw the
+    // fourth channel away, so an albedo map's alpha did nothing at all -- no
+    // cutout foliage, no soft-edged decal, and no error to say why. The default
+    // binding is a 1x1 white texel, so every existing material is unchanged.
+    const float4 albedoBase = albedoMap.sample(smp, uv);
+    const float3 albedo = in.color.rgb * u.baseColor.rgb * albedoBase.rgb;
     const float roughness =
         saturate(u.surface.x * roughnessMap.sample(smp, uv).r);
     const float metallic = saturate(u.surface.y * metallicMap.sample(smp, uv).r);
@@ -324,5 +328,5 @@ fragment float4 fs_lit(VSOut in [[stage_in]],
     // shadows it, no light affects it and ambient occlusion does not dim it --
     // a glowing sign in a dark alcove is exactly as bright as one in the open.
     const float3 emit = u.emissive.rgb * emissiveMap.sample(smp, uv).rgb;
-    return float4(lit + emit, in.color.a);
+    return float4(lit + emit, in.color.a * albedoBase.a);
 }

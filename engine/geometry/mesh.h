@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include "engine/core/math.h"
@@ -76,5 +77,47 @@ struct Mesh {
 // makes green point DOWN the image. This is exactly what glTF specifies, so a
 // map exported for glTF is correct here with no channel flip.
 void GenerateTangents(Mesh&);
+
+// A mesh that LIES ON a surface: a patch of ground, lifted slightly, carrying a
+// decal's uv.
+//
+// WHY THIS EXISTS WHEN THERE IS ALREADY A DECAL SYSTEM. The projected kind
+// writes into the G-buffer's albedo, and a forward renderer shades each surface
+// once as it draws it -- there is no moment between "the surface exists" and
+// "the surface is lit" at which to intervene. decals.h says so in its first
+// paragraph. So a forward path cannot have projected decals, and the technique
+// it CAN have is this one: build geometry that follows the receiving surface
+// and draw it as an ordinary transparent object.
+//
+// The trade is explicit. A projected decal needs no knowledge of what it lands
+// on and costs nothing per receiver; this one has to be built against a
+// specific surface and rebuilt if that surface changes. In exchange it works on
+// a path where the other cannot, it is depth-sorted like anything else, and it
+// takes the same normal maps and lighting as the ground it sits on.
+//
+// ALPHA IS IN THE VERTEX COLOUR, falling off toward the rim. The lit shader
+// multiplies the vertex alpha by the albedo map's, so the mesh supplies the
+// shape of the fade and the texture supplies its detail -- and a decal with a
+// hard rectangular edge, which is what a texture alone would give against a
+// clamped sampler, is the most recognisable way to get this wrong.
+struct GroundDecalDesc {
+    Vec3 centre{0.0f, 0.0f, 0.0f};  // y is ignored; the surface decides it
+    float radius = 1.0f;
+    float rotation = 0.0f;  // radians about y, so repeated decals are not clones
+    // How far above the surface. Enough to clear depth-buffer noise at the
+    // distances it will be seen from, and no more -- lift it too far and it
+    // stops looking painted on and starts looking like a sticker hovering.
+    float lift = 0.02f;
+    // Grid resolution across the patch. It has to follow the ground, so this is
+    // bounded below by how bumpy the ground is rather than by the decal.
+    int segments = 20;
+    Vec4 tint{1.0f, 1.0f, 1.0f, 1.0f};
+    // Where the alpha starts falling off, as a fraction of the radius. 1 would
+    // be a hard circular edge.
+    float fade_from = 0.45f;
+};
+
+[[nodiscard]] Mesh MakeGroundDecal(const GroundDecalDesc&,
+                                   const std::function<float(float, float)>& height);
 
 }  // namespace eng
