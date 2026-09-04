@@ -584,10 +584,26 @@ class World {
                              Vec3* point_a = nullptr, Vec3* point_b = nullptr);
 
 // The fraction of the given motion at which two bodies first touch, or 1 if
-// they do not touch within it. Rotation is ignored, which is what makes the
-// bound conservative and cheap; for the fast-moving thing CCD exists for, the
-// translation dominates by orders of magnitude.
+// they do not touch within it.
+//
+// ROTATION IS INCLUDED, and the note that used to be here said the opposite:
+// "Rotation is ignored, which is what makes the bound conservative and cheap."
+// That is backwards. Conservative advancement is safe because it OVER-estimates
+// how fast the gap can close; leaving the angular term out UNDER-estimates it,
+// so the advance is too long and can step straight over an impact. Ignoring
+// rotation does not make the bound conservative, it makes it optimistic, which
+// is the one thing this algorithm must not be.
+//
+// A point on a spinning body moves at |v| + |w| * r. A tumbling bar whose
+// centre passes cleanly by a wall can still sweep an end through it, and the
+// old bound had no term that could see that coming.
+//
+// `step_seconds` is how long the motions represent, and it is needed because
+// they are DISPLACEMENTS while angular_velocity is a RATE -- there is no way to
+// put the two in the same units without it. Zero means translation only, which
+// is what every caller wanted while rotation was not handled at all.
 [[nodiscard]] float TimeOfImpact(const Body& a, const Body& b, Vec3 motion_a,
-                                 Vec3 motion_b, float tolerance = 1e-3f);
+                                 Vec3 motion_b, float tolerance = 1e-3f,
+                                 float step_seconds = 0.0f);
 
 }  // namespace eng::physics

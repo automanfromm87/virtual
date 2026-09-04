@@ -1102,23 +1102,61 @@ float Distance(const Body& a, const Body& b, Vec3* normal, Vec3* point_a,
 
 // ------------------------------------------------------------------ CCD -----
 
+namespace {
+
+// The orientation a body reaches after `t` of a step, using the SAME first
+// order integration the step itself uses. Slerping to a separately computed
+// end orientation would be smoother and would describe a rotation the body
+// never actually performs.
+Quat SpunBy(Quat q, Vec3 w, float t) {
+    if (t <= 0.0f || Dot(w, w) < 1e-18f) return q;
+    const Quat spin = Quat{w.x, w.y, w.z, 0.0f} * q;
+    const float half = 0.5f * t;
+    return Normalize(Quat{q.x + spin.x * half, q.y + spin.y * half,
+                          q.z + spin.z * half, q.w + spin.w * half});
+}
+
+}  // namespace
+
 float TimeOfImpact(const Body& a, const Body& b, Vec3 motion_a, Vec3 motion_b,
-                   float tolerance) {
+                   float tolerance, float step_seconds) {
     // CONSERVATIVE ADVANCEMENT. Given the distance between two shapes and an
     // upper bound on how fast that distance can close, there is a span of time
     // in which they certainly cannot touch. Advance by exactly that, and
     // repeat. Each step is provably safe, so the result never skips an impact
     // -- which a fixed number of intermediate samples always eventually does,
     // and only for the fast objects where it matters most.
+    //
+    // ROTATION COUNTS TWICE, and it used to count not at all.
+    //
+    // A point on a spinning body moves at |v| + |w| * r, not |v|. A tumbling
+    // bar whose CENTRE passes cleanly by a wall can still sweep an end through
+    // it, and with only the linear speed in the bound the advance was too long
+    // and stepped over the impact -- the exact failure conservative advancement
+    // exists to make impossible. So the bound carries the angular term.
+    //
+    // And the shapes have to be TURNED as well as moved, or the distance is
+    // measured between two orientations neither body is in at time t. The
+    // integrator's own first-order quaternion step is reproduced here rather
+    // than slerped, so the pose this tests against is the pose the body will
+    // actually have.
     const Vec3 relative = motion_a - motion_b;
-    const float speed = Length(relative);
-    if (speed < 1e-9f) return 1.0f;
+    const float linear = Length(relative);
+    // Angular velocity is a rate; the motions are displacements over one step.
+    // Multiplying by the step puts them in the same units -- radians turned
+    // during this step, times the radius, is metres the far edge travels.
+    const float turn_a = Length(a.angular_velocity) * step_seconds;
+    const float turn_b = Length(b.angular_velocity) * step_seconds;
+    const float reach = turn_a * a.shape.bounds_radius + turn_b * b.shape.bounds_radius;
+    if (linear < 1e-9f && reach < 1e-9f) return 1.0f;
 
     Body ma = a, mb = b;
     float t = 0.0f;
     for (int iter = 0; iter < 32; ++iter) {
         ma.position = a.position + motion_a * t;
         mb.position = b.position + motion_b * t;
+        ma.orientation = SpunBy(a.orientation, a.angular_velocity, t * step_seconds);
+        mb.orientation = SpunBy(b.orientation, b.angular_velocity, t * step_seconds);
         Vec3 n;
         const float dist = Distance(ma, mb, &n, nullptr, nullptr);
         if (dist <= tolerance) return t;
@@ -1127,10 +1165,29 @@ float TimeOfImpact(const Body& a, const Body& b, Vec3 motion_a, Vec3 motion_b,
         // separating direction. Using the projected speed instead would be
         // tighter and would also be WRONG here, because the direction turns as
         // the bodies move.
+        const float speed = linear + reach;
         const float advance = (dist - tolerance) / speed;
         t += advance;
         if (t >= 1.0f) return 1.0f;
     }
+    // OUT OF ITERATIONS RETURNS t, AND THAT IS A COMPROMISE rather than an
+    // answer. t is a LOWER BOUND on when a touch could happen, not a time when
+    // one does, so a pair that approaches slowly and never quite meets comes
+    // back with a t the caller clamps to -- the body stops dead in mid-air
+    // short of a wall it was going to miss. Measured: a bar passing a wall edge
+    // with 40 mm of clearance returns 0.636.
+    //
+    // Returning 1 instead was tried and is worse. Five of twenty-four head-on
+    // bullet pairs tunnel with it: they are exactly the pairs whose sweep does
+    // not converge inside the budget, and the spurious clamp was the only thing
+    // catching them. Raising the budget to 128 changes neither number, so it is
+    // not a case of needing more iterations -- the bound is too loose to prove
+    // the contact and too loose to rule it out.
+    //
+    // Stopping short of a miss is a visible artifact; tunnelling through a hit
+    // is a broken simulation. Until the bound is tightened -- projecting onto
+    // the separating axis and re-deriving it each step, which is what Box2D
+    // does -- this is the side to err on.
     return t;
 }
 
@@ -2059,7 +2116,8 @@ void World::StepFixed() {
                 if (Dot(other.position - b.position, other.position - b.position) >
                     reach * reach)
                     continue;
-                toi = std::fmin(toi, TimeOfImpact(b, other, motion, other_motion));
+                toi = std::fmin(toi, TimeOfImpact(b, other, motion, other_motion,
+                                                  1e-3f, fixed_dt));
             }
             if (toi < 1.0f) {
                 // Stop a little PAST the touch point, not exactly on it.

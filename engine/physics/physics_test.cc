@@ -943,6 +943,98 @@ int main() {
         CHECK(tunnelled == 0);
         CHECK(unresolved == 0);
 
+        // A TUMBLING BAR, whose centre misses and whose END does not.
+        //
+        // Conservative advancement is safe only because it OVER-estimates how
+        // fast the gap can close. The bound was the linear speed alone, and a
+        // point on a spinning body moves at |v| + |w| * r -- so the estimate
+        // was too small, the advance too long, and the sweep stepped over the
+        // impact. The header said ignoring rotation was what made the bound
+        // "conservative and cheap"; it made it optimistic, which is the one
+        // thing this algorithm must not be.
+        //
+        // TimeOfImpact DIRECTLY rather than through a simulation. Run through
+        // the world, a bar that clips a wall edge at 120 m/s is resolved and
+        // slides past it, so both the spinning and the still one end up far
+        // downrange and the difference is one step of position -- a number that
+        // moves for half a dozen reasons. The function's own answer is the
+        // claim being made.
+        {
+            Body wall;
+            wall.shape = Shape::MakeBox(Vec3{0.05f, 3.0f, 3.0f});
+            wall.position = Vec3{0.0f, 0.0f, 0.0f};
+            wall.SetMass(0.0f);
+
+            // Long and thin, and offset in z so it passes BESIDE the wall: the
+            // wall ends at z = 3 and the bar's centre line is at 3.4. Along its
+            // start orientation the bar is only 0.06 thick in z, so nothing on
+            // it comes near the wall.
+            Body bar;
+            bar.shape = Shape::MakeBox(Vec3{1.7f, 0.06f, 0.06f});
+            bar.position = Vec3{-1.9f, 0.0f, 3.55f};
+            bar.SetMass(1.0f);
+
+            constexpr float kStep = 1.0f / 60.0f;
+            const Vec3 motion{2.0f, 0.0f, 0.0f};  // 120 m/s for one step
+
+            const float still = TimeOfImpact(bar, wall, motion, Vec3{0, 0, 0},
+                                             1e-3f, kStep);
+            // A quarter turn during the step, which swings the bar's long axis
+            // from x round to z -- so its ends reach z = 3.4 +/- 0.9 and cross
+            // into the wall while the centre never does.
+            bar.angular_velocity = Vec3{0.0f, 1.5708f / kStep, 0.0f};
+            const float spun = TimeOfImpact(bar, wall, motion, Vec3{0, 0, 0},
+                                            1e-3f, kStep);
+            {
+                Body probe = bar;
+                probe.position = Vec3{0.0f, 0.0f, 3.4f};
+                const float flat = Distance(probe, wall, nullptr, nullptr, nullptr);
+                probe.orientation = Quat{0.0f, 0.70711f, 0.0f, 0.70711f};  // 90 about y
+                const float turned = Distance(probe, wall, nullptr, nullptr, nullptr);
+                std::printf("    DIAG at x=0: distance flat %.3f, turned 90deg %.3f\n",
+                            flat, turned);
+            }
+            float truth_first = 1.0f;
+            {
+                // Ground truth: sample the swept path and find the closest it
+                // ever comes. If this never reaches zero there is no impact to
+                // find and the test is asking for the wrong thing.
+                float best = 1e9f; float best_t = 0.0f; float first = 1.0f;
+                for (int k = 0; k <= 40; ++k) {
+                    const float tt = float(k) / 40.0f;
+                    Body probe = bar;
+                    probe.angular_velocity = Vec3{0.0f, 1.5708f / kStep, 0.0f};
+                    probe.position = bar.position + motion * tt;
+                    const float ang = 1.5708f * tt;
+                    probe.orientation = Quat{0.0f, std::sin(ang * 0.5f), 0.0f,
+                                             std::cos(ang * 0.5f)};
+                    const float dd = Distance(probe, wall, nullptr, nullptr, nullptr);
+                    if (dd < best) { best = dd; best_t = tt; }
+                    if (dd <= 0.0f && first == 1.0f) first = tt;
+                }
+                truth_first = first;
+                std::printf("    sampled ground truth: first touch at t=%.3f "
+                            "(closest approach %.4f at t=%.3f)\n", first, best, best_t);
+            }
+            std::printf("    bar beside a wall that ends at z=3, centre at z=3.4:\n"
+                        "      not spinning: toi %.3f    quarter turn: toi %.3f\n",
+                        still, spun);
+            // Not spinning it genuinely misses, and this fix must not change
+            // that -- a sweep that catches things it should not is as bad as
+            // one that misses things it should not.
+            CHECK(still == 1.0f);
+            // NOT MERELY "it found something". Conservative advancement's whole
+            // guarantee is that it never steps PAST the first contact, so the
+            // answer has to be at or before the sampled one. Dropping the
+            // angular term from the bound still returns a hit here -- at 0.256
+            // against a true first touch at 0.200 -- which is the algorithm
+            // silently losing the only property it has, and a test that just
+            // asked for "less than 1" would have called that a pass.
+            std::printf("      toi %.3f against a true first touch at %.3f\n",
+                        spun, truth_first);
+            CHECK(spun > 0.0f && spun <= truth_first);
+        }
+
         // TWO BULLETS HEAD-ON, which is the case the sweep used to refuse.
         //
         // It skipped any body that was itself awake and moving, on the grounds
