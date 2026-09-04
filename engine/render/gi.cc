@@ -376,4 +376,84 @@ Vec3 IrradianceVolume::SampleFrom(const std::vector<ShProbe>& probes, Vec3 world
     return ShIrradiance(blended, normal);
 }
 
+int IrradianceVolume::FillDark() {
+    const std::size_t count = probes_.size();
+    if (count == 0 || dark_ == 0) return 0;
+
+    // The same criterion the bake reported with, recomputed rather than stored
+    // per probe: two definitions of "dark" that could drift apart is exactly
+    // the kind of thing that makes a repair pass fix the wrong probes.
+    std::vector<float> lum;
+    lum.reserve(count);
+    for (const ShProbe& pr : probes_)
+        lum.push_back(0.2126f * pr.r.x + 0.7152f * pr.g.x + 0.0722f * pr.b.x);
+    std::vector<float> sorted = lum;
+    std::nth_element(sorted.begin(), sorted.begin() + long(count / 2), sorted.end());
+    const float median = sorted[count / 2];
+    if (median <= 1e-4f) return 0;  // dark everywhere: nothing to borrow from
+    const float threshold = median / 7.0f;
+
+    std::vector<char> lit(count);
+    for (std::size_t i = 0; i < count; ++i) lit[i] = lum[i] >= threshold ? 1 : 0;
+
+    const int nx = cfg_.nx, ny = cfg_.ny, nz = cfg_.nz;
+    const auto index = [&](int x, int y, int z) {
+        return std::size_t((z * ny + y) * nx + x);
+    };
+
+    int filled = 0;
+    // Bounded rather than while(true): a volume with no lit probe at all would
+    // otherwise spin, and the bound is the largest number of sweeps it can take
+    // to cross the grid diagonally.
+    const int max_sweeps = nx + ny + nz;
+    for (int sweep = 0; sweep < max_sweeps; ++sweep) {
+        std::vector<std::size_t> repaired;
+        std::vector<ShProbe> values;
+        for (int z = 0; z < nz; ++z)
+            for (int y = 0; y < ny; ++y)
+                for (int x = 0; x < nx; ++x) {
+                    const std::size_t i = index(x, y, z);
+                    if (lit[i]) continue;
+                    ShProbe sum{};
+                    int n = 0;
+                    for (int dz = -1; dz <= 1; ++dz)
+                        for (int dy = -1; dy <= 1; ++dy)
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                if (dx == 0 && dy == 0 && dz == 0) continue;
+                                const int px = x + dx, py = y + dy, pz = z + dz;
+                                if (px < 0 || py < 0 || pz < 0 || px >= nx || py >= ny ||
+                                    pz >= nz)
+                                    continue;
+                                const std::size_t j = index(px, py, pz);
+                                if (!lit[j]) continue;
+                                sum.r = sum.r + probes_[j].r;
+                                sum.g = sum.g + probes_[j].g;
+                                sum.b = sum.b + probes_[j].b;
+                                ++n;
+                            }
+                    if (n == 0) continue;
+                    const float inv = 1.0f / float(n);
+                    ShProbe out;
+                    out.r = sum.r * inv;
+                    out.g = sum.g * inv;
+                    out.b = sum.b * inv;
+                    repaired.push_back(i);
+                    values.push_back(out);
+                }
+        if (repaired.empty()) break;
+        // APPLIED AFTER THE WHOLE SWEEP, not during it. Writing as we go would
+        // let a probe filled early in the sweep feed one filled later, so the
+        // result would depend on the order the grid was walked -- and the light
+        // would smear along +x, which is a visible directional bias.
+        for (std::size_t k = 0; k < repaired.size(); ++k) {
+            probes_[repaired[k]] = values[k];
+            lit[repaired[k]] = 1;
+            ++filled;
+        }
+    }
+    dark_ -= filled;
+    if (dark_ < 0) dark_ = 0;
+    return filled;
+}
+
 }  // namespace eng

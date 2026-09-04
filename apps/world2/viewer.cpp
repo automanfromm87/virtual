@@ -12,7 +12,9 @@
 // found, over terrain the physics collider agrees with, lit by a sky you can
 // drag around.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <thread>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -25,6 +27,7 @@
 #include "engine/geometry/mesh.h"
 #include "engine/geometry/simplify.h"
 #include "engine/asset/texgen.h"
+#include "engine/render/gi.h"
 #include "engine/geometry/terrain.h"
 #include "engine/geometry/tree.h"
 #include "engine/nav/navmesh.h"
@@ -215,6 +218,13 @@ int main(int argc, char** argv) {
     // apart once they are rotated and scaled differently.
     std::printf("growing trees...\n");
     eng::Mesh forest_trunks, forest_leaves;
+    // ONE SPHERE PER CANOPY, kept for the light bake below. The forest is 2.5M
+    // triangles and tracing rays against that is hopeless, but GI does not need
+    // the shape of a leaf -- it needs to know that the sky is blocked here and
+    // that what bounces off it is green. A coarse sphere per tree says both, in
+    // a hundredth of the geometry.
+    struct CanopyProxy { eng::Vec3 centre; float radius; };
+    std::vector<CanopyProxy> canopies;
     {
         eng::Tree variants[6];
         for (int i = 0; i < 6; ++i) {
@@ -270,6 +280,26 @@ int main(int argc, char** argv) {
                                    eng::Vec4{1.0f, 1.0f, 1.0f, 1.0f});
             eng::AppendTransformed(forest_leaves, t.foliage, model,
                                    eng::Vec4{warm, 1.0f, 2.0f - warm, 1.0f});
+            const eng::Vec4 c = model * eng::Vec4{t.foliage.bounds.center.x,
+                                                  t.foliage.bounds.center.y,
+                                                  t.foliage.bounds.center.z, 1.0f};
+            // 0.45 OF THE BOUNDING RADIUS, and that is not a fudge. The
+            // bounding sphere of a crown is 10 metres on these trees -- they
+            // are 15 to 20 metres tall -- and a crown is not a solid ball, it
+            // is a scattered cloud of leaf blobs that passes most of the light
+            // reaching it. Filling the bound solid put 200 opaque 10 m spheres
+            // over a 128 m field and blocked the sky almost everywhere:
+            // irradiance in an open clearing came out at 0.009 against the
+            // 0.183 an unoccluded bake gives.
+            //
+            // A sphere at 0.45 covers a fifth of the bound's projected area,
+            // which is about what a crown's leaves actually subtend. The honest
+            // fix is a transmittance on GiTriangle so a canopy can pass light
+            // rather than either blocking it or not; this is the cheap version
+            // of the same idea and it is the radius, not the model, that was
+            // wrong.
+            canopies.push_back(
+                {eng::Vec3{c.x, c.y, c.z}, t.foliage.bounds.radius * scale * 0.45f});
             ++planted;
         }
         std::printf("  %d trees (%zu + %zu tris), rejected %d steep, %d in the clearing\n",
@@ -383,6 +413,164 @@ int main(int argc, char** argv) {
     std::printf("  %d polygons, %d portals, %.0f ms\n", navmesh.PolyCount(),
                 navmesh.Stats().portals, navmesh.Stats().build_seconds * 1000.0);
 
+    // Declared here rather than with the rest of the frame state below: the
+    // light bake needs the sun before the first frame runs, and a bake done
+    // against a different sun than the frame uses lights the scene as though
+    // it were two times of day at once.
+    eng::SkyConfig sky;
+    float sun_azimuth = 1.1f, sun_elevation = 0.55f;
+
+    // --- baked indirect light --------------------------------------------------
+    //
+    // The shadows were lit by a constant hemisphere term, which is why they were
+    // flat: every shaded pixel in the scene got the same ambient regardless of
+    // whether it was in the open, under a tree, or in a hollow. That reads as a
+    // renderer, not as a forest.
+    //
+    // What a volume adds here is two things the constant cannot: the sky is
+    // OCCLUDED under the canopy, so it gets darker where a tree is over it, and
+    // the ground BOUNCES, so shaded grass is lit by green light from the sunlit
+    // grass beside it rather than by grey.
+    //
+    // THE PROXY GEOMETRY is the coarse terrain plus one sphere per canopy. The
+    // real forest is 2.5M triangles and the bake traces hundreds of thousands
+    // of rays; the sphere says "sky blocked here, and green" which is the whole
+    // of a tree's contribution to indirect light.
+    {
+        // The sun and sky the bake assumes have to be the ones the frame uses,
+        // or the indirect light disagrees with the direct light and the scene
+        // looks lit by two different times of day.
+        sky.sun_direction = eng::Vec3{std::cos(sun_azimuth) * std::cos(sun_elevation),
+                                      std::sin(sun_elevation),
+                                      std::sin(sun_azimuth) * std::cos(sun_elevation)};
+        eng::Environment::ApplyTo(&scene, sky);
+
+        // THE SKY THE BAKE USES HAS TO BE THE SKY THE FRAME USES, and
+        // scene.ambientSky is not it: ApplyTo says in its own comment that the
+        // hemisphere term is a FALLBACK for paths without image-based lighting,
+        // a hand-fitted constant "scaled to roughly what the sky contributes".
+        // The forward path here reads the irradiance cube instead, so feeding
+        // the bake the fallback made the indirect light disagree with the
+        // direct -- it was four times too dim.
+        //
+        // So: bake the sky and read the irradiance cube back. The +Y and -Y
+        // faces are the irradiance on a level surface facing up and down, which
+        // is exactly what the bake wants for sky_top and sky_bottom.
+        //
+        // NOT corrected for the solar disc, and that needs saying because the
+        // cube does contain one. kSunDiscGain is deliberately set two hundred
+        // times below the true radiance-per-irradiance ratio so that the sun is
+        // NOT counted twice -- once by the directional light and once by the
+        // environment. At that gain the disc puts about 0.05 units into this
+        // face against the sky's 1.7, and subtracting the directional light
+        // instead, which is what this did first, takes off 8.3 and leaves zero.
+        eng::Vec3 sky_up{0.0f, 0.0f, 0.0f}, sky_down{0.0f, 0.0f, 0.0f};
+        {
+            constexpr int kFace = 4;
+            app->Gpu().BeginFrame();
+            {
+                auto e = app->Gpu().BeginCompute();
+                env->BakeSky(e, sky);
+                env->ReadCube(e, eng::Environment::Probe::Irradiance, kFace, 0.0f);
+                app->Gpu().EndCompute();
+            }
+            if (!app->Gpu().CommitAndWait(error)) return Fail(error);
+            const std::vector<eng::Vec4> cube = env->TakeCube();
+            const auto face_mean = [&](int face) {
+                eng::Vec3 sum{0.0f, 0.0f, 0.0f};
+                const int n = kFace * kFace;
+                for (int i = 0; i < n; ++i) {
+                    const eng::Vec4& v = cube[std::size_t(face * n + i)];
+                    sum = sum + eng::Vec3{v.x, v.y, v.z};
+                }
+                return sum * (1.0f / float(n));
+            };
+            if (cube.size() >= std::size_t(6 * kFace * kFace)) {
+                sky_up = face_mean(2);    // +Y
+                sky_down = face_mean(3);  // -Y
+            }
+        }
+        std::printf("    sun %.2f, sky %.2f (%.1f:1) at %.0f degrees\n",
+                    scene.lightColor.y * std::max(sky.sun_direction.y, 0.0f), sky_up.y,
+                    double(scene.lightColor.y * std::max(sky.sun_direction.y, 0.0f) /
+                           std::max(sky_up.y, 1e-4f)),
+                    sun_elevation * 57.2958f);
+        std::vector<eng::GiTriangle> soup;
+        const eng::Vec3 grass{ground_md.base_color.x, ground_md.base_color.y,
+                              ground_md.base_color.z};
+        for (std::size_t i = 0; i + 2 < nav_indices.size(); i += 3)
+            soup.push_back({nav_vertices[nav_indices[i]], nav_vertices[nav_indices[i + 1]],
+                            nav_vertices[nav_indices[i + 2]], grass});
+        const std::size_t ground_tris = soup.size();
+
+        const eng::Mesh proxy = eng::MakeUVSphere(1.0f, 6, 8, eng::Vec4{1, 1, 1, 1},
+                                                  eng::Vec4{1, 1, 1, 1});
+        const eng::Vec3 leafy{leaf_md.base_color.x, leaf_md.base_color.y,
+                              leaf_md.base_color.z};
+        for (const CanopyProxy& c : canopies)
+            for (std::size_t i = 0; i + 2 < proxy.indices.size(); i += 3) {
+                const auto at = [&](std::size_t k) {
+                    const VertexIn& v = proxy.vertices[proxy.indices[i + k]];
+                    return eng::Vec3{c.centre.x + v.position.x * c.radius,
+                                     c.centre.y + v.position.y * c.radius,
+                                     c.centre.z + v.position.z * c.radius};
+                };
+                soup.push_back({at(0), at(1), at(2), leafy});
+            }
+
+        eng::GiBakeConfig gi;
+        // 8 metres between probes horizontally and 5 vertically, over the
+        // playable bowl. Finer would resolve the shade under individual trees,
+        // and at 8 m it resolves the shade under a STAND of them -- which is
+        // the scale the light actually varies on outdoors, and a sixteenth of
+        // the bake time.
+        gi.nx = 17;
+        gi.ny = 7;
+        gi.nz = 17;
+        gi.origin = eng::Vec3{-64.0f, -10.0f, -64.0f};
+        gi.spacing = eng::Vec3{8.0f, 5.0f, 8.0f};
+        gi.rays = 96;
+        gi.bounces = 2;
+        gi.sun_direction = sky.sun_direction;
+        gi.sun_color = eng::Vec3{scene.lightColor.x, scene.lightColor.y,
+                                 scene.lightColor.z};
+        gi.sky_top = sky_up;
+        gi.sky_bottom = sky_down;
+        gi.threads = int(std::thread::hardware_concurrency());
+
+        std::printf("baking indirect light (%d probes, %zu ground + %zu canopy tris)...\n",
+                    gi.nx * gi.ny * gi.nz, ground_tris, soup.size() - ground_tris);
+        const auto t0 = std::chrono::steady_clock::now();
+        eng::IrradianceVolume volume = eng::IrradianceVolume::Bake(soup, gi);
+        const int dark = volume.DarkProbes();
+        // A probe grid is a box and terrain is not, so a large fraction of this
+        // one is underground and bakes to zero. Left alone they drag every
+        // shaded surface interpolating against them toward black -- which is
+        // exactly what happened the first time this ran: the forest floor went
+        // from flat to nearly unlit and the meter opened two more stops trying
+        // to compensate.
+        const int filled = volume.FillDark();
+        const double secs =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (!app->Draw().SetIrradianceVolume(volume, error)) return Fail(error);
+        std::printf("  %.2f s, %d of %d probes were buried, %d filled from neighbours\n",
+                    secs, dark, gi.nx * gi.ny * gi.nz, filled);
+        {
+            // The two numbers worth printing: what the volume gives in the open
+            // and what it gives under the trees. If the first is far below an
+            // unoccluded bake the proxy geometry is wrong, and if the second is
+            // not clearly below the first the trees are not occluding anything.
+            const eng::Vec3 up{0.0f, 1.0f, 0.0f};
+            const eng::Vec3 open = volume.Sample(
+                eng::Vec3{0.0f, terrain.HeightAt(0.0f, 0.0f) + 0.2f, 0.0f}, up);
+            const eng::Vec3 under = volume.Sample(
+                eng::Vec3{34.0f, terrain.HeightAt(34.0f, 34.0f) + 0.2f, 34.0f}, up);
+            std::printf("  irradiance in the open (%.3f %.3f %.3f), "
+                        "under canopy (%.3f %.3f %.3f)\n",
+                        open.x, open.y, open.z, under.x, under.y, under.z);
+        }
+    }
+
     // Two instances, at the origin: the trees were baked into world space by
     // AppendTransformed, so the model matrix is identity and the only reason
     // these are instances at all is that a draw needs one.
@@ -437,8 +625,6 @@ int main(int argc, char** argv) {
     scene.shadowCascades = 3;
     scene.shadowDistance = 90.0f;
 
-    eng::SkyConfig sky;
-    float sun_azimuth = 1.1f, sun_elevation = 0.55f;
     // AUTO EXPOSURE. Without it the composite applies a fixed exposure of 1,
     // and this scene is far too bright for that: the ground's albedo is
     // {0.34, 0.40, 0.26}, a green-grey, and it was rendering at 209,202,189 --

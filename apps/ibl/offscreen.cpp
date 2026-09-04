@@ -216,10 +216,74 @@ int main() {
         const Stats up = face_mean(2);
         const Stats down = face_mean(3);
         const Stats side = face_mean(4);
-        std::printf("    up %.3f   side %.3f   down %.3f\n", up.mean, side.mean, down.mean);
+        // The MAX matters here, not the mean: the check below is about the
+        // solar disc, which is one bright texel in a face of ordinary sky.
+        std::printf("    mean up %.3f side %.3f down %.3f; brightest texel "
+                    "up %.2f side %.2f (%.1fx)\n",
+                    up.mean, side.mean, down.mean, up.hi, side.hi,
+                    double(up.hi / std::max(side.hi, 1e-6f)));
         // The sun is straight up, so the zenith face contains the disc and is
         // by far the brightest thing anywhere.
         Check(up.hi > side.hi * 2.0f, "the sun's disc is in the face it points at");
+
+        // THE SUN IS ABOUT FOUR TIMES THE SKY, and that is a measured property
+        // of the atmosphere rather than a preference.
+        //
+        // A clear sky at midday puts 100 to 130 W/m^2 of diffuse light on a
+        // level surface while the direct beam puts 400 to 600 -- call it 3:1 to
+        // 6:1. This model's sun_intensity of 22 stands for the 1361 W/m^2 at
+        // the top of the atmosphere, so a unit is about 62 W/m^2 and both sides
+        // of the ratio can be read off in real units.
+        //
+        // IT USED TO BE 23:1. The scattering integral follows each photon
+        // exactly once -- sun, one bounce, eye -- and a single-scatter sky is
+        // about a quarter as bright as a real one, because most of a clear
+        // sky's light has bounced more than once. The sun was roughly right and
+        // the sky was four times too dark, which is two and a half stops of
+        // extra contrast on every outdoor scene in the engine. It is why the
+        // shadows in world2 were black.
+        //
+        // THIS IS THE CHECK THAT PINS kMultiScatter. The gain in the sky shader
+        // is fitted, and has to be -- deriving it means solving radiative
+        // transfer to convergence, which is the thing the approximation avoids
+        // -- but what it is fitted TO is this number, and this number is not a
+        // matter of taste.
+        {
+            eng::SkyConfig tilted_sun;
+            const float elevation = 0.55f;  // 32 degrees, the angle world2 uses
+            tilted_sun.sun_direction =
+                eng::Vec3{std::cos(elevation), std::sin(elevation), 0.0f};
+            auto ratio_env = eng::Environment::Create(*dev, error, 64);
+            if (!ratio_env) { std::fprintf(stderr, "FAIL: %s\n", error.c_str()); return 1; }
+            if (!RunCompute(*dev, [&](eng::rhi::ComputeEncoder& e) {
+                    ratio_env->BakeSky(e, tilted_sun);
+                }, error)) { std::fprintf(stderr, "FAIL: %s\n", error.c_str()); return 1; }
+            if (!RunCompute(*dev, [&](eng::rhi::ComputeEncoder& e) {
+                    ratio_env->ReadCube(e, eng::Environment::Probe::Irradiance, 4, 0.0f);
+                }, error)) { std::fprintf(stderr, "FAIL: %s\n", error.c_str()); return 1; }
+            const std::vector<eng::Vec4> irr = ratio_env->TakeCube();
+            // Face 2 is +Y: the irradiance a level surface receives from the
+            // sky. The disc is not in it -- cs_irradiance clamps it out on
+            // purpose, so that the directional light below is the only sun.
+            eng::Vec3 sky_up{0, 0, 0};
+            for (int i = 0; i < 16; ++i) {
+                const eng::Vec4& v = irr[std::size_t(2 * 16 + i)];
+                sky_up = eng::Vec3{sky_up.x + v.x, sky_up.y + v.y, sky_up.z + v.z};
+            }
+            sky_up = sky_up * (1.0f / 16.0f);
+            const eng::Vec3 sun = eng::Environment::SunColor(tilted_sun);
+            const float sun_level = sun.y * std::sin(elevation);
+            const float ratio = sun_level / std::max(sky_up.y, 1e-6f);
+            std::printf("    on a level surface: sun %.2f (%.0f W/m2), sky %.2f "
+                        "(%.0f W/m2), ratio %.1f:1\n",
+                        sun_level, sun_level * 61.9, sky_up.y, sky_up.y * 61.9, ratio);
+            Check(ratio > 2.5f && ratio < 7.0f,
+                  "the sun is 3 to 6 times the sky on a level surface");
+            // AND THE SKY IS THE RIGHT SIZE ON ITS OWN, not just in proportion.
+            // A ratio alone would also be satisfied by halving both.
+            Check(sky_up.y * 61.9f > 60.0f && sky_up.y * 61.9f < 200.0f,
+                  "and the sky alone is within sight of 100 W per square metre");
+        }
 
         // THE GROUND, compared against a direction rather than against another
         // whole face. The first version of this compared the -Y face with the

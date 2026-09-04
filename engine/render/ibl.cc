@@ -146,6 +146,10 @@ struct Environment::Impl {
     // BakeEquirect, because the only difference between them is where the top
     // mip came from.
     void BakeChain(rhi::ComputeEncoder& enc);
+    // Radiance above which the DIFFUSE convolution stops integrating, so the
+    // solar disc does not get counted a second time on top of the directional
+    // light. Set per bake; see cs_irradiance.
+    float diffuse_clamp = 1e30f;
 };
 
 Environment::Environment() : impl_(std::make_unique<Impl>()) {}
@@ -251,6 +255,11 @@ void Environment::Impl::BakeChain(rhi::ComputeEncoder& enc) {
     {
         CubeParams p{};
         p.size.x = std::uint32_t(kIrradianceSize);
+        // Four times the source irradiance the scattering integral is driven
+        // by. The sky's own radiance never approaches it -- the brightest
+        // direction in the model is a few percent of the source -- so this
+        // removes the solar disc and nothing else. See cs_irradiance.
+        p.tune.w = diffuse_clamp;
         enc.SetPipeline(irradiance_pass);
         enc.SetTexture(irradiance_view, 0);
         enc.SetTexture(radiance, 1);
@@ -300,6 +309,11 @@ void Environment::BakeSky(rhi::ComputeEncoder& enc, const SkyConfig& sky) {
                     sky.turbidity};
     p.tune = Vec4{sky.sun_intensity, sky.exposure, sky.night_lift, 0.0f};
     p.size.x = std::uint32_t(impl_->cube_size);
+    // Four times the source irradiance. The scattered sky never gets close --
+    // the brightest direction in the model is a few percent of the source --
+    // so this separates the disc from the sky with two orders of magnitude to
+    // spare, and it moves with sun_intensity instead of being a magic number.
+    impl_->diffuse_clamp = sky.sun_intensity * sky.exposure * 4.0f;
 
     enc.SetPipeline(impl_->sky_cube);
     enc.SetTexture(impl_->radiance_views[0], 0);
@@ -310,6 +324,12 @@ void Environment::BakeSky(rhi::ComputeEncoder& enc, const SkyConfig& sky) {
 
 void Environment::BakeEquirect(rhi::ComputeEncoder& enc, rhi::TextureId equirect) {
     if (!Valid(equirect)) return;
+    // NO CLAMP on a supplied image. The analytic sky has a directional light
+    // standing beside it that carries the sun, so its disc has to be kept out
+    // of the diffuse integral; a captured environment is on its own, and
+    // clipping its brightest region would just lose light with nothing to
+    // replace it.
+    impl_->diffuse_clamp = 1e30f;
     CubeParams p{};
     p.size.x = std::uint32_t(impl_->cube_size);
     enc.SetPipeline(impl_->equirect);

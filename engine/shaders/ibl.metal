@@ -31,7 +31,8 @@ constant float kPi = 3.14159265358979;
 
 struct CubeParams {
     uint4 size;      // .x face size of the OUTPUT, .y source mip count, .zw unused
-    float4 tune;     // .x roughness, .y source face size, .z sample count, .w unused
+    float4 tune;     // .x roughness, .y source face size, .z sample count,
+                     // .w radiance clamp for the diffuse convolution
 };
 
 // Cube face texel -> direction. The one place the face order is written down;
@@ -106,7 +107,31 @@ kernel void cs_irradiance(texture2d_array<float, access::write> out [[texture(0)
             // is a mistake that still produces a plausible-looking blur --
             // dropping the cosine makes the result too bright at grazing
             // angles, and nothing about the picture says which one is missing.
-            sum += env.sample(samp, dir, level(0.0)).rgb * cos_t * sin_t;
+            // CLAMPED, and this is what lets the solar disc be physically
+            // bright in the radiance cube.
+            //
+            // The renderer applies the sun TWICE if it is in both places: once
+            // as the directional light, which is shadowed, and once through
+            // this convolution, which is not. The second copy lights the inside
+            // of every shadow as though the sun reached it, and no amount of
+            // shadow work fixes it because the light is not coming from the
+            // shadowed path.
+            //
+            // It used to be avoided by making the disc 245 times dimmer than
+            // its true radiance -- 1/solid-angle is about 14700 and the gain
+            // was 60 -- which kept the diffuse honest at the cost of a sun that
+            // barely showed in the sky and put no highlight on anything. With a
+            // physically bright sky the disc stopped being the brightest thing
+            // in its own face at all.
+            //
+            // Clamping instead keeps the disc out of the DIFFUSE integral while
+            // leaving it at full strength in the cube the specular prefilter
+            // and the sky image read. The threshold is set from the sun, not
+            // guessed: anything above a few times the sun's source irradiance
+            // is the disc and nothing else, because the brightest sky in the
+            // model is a small fraction of it.
+            const float3 radiance = env.sample(samp, dir, level(0.0)).rgb;
+            sum += min(radiance, float3(p.tune.w)) * cos_t * sin_t;
             weight += cos_t * sin_t;
         }
     }

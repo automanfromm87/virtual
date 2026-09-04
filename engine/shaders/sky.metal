@@ -39,12 +39,88 @@ constant float kMieScaleHeight = 1200.0;
 // Mie's forward-scattering bias. Near 1 the glow tightens onto the sun.
 constant float kMieG = 0.758;
 // How much brighter the solar disc is than the `sun_intensity` that drives the
-// scattering integral. It is a unit conversion and not a fudge: the integral
-// treats sun_intensity as the irradiance arriving at the top of the atmosphere,
-// while the disc needs a RADIANCE -- energy per unit solid angle -- and the two
-// differ by the solid angle the disc covers. Sixty is that ratio at the scale
-// the rest of the model is calibrated to.
-constant float kSunDiscGain = 60.0;
+// scattering integral. It is a unit conversion: the integral treats
+// sun_intensity as the irradiance arriving at the top of the atmosphere, while
+// the disc needs a RADIANCE -- energy per solid angle -- and the two differ by
+// the solid angle the disc covers, 1/(pi r^2) which is about 14700.
+//
+// IT WAS 60, which is 245 times too low, and that was load-bearing rather than
+// careless: the irradiance convolution integrates this cube, the renderer also
+// applies the sun as a directional light, and a disc at full strength is
+// therefore counted twice -- the second time without a shadow, so it lights the
+// inside of every shadow. Suppressing the disc was the cheap way to avoid that.
+// cs_irradiance clamps now, so it no longer has to be.
+//
+// AND IT IS STILL NOT 14700, because the environment is stored as RGBA16Float
+// and 22 * 14700 is 324000, which is five times the format's 65504 ceiling and
+// arrives as +Inf -- which then propagates through the mip chain and the
+// specular prefilter and turns whole reflections into NaN. 2000 puts the peak
+// texel near 44000 with room to spare, leaves the disc about a thousand times
+// the brightest sky, and costs nothing real: the sun's ENERGY is carried by the
+// directional light, and what the cube needs is something that looks like a sun
+// when it is reflected.
+constant float kSunDiscGain = 2000.0;
+
+// MULTIPLE SCATTERING, as an isotropic addition to the single-scatter integral.
+//
+// The march below follows each photon exactly once: sun -> one scattering event
+// -> eye. A real photon bounces around the atmosphere many times before it
+// arrives, and the ones that bounce more than once are a large fraction of a
+// clear sky's light. Leaving them out does not make the sky slightly dim, it
+// makes it dim by a factor of four, and it is the single reason a physically
+// correct renderer produces harsh outdoor images: the SUN is right, the sky is
+// a quarter of what it should be, and every shadow is therefore two stops too
+// dark.
+//
+// Measured, at 32 degrees of sun elevation, against the irradiance the
+// environment cube actually delivers on a level surface:
+//
+//   sun_intensity 22 stands for the 1361 W/m^2 at the top of the atmosphere,
+//   so one unit is 62 W/m^2. Single scattering gave 0.41 units = 25 W/m^2.
+//   A clear sky at that elevation delivers 100 to 130. Direct sun was 9.3
+//   units = 577 W/m^2 against a real 420, so the sun was close and the sky
+//   was not: 23:1 where the world is about 4:1.
+//
+// ISOTROPIC and not another phase-weighted term, because that is what multiple
+// scattering does -- each additional bounce washes out the direction the light
+// came from, and by the third the sky has forgotten where the sun is. Using the
+// Rayleigh phase again would deepen the glow around the sun instead of lifting
+// the whole dome, which is the opposite of the effect.
+//
+// The gain is fitted, and it has to be: getting it from first principles means
+// solving the radiative transfer equation to convergence, which is the thing
+// this approximation exists to avoid. What is NOT fitted is the target -- the
+// sun-to-sky irradiance ratio of a clear sky is a measured property of the
+// atmosphere, and sky_test pins this to it.
+constant float kMultiScatter = 3.4;
+constant float kIsotropicPhase = 0.0795774715;  // 1 / (4 pi)
+// How far the multiply-scattered term is pulled toward grey.
+//
+// Rayleigh scattering goes as 1/lambda^4, so blue scatters about six times as
+// readily as red -- which is why the sky is blue, and why the FIRST version of
+// the term above weighted it by the full Rayleigh coefficient. That is wrong,
+// and it broke a test that was right: the horizon came out marginally BLUER
+// than the zenith when it must be whiter.
+//
+// The reason is that the same 1/lambda^4 that scatters blue in also scatters it
+// back out. After one bounce the light is blue; after many it has been
+// redistributed so often that the spectrum flattens, which is exactly why a
+// hazy sky is white and a deep one is blue. Weighting multiple scattering by
+// the single-scattering spectrum applies the selectivity once per bounce and
+// never applies the saturation.
+//
+// The horizon is where this shows, because it is the direction with the most
+// atmosphere in it and therefore the most multiple scattering.
+//
+// SO THE WHITENING TRACKS OPTICAL DEPTH rather than being a constant. A fixed
+// fraction cannot work: at 0 the horizon comes out bluer than the zenith, and
+// at 0.72 -- enough to fix the horizon -- the zenith's blue/red falls from 2.4
+// to 1.2 and the sky stops being blue at all. They are not the same question.
+// Looking up through a tenth of an atmosphere the light has scattered about
+// once and is blue; looking along the horizon through forty times as much it
+// has scattered many times and is white. This is the optical depth at which it
+// is half way between.
+constant float kWhitenDepth = 1.5;
 
 // THE PRECISION PROBLEM, and why both functions below are written oddly.
 //
@@ -192,8 +268,14 @@ static float3 ScatteredRadiance(float3 dir, constant SkyParams& p, thread float3
     out_tau = kRayleigh * optical_r + float3(mie_scale * 1.1) * optical_m;
 
     const float cos_theta = dot(dir, sun);
-    return float3(p.tune.x) * (rayleigh_sum * kRayleigh * RayleighPhase(cos_theta) +
-                               mie_sum * mie_scale * MiePhase(cos_theta, kMieG));
+    const float3 single = rayleigh_sum * kRayleigh * RayleighPhase(cos_theta) +
+                          mie_sum * mie_scale * MiePhase(cos_theta, kMieG);
+    const float3 grey = float3((kRayleigh.x + kRayleigh.y + kRayleigh.z) / 3.0);
+    const float tau_view = grey.x * optical_r;
+    const float3 ms_rayleigh = mix(kRayleigh, grey, tau_view / (tau_view + kWhitenDepth));
+    const float3 multi = (rayleigh_sum * ms_rayleigh + mie_sum * mie_scale) *
+                         (kMultiScatter * kIsotropicPhase);
+    return float3(p.tune.x) * (single + multi);
 }
 
 // The irradiance the SKY puts on level ground: a cosine-weighted average over
@@ -254,12 +336,34 @@ static float3 SkyRadiance(float3 dir, constant SkyParams& p) {
     // the environment carries no sun at all and every specular reflection is a
     // dull smear instead of a highlight.
     const float radius = max(p.sun_dir.w, 1e-4);
-    const float3 disc_radiance = exp(-tau) * float3(p.tune.x) * kSunDiscGain;
+
+    // SPREAD TO AT LEAST A TEXEL, with the radiance dropped to match.
+    //
+    // The sun is a quarter of a degree across and a face of a 64-cube is 90
+    // degrees over 64 texels, so a texel is 1.4 degrees and the disc is a fifth
+    // of one. This is evaluated at texel CENTRES, and for a sun on a face's
+    // axis the nearest centre is half a texel away -- so no sample ever landed
+    // inside the disc and the cube contained no sun at all. Raising the gain
+    // did nothing, measured: the brightest texel in the sun's own face did not
+    // move by a digit when the gain went up by a factor of thirty.
+    //
+    // Widening it and scaling the radiance by the ratio of solid angles keeps
+    // the total energy right, which is the whole point -- an aliased disc is
+    // not "a slightly wrong sun", it is no sun, and a disc drawn at full
+    // radiance across a whole texel would be a sun thirty times too bright.
+    const float texel = 1.5707963 / max(float(p.size.x), 1.0);
+    // 1.2 texels: half a texel diagonal is 0.71, so this guarantees a centre
+    // inside the disc with enough margin that the smoothstep edge has somewhere
+    // to fall rather than clipping to a single hard texel.
+    const float spread = max(radius, texel * 1.2);
+    const float conserve = (radius * radius) / (spread * spread);
+    const float3 disc_radiance =
+        exp(-tau) * float3(p.tune.x) * kSunDiscGain * conserve;
     if (!hits_ground) {
         const float angle = acos(clamp(dot(dir, sun), -1.0, 1.0));
         // Softened at the edge so a low-resolution cube does not alias the disc
         // into a square.
-        const float disc = 1.0 - smoothstep(radius * 0.85, radius * 1.15, angle);
+        const float disc = 1.0 - smoothstep(spread * 0.85, spread * 1.15, angle);
         if (disc > 0.0) result += disc_radiance * disc;
     }
 

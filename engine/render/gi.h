@@ -117,9 +117,33 @@ class IrradianceVolume {
     // fails on a thin slab because most rays escape sideways. Both were tried.
     // Darkness is the symptom that actually matters and it needs neither.
     //
-    // Reported rather than corrected: the fix is to move the grid or supply a
-    // fallback, and both are the caller's decision.
+    // Reported rather than corrected, because a caller that knows its grid is
+    // clear of geometry should be told rather than quietly patched. Callers
+    // that cannot guarantee that -- anything over terrain -- want FillDark.
     [[nodiscard]] int DarkProbes() const { return dark_; }
+
+    // Replaces every dark probe with the average of its lit neighbours, sweeping
+    // outward until none are left or none can be reached. Returns how many were
+    // filled.
+    //
+    // WHY THIS IS NECESSARY over terrain and not optional. A probe grid is a
+    // box and terrain is not, so a grid that covers a valley has a large
+    // fraction of its probes underground -- 761 of 2023, measured, on a bowl
+    // 128 metres across. A buried probe sees nothing, bakes to zero, and every
+    // shaded surface trilinearly interpolating against it is dragged toward
+    // black. The result is worse than no volume at all: the constant ambient it
+    // replaces was at least uniformly wrong.
+    //
+    // AVERAGING NEIGHBOURS rather than falling back to the constant ambient,
+    // because a buried probe's nearest lit neighbour is the surface directly
+    // above it, and that is a far better estimate of the light at a point on
+    // the ground than any scene-wide constant. Iterating outward is what carries
+    // that estimate down into probes with no lit neighbour at all.
+    //
+    // The 26-neighbourhood, not the 6: a probe buried under a slope often has
+    // no lit neighbour on any axis but a lit one diagonally, and using the 6
+    // costs an extra sweep per such probe for nothing.
+    int FillDark();
 
   private:
     // Shared by Sample and by the bake's own bounce lookup. The bake cannot
