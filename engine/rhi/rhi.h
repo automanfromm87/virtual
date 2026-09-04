@@ -213,6 +213,22 @@ struct GpuTiming {
     // report a timing would be its own performance problem.
     const char* label = "";
     double milliseconds = 0.0;
+    // WHEN, not just how long, relative to the earliest sample in the frame.
+    //
+    // A duration on its own is misleading on a tile-based GPU and measurably
+    // so: sampling at stage boundaries times a pass from its VERTEX start to
+    // its FRAGMENT end, and the hardware overlaps one pass's fragment work with
+    // the next one's vertex work. The eleven passes of the world app's frame
+    // summed to 19.5 ms of a 4.3 ms frame -- not because any figure was wrong,
+    // but because the last four all ended within 0.11 ms of each other and each
+    // reported the whole span back to its own start.
+    //
+    // With begin and end the overlap is visible instead of confusing, and the
+    // question a profile is actually asked -- what is on the critical path --
+    // has an answer. Both are milliseconds from the first sample the frame
+    // took, so they are comparable across passes and meaningless across frames.
+    double begin_ms = 0.0;
+    double end_ms = 0.0;
 };
 
 struct PassDesc {
@@ -674,7 +690,13 @@ class Device {
     // three frames behind the one being recorded, because reading them any
     // sooner would mean waiting for the GPU. That lag is why these are for a
     // HUD and a log, not for anything that feeds back into the frame.
-    [[nodiscard]] std::span<const GpuTiming> LastFrameTimings() const;
+    //
+    // BY VALUE, and that is not an oversight. These are published from a Metal
+    // completion handler on a driver thread; handing back a view into the
+    // engine's own vector meant the caller held a pointer that the next
+    // completion freed. A dozen structs copied once a frame is not a cost worth
+    // a lifetime hazard.
+    [[nodiscard]] std::vector<GpuTiming> LastFrameTimings() const;
     // Wall-clock GPU time for the whole of the last completed command buffer.
     // Available even without stage-boundary sampling, and the honest headline
     // number: the per-pass timings do not sum to it, because passes overlap.

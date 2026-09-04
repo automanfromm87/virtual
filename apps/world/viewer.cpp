@@ -1582,6 +1582,7 @@ int main(int argc, char** argv) {
     app->Actions().Bind("stop4", '4');
     app->Actions().Bind("stop5", '5');
     app->Actions().Bind("reset", 'r');
+    app->Actions().Bind("passes", 'p');
     app->Actions().Bind("forward", 'w');
     app->Actions().Bind("back", 's');
     app->Actions().Bind("left", 'a');
@@ -1604,6 +1605,30 @@ int main(int argc, char** argv) {
     // frame of its own and waits on it, which from inside App::BeginFrame's
     // frame leaks a frames-in-flight permit and discards the frame in progress.
     bool gi_rebake_pending = false;
+    // --- the frame, accounted for ---------------------------------------------
+    //
+    // The app named a GPU timer on eight render passes and four compute
+    // encoders and then printed one aggregate number, so a frame that was too
+    // slow gave no hint as to which of its fourteen encoders to look at. These
+    // three carry last frame's answer, because the HUD is built before this
+    // frame's passes run -- every number on it is one frame old, and pretending
+    // otherwise would be worse than the lag.
+    //
+    // cpu_ms is the loop body: BeginFrame to EndFrame, so it excludes the wait
+    // for a drawable and for a frame slot. Against Clock::RawDt, which is the
+    // whole wall period including those waits, it says which side the frame is
+    // bound on -- cpu near period means the CPU is the wall, cpu far below it
+    // means we are waiting on the GPU or on vsync.
+    //
+    // period_ms is measured here rather than taken from Clock::RawDt because
+    // headless FIXES the timestep on purpose (app.h: "two identical captures
+    // differ and nothing can be compared byte for byte"), so RawDt reports the
+    // nominal 1/60 in a capture no matter how long the frame really took. The
+    // wall clock is the same number in both modes.
+    double cpu_ms = 0.0, period_ms = 0.0;
+    auto period_prev = std::chrono::steady_clock::now();
+    std::vector<eng::rhi::GpuTiming> pass_ms;
+    bool profile_panel = false;
     while (app->Running()) {
         if (gi_rebake_pending) {
             gi_rebake_pending = false;
@@ -1611,6 +1636,9 @@ int main(int argc, char** argv) {
             gi_stale = false;
         }
         if (!app->BeginFrame()) continue;
+        const auto cpu_begin = std::chrono::steady_clock::now();
+        period_ms = std::chrono::duration<double, std::milli>(cpu_begin - period_prev).count();
+        period_prev = cpu_begin;
         const eng::app::Frame& f = app->Current();
 
         // --- camera ----------------------------------------------------------
@@ -1637,6 +1665,7 @@ int main(int argc, char** argv) {
             focus_height = std::max(focus_height - f.dt * 9.0f, 0.4f);
         if (app->Actions().Pressed("ssao")) ssao_on = !ssao_on;
         if (app->Actions().Pressed("shafts")) shafts_on = !shafts_on;
+        if (app->Actions().Pressed("passes")) profile_panel = !profile_panel;
 
         // --- the sun, and the indirect light that has to follow it -------------
         //
@@ -2144,8 +2173,8 @@ int main(int argc, char** argv) {
 
         // --- HUD ----------------------------------------------------------------
         ui->Begin(f.width, f.height);
-        ui->Rect(12, 12, 500, 252, eng::Vec4{0.05f, 0.06f, 0.08f, 0.72f});
-        ui->Outline(12, 12, 500, 252, 1.0f, eng::Vec4{0.35f, 0.40f, 0.48f, 0.9f});
+        ui->Rect(12, 12, 500, 276, eng::Vec4{0.05f, 0.06f, 0.08f, 0.72f});
+        ui->Outline(12, 12, 500, 276, 1.0f, eng::Vec4{0.35f, 0.40f, 0.48f, 0.9f});
         char line[192];
         const eng::RenderStats& rs = app->Draw().LastStats();
         // In indirect mode LastStats is the REMAINDER's (the forward pass runs
@@ -2198,16 +2227,32 @@ int main(int argc, char** argv) {
                       terrain.HeightAt(player.Feet().x, player.Feet().z),
                       player.Feet().y - terrain.HeightAt(player.Feet().x, player.Feet().z));
         ui->Text(26, 98, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
+        // THE HEADLINE IS THREE NUMBERS, not one. gpu alone cannot say whether
+        // a slow frame is the GPU's fault: cpu is the loop body and period is
+        // the wall including every wait, so cpu ~= period means the CPU is the
+        // wall and cpu << period means it is not. `slowest` is the one pass
+        // worth looking at first; `p` opens the rest.
+        const char* slowest = "-";
+        double slowest_ms = 0.0;
+        for (const eng::rhi::GpuTiming& t : pass_ms)
+            if (t.milliseconds > slowest_ms) {
+                slowest_ms = t.milliseconds;
+                slowest = t.label;
+            }
         std::snprintf(line, sizeof(line),
-                      "gpu %.2f ms  fog %s  taa %s  ao %s  exposure %.2f (%+.1f EV)  %s",
-                      app->Gpu().LastFrameGpuMilliseconds(),
+                      "cpu %.2f  gpu %.2f  period %.2f ms  %.0f fps   slowest: %s %.2f",
+                      cpu_ms, app->Gpu().LastFrameGpuMilliseconds(), period_ms,
+                      app->Time().Fps(), slowest, slowest_ms);
+        ui->Text(26, 122, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
+        std::snprintf(line, sizeof(line),
+                      "fog %s  taa %s  ao %s  exposure %.2f (%+.1f EV)  %s",
                       post->config.fog ? "on" : "off",
                       post->config.taa ? "on" : "off", ssao_on ? "on" : "off",
                       post->LastExposure(),
                       std::log2(std::max(post->LastExposure(), 1e-6f)),
                       player.Grounded() ? "grounded" : "airborne");
-        ui->Text(26, 122, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
-        ui->Text(26, 152, "click: walk there   right-drag: orbit   scroll: zoom",
+        ui->Text(26, 146, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
+        ui->Text(26, 176, "click: walk there   right-drag: orbit   scroll: zoom",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
         const eng::Renderer::ClusterStats cs =
             app->Draw().ClusteredLighting() ? app->Draw().ReadClusterStats()
@@ -2226,14 +2271,65 @@ int main(int argc, char** argv) {
                       audio_peak,
                       audio && audio->StarvedVoices() ? "  STARVED" : "",
                       audio_peak > 1.0f ? "  CLIPPING" : "");
-        ui->Text(26, 200, line,
+        ui->Text(26, 224, line,
                  cs.overflowed_cells ? eng::Vec4{1.0f, 0.72f, 0.35f, 1.0f}
                                      : eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
         std::snprintf(line, sizeof(line), "at: %s   (0-5 to travel)",
                       kStopList[std::clamp(here, 0, kStops - 1)].name);
-        ui->Text(26, 176, line, eng::Vec4{0.92f, 0.94f, 0.98f, 1.0f});
-        ui->Text(26, 224, "wasd: walk  space: run  qe: look down/up  f t o v: effects  [ ]: sun  r: reset",
+        ui->Text(26, 200, line, eng::Vec4{0.92f, 0.94f, 0.98f, 1.0f});
+        ui->Text(26, 248, "wasd: walk  space: run  qe: look down/up  f t o v: effects  [ ]: sun  r: reset  p: passes",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
+
+        // --- the pass table -------------------------------------------------
+        //
+        // A SEPARATE PANEL, off by default, so the default frame a screenshot
+        // captures is unchanged and the pixel comparisons in the commit
+        // messages stay comparable. The headline row above is always on, which
+        // is what keeps this from rotting the way the timing feature already
+        // did once when nothing read it.
+        //
+        // These do NOT sum to the gpu figure and they are not meant to: a tiler
+        // overlaps one pass's vertex work with the last one's fragment work, so
+        // the sum exceeds the frame. The sum is printed anyway, because the
+        // RATIO of the two is how much overlap the GPU found.
+        if (profile_panel && !pass_ms.empty()) {
+            // A TIMELINE, not a column of durations. Drawn as a bar per pass
+            // positioned by begin_ms and end_ms, so the overlap the tiler finds
+            // is a picture instead of a sum that does not add up.
+            const int rows = int(pass_ms.size()) + 1;
+            const int top = 300, w = 460, h = rows * 20 + 20;
+            const int bar_x = 130, bar_w = w - bar_x - 14;
+            double span = 0.0;
+            for (const eng::rhi::GpuTiming& t : pass_ms)
+                span = std::max(span, t.end_ms);
+            span = std::max(span, 1e-3);
+            ui->Rect(12, top, w, h, eng::Vec4{0.05f, 0.06f, 0.08f, 0.72f});
+            ui->Outline(12, top, w, h, 1.0f, eng::Vec4{0.35f, 0.40f, 0.48f, 0.9f});
+            int row = 0;
+            for (const eng::rhi::GpuTiming& t : pass_ms) {
+                const int y = top + 12 + row * 20;
+                std::snprintf(line, sizeof(line), "%-9s %5.2f", t.label,
+                              t.milliseconds);
+                ui->Text(24, y + 6, line,
+                         t.milliseconds >= slowest_ms
+                             ? eng::Vec4{1.0f, 0.82f, 0.45f, 1.0f}
+                             : eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
+                const float x0 = float(t.begin_ms / span) * float(bar_w);
+                const float x1 = float(t.end_ms / span) * float(bar_w);
+                ui->Rect(float(12 + bar_x) + x0, float(y) + 2.0f,
+                         std::max(x1 - x0, 1.0f), 11.0f,
+                         t.milliseconds >= slowest_ms
+                             ? eng::Vec4{1.0f, 0.72f, 0.30f, 0.95f}
+                             : eng::Vec4{0.42f, 0.62f, 0.86f, 0.95f});
+                ++row;
+            }
+            std::snprintf(line, sizeof(line),
+                          "gpu %.2f ms   span %.2f ms   %d passes",
+                          app->Gpu().LastFrameGpuMilliseconds(), span,
+                          int(pass_ms.size()));
+            ui->Text(24, top + 12 + row * 20 + 6, line,
+                     eng::Vec4{0.92f, 0.94f, 0.98f, 1.0f});
+        }
 
         // --- passes --------------------------------------------------------------
         if (!shot_path.empty() && !eng::rhi::Valid(shot_target))
@@ -2518,19 +2614,35 @@ int main(int argc, char** argv) {
         }
         post->EndFrame();
         app->EndFrame();
+        // AFTER EndFrame, so cpu_ms covers the whole loop body including the
+        // commit, and so the timings are the newest the GPU has finished. Both
+        // are read by the HUD one frame later.
+        cpu_ms = std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - cpu_begin)
+                     .count();
+        pass_ms = app->Gpu().LastFrameTimings();
         // Every frame during a capture, because the two things most likely to
         // be wrong in a screenshot are an exposure that has not settled and a
         // camera that is not where it was asked to be.
         if (!shot_path.empty()) {
+            std::printf("  frame %3d  cpu %6.3f  gpu %6.3f  period %6.3f ms |",
+                        int(f.index), cpu_ms,
+                        app->Gpu().LastFrameGpuMilliseconds(), period_ms);
+            // begin-end, not just a duration: the passes overlap, and a log of
+            // durations that sum past the frame time has fooled every reader.
+            for (const eng::rhi::GpuTiming& t : pass_ms)
+                std::printf(" %s %.2f-%.2f", t.label, t.begin_ms, t.end_ms);
+            std::printf("\n");
             if (indirect_on)
-                std::printf("  frame %3d  gpu %.3f ms  indirect %d draws over %d batches + %d remainder, %d sparks\n",
-                            int(f.index), app->Gpu().LastFrameGpuMilliseconds(),
+                std::printf("             indirect %d draws over %d batches + %d remainder, "
+                            "shadow %d/%d culled, %d dropped, %d sparks\n",
                             indirect_draws, indirect_batches, rem_draws,
+                            app->Draw().ShadowDrawCount(), app->Draw().ShadowCulledCount(),
+                            app->Draw().LastStats().overflowed + app->Draw().ShadowOverflowCount(),
                             sparks->LiveCountSlow());
             else
-                std::printf("  frame %3d  gpu %.3f ms  %d draws (%d transparent), %d culled, "
+                std::printf("             %d draws (%d transparent), %d culled, "
                             "shadow %d/%d culled, %d dropped, %d sparks\n",
-                            int(f.index), app->Gpu().LastFrameGpuMilliseconds(),
                             app->Draw().LastStats().draws, app->Draw().LastStats().transparent_draws, app->Draw().LastStats().culled,
                             app->Draw().ShadowDrawCount(), app->Draw().ShadowCulledCount(),
                             app->Draw().LastStats().overflowed + app->Draw().ShadowOverflowCount(),

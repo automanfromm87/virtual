@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 
 #include "engine/rhi/rhi.h"
 
@@ -113,25 +114,47 @@ struct Device::Impl {
 
     // --- GPU timing -----------------------------------------------------------
     //
-    // ONE sample buffer, reused every frame, with two slots per timed pass.
-    // Metal writes a GPU tick into a slot at a stage boundary; the difference
-    // between the pair is the pass's duration.
+    // Two slots per timed pass -- Metal writes a GPU tick into each at a stage
+    // boundary and the difference is the pass's duration -- and ONE REGION PER
+    // FRAME SLOT, which is the part this got wrong for its whole life.
     //
-    // Reused rather than allocated per frame because a counter sample buffer is
-    // a real allocation and there are at most a couple of dozen passes. The
-    // reuse is safe for the same reason the uniform ring is: the frame that
-    // last wrote these slots has provably completed before this one is allowed
-    // to start.
+    // It was a single region of kMaxTimedPasses pairs, reused every frame, and
+    // the comment defending that said the reuse was "safe for the same reason
+    // the uniform ring is: the frame that last wrote these slots has provably
+    // completed". That reason does not apply here. The uniform ring is indexed
+    // by FrameSlot; this was not indexed at all. BeginFrame resets
+    // timed_this_frame to zero, so frame N+1 began overwriting slot 0 while
+    // frame N's samples were still unresolved -- with kFramesInFlight = 3,
+    // three frames writing one region. The symptom was not silence, which is
+    // why it survived: every pass reported a plausible number, drawn from
+    // whichever frame happened to write last. A static camera produced a
+    // bimodal shadow time (2.0 ms and 16.3 ms in the same run) and per-pass
+    // totals two to three times the frame's own GPU time.
     bool timing_supported = false;
     id<MTLCounterSampleBuffer> counters = nil;
     static constexpr int kMaxTimedPasses = 32;
     // Labels recorded while encoding THIS frame, in the order the passes were
-    // begun. Resolved into `timings` when the buffer completes.
+    // begun. Copied into the completion handler, which resolves them.
     std::vector<const char*> timing_labels;
-    std::vector<GpuTiming> timings;      // last completed frame, for the caller
-    std::vector<GpuTiming> timings_next; // being resolved
     std::atomic<double> gpu_ms{0.0};
     int timed_this_frame = 0;
+
+    // PUBLISHED UNDER A LOCK, and read out as a COPY.
+    //
+    // The reader used to be handed `{timings.data(), timings.size()}` -- a raw
+    // span into a vector that a driver-thread completion block swapped, and
+    // whose swapped-out buffer the NEXT completion destroyed. That is a
+    // use-after-free with a two-frame fuse, and it stayed hidden only because
+    // nothing outside a test ever called LastFrameTimings.
+    //
+    // A mutex rather than an atomic swap because there is more than one
+    // producer: up to kFramesInFlight completion handlers can run at once, on
+    // whatever threads Metal chooses. `timings_frame` is what keeps them in
+    // order -- a handler that completes late must not overwrite a newer frame's
+    // numbers with its own.
+    std::mutex timings_mutex;
+    std::vector<GpuTiming> timings;
+    std::uint64_t timings_frame = 0;
 
     // Throttles the CPU to kFramesInFlight outstanding frames. Signalled from
     // each command buffer's completion handler.
@@ -147,6 +170,13 @@ struct Device::Impl {
     // this the table grows by one entry per window resize forever.
     std::vector<std::uint32_t> free_textures;
 
+    // Where this frame's pairs start in the shared buffer. Frame slot N owns
+    // pairs [N * kMaxTimedPasses, (N+1) * kMaxTimedPasses).
+    [[nodiscard]] int TimingBase() const {
+        const std::uint64_t f = frame_index == 0 ? 0 : frame_index - 1;
+        return int(f % kFramesInFlight) * kMaxTimedPasses;
+    }
+
     // Claims a pair of timestamp slots for a pass, or -1 when the pass asked
     // for no timing, the hardware cannot sample, or the frame has already used
     // all of them. Dropping the extras silently is deliberate: running out of
@@ -154,7 +184,7 @@ struct Device::Impl {
     int BeginTiming(const char* label) {
         if (!label || !timing_supported) return -1;
         if (timed_this_frame >= kMaxTimedPasses) return -1;
-        const int slot = timed_this_frame++;
+        const int slot = TimingBase() + timed_this_frame++;
         timing_labels.push_back(label);
         return slot;
     }
@@ -413,7 +443,11 @@ std::unique_ptr<Device> Device::Create(std::string& error) {
             MTLCounterSampleBufferDescriptor* cd =
                 [[MTLCounterSampleBufferDescriptor alloc] init];
             cd.counterSet = timestamps;
-            cd.sampleCount = NSUInteger(Device::Impl::kMaxTimedPasses * 2);
+            // ONE REGION PER FRAME SLOT. Three frames are in flight and each
+            // writes its own; sharing one region is what made every per-pass
+            // number a mixture of up to three frames.
+            cd.sampleCount =
+                NSUInteger(Device::Impl::kMaxTimedPasses * 2 * kFramesInFlight);
             // SHARED, so resolveCounterRange can read it without a blit. The
             // buffer is a few hundred bytes and is read once a frame.
             cd.storageMode = MTLStorageModeShared;
@@ -1318,6 +1352,10 @@ void Device::InstallFrameCompletion() { @autoreleasepool {
     // whose symptom is a garbage label, or a crash if it reallocated.
     std::vector<const char*> labels = impl_->timing_labels;
     const int timed = impl_->timed_this_frame;
+    // WHERE this frame's pairs live, captured with them. Resolving from zero
+    // would read whichever frame owns slot 0 rather than this one.
+    const int base = impl_->TimingBase();
+    const std::uint64_t frame = impl_->frame_index;
     id<MTLCounterSampleBuffer> counters = impl_->counters;
     [impl_->cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         // GPUEndTime and GPUStartTime are seconds, and available whether or not
@@ -1327,11 +1365,24 @@ void Device::InstallFrameCompletion() { @autoreleasepool {
         impl->gpu_ms.store((done.GPUEndTime - done.GPUStartTime) * 1000.0,
                            std::memory_order_relaxed);
         if (timed > 0 && counters) {
-            NSData* data = [counters resolveCounterRange:NSMakeRange(0, NSUInteger(timed * 2))];
+            NSData* data = [counters
+                resolveCounterRange:NSMakeRange(NSUInteger(base * 2),
+                                                NSUInteger(timed * 2))];
             if (data && data.length >= sizeof(MTLCounterResultTimestamp) * std::size_t(timed * 2)) {
                 const auto* t = static_cast<const MTLCounterResultTimestamp*>(data.bytes);
                 std::vector<GpuTiming> out;
                 out.reserve(std::size_t(timed));
+                // THE FRAME'S OWN ORIGIN, taken from the samples rather than
+                // from GPUStartTime. The two are not the same clock -- one is
+                // seconds on the CPU timebase and the other is GPU ticks -- and
+                // correlating them buys nothing here, because begin and end are
+                // only ever compared with each other.
+                MTLTimestamp origin = ~MTLTimestamp{0};
+                for (int i = 0; i < timed * 2; ++i)
+                    if (t[i].timestamp != MTLCounterErrorValue &&
+                        t[i].timestamp < origin)
+                        origin = t[i].timestamp;
+                if (origin == ~MTLTimestamp{0}) origin = 0;
                 for (int i = 0; i < timed; ++i) {
                     const MTLTimestamp a = t[i * 2].timestamp;
                     const MTLTimestamp b = t[i * 2 + 1].timestamp;
@@ -1347,15 +1398,22 @@ void Device::InstallFrameCompletion() { @autoreleasepool {
                     // share a timebase, which is exactly why no correlation
                     // call is needed here.
                     g.milliseconds = bad ? 0.0 : double(b - a) * 1e-6;
+                    g.begin_ms = bad ? 0.0 : double(a - origin) * 1e-6;
+                    g.end_ms = bad ? 0.0 : double(b - origin) * 1e-6;
                     out.push_back(g);
                 }
-                impl->timings_next = std::move(out);
+                // IN ORDER, and under the lock. Completion handlers run on
+                // driver threads and there can be kFramesInFlight of them at
+                // once, so "last to finish" is not "newest" -- without the
+                // frame check a handler that came back late would replace a
+                // newer frame's numbers with its own.
+                std::lock_guard<std::mutex> guard(impl->timings_mutex);
+                if (frame >= impl->timings_frame) {
+                    impl->timings = std::move(out);
+                    impl->timings_frame = frame;
+                }
             }
         }
-        // Published LAST, so a reader never sees a half-filled list. Single
-        // producer, and the reader is the game thread reading a vector it only
-        // ever swaps whole -- see LastFrameTimings for why that is enough here.
-        impl->timings.swap(impl->timings_next);
         counter->fetch_sub(1);
         dispatch_semaphore_signal(sem);
     }];
@@ -1377,8 +1435,9 @@ int Device::TextureSlotCount() const { return int(impl_->textures.size()); }
 
 bool Device::SupportsGpuTiming() const { return impl_->timing_supported; }
 
-std::span<const GpuTiming> Device::LastFrameTimings() const {
-    return {impl_->timings.data(), impl_->timings.size()};
+std::vector<GpuTiming> Device::LastFrameTimings() const {
+    std::lock_guard<std::mutex> guard(impl_->timings_mutex);
+    return impl_->timings;
 }
 
 double Device::LastFrameGpuMilliseconds() const {
