@@ -253,6 +253,7 @@ struct FluidOut {
     float4 position [[position]];
     float2 uv;
     float3 color;
+    float3 world;
 };
 
 vertex FluidOut vs_fluid(uint vid [[vertex_id]],
@@ -275,6 +276,7 @@ vertex FluidOut vs_fluid(uint vid [[vertex_id]],
     FluidOut o;
     o.position = u.viewProj * float4(world, 1.0f);
     o.uv = corner;
+    o.world = q.position.xyz;
     // Tinted by SPEED. Not decoration: a still fluid and a violently churning
     // one look identical as a field of blue dots, and the whole question when
     // watching a fluid solver is where the energy is.
@@ -284,7 +286,8 @@ vertex FluidOut vs_fluid(uint vid [[vertex_id]],
     return o;
 }
 
-fragment float4 fs_fluid(FluidOut in [[stage_in]])
+fragment float4 fs_fluid(FluidOut in [[stage_in]],
+                             constant FrameUniforms& u [[buffer(1)]])
 {
     const float r2 = dot(in.uv, in.uv);
     if (r2 > 1.0f) discard_fragment();
@@ -292,7 +295,20 @@ fragment float4 fs_fluid(FluidOut in [[stage_in]])
     // gives a normal, and a cheap diffuse term off it reads as a droplet
     // instead of a sticker.
     const float z = sqrt(1.0f - r2);
+    // World space: right/up above are world axes, so this normal is too, and
+    // the fixed sun below means the same thing it meant to the diffuse term.
     const float3 n = normalize(float3(in.uv, z));
-    const float light = 0.35f + 0.65f * saturate(dot(n, normalize(float3(0.4f, 0.7f, 0.6f))));
-    return float4(in.color * light, 1.0f);
+    const float3 sun = normalize(float3(0.4f, 0.7f, 0.6f));
+    const float diffuse = 0.35f + 0.65f * saturate(dot(n, sun));
+    // A sun glint and a sky rim: the two cheapest water cues. A matte ball and
+    // a water droplet differ almost entirely in these -- the droplet returns
+    // the sun in a tight highlight and the sky at grazing angles, and without
+    // either every particle reads as plastic no matter what the solver does.
+    const float3 v = normalize(u.eyePos.xyz - in.world);
+    const float3 h = normalize(sun + v);
+    const float spec = pow(saturate(dot(n, h)), 90.0f);
+    const float fres = pow(1.0f - saturate(dot(n, v)), 3.0f);
+    const float3 color = in.color * diffuse + spec * float3(1.0f, 0.98f, 0.95f) +
+                         fres * float3(0.30f, 0.42f, 0.60f) * 0.55f;
+    return float4(color, 1.0f);
 }

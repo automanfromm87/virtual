@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "engine/geometry/mesh.h"
 #include "engine/shaders/shader_types.h"
 
 namespace eng {
@@ -272,6 +273,10 @@ void FluidSim::Draw(rhi::Encoder& enc, const Camera& camera, int width,
     enc.SetVertexBuffer(impl_->particles, 0, 0);
     enc.SetVertexBytes(&u, sizeof(u), 1);
     enc.SetVertexBytes(&params, sizeof(params), 2);
+    // The fragment stage reads eyePos out of the same block, and vertex and
+    // fragment bindings are separate tables -- setting it for the vertex stage
+    // alone leaves the fragment reading an unbound buffer.
+    enc.SetFragmentBytes(&u, sizeof(u), 1);
     enc.DrawIndexedInstancedU32(impl_->quad_ib, 6, std::size_t(impl_->count));
 }
 
@@ -336,5 +341,211 @@ int FluidSim::OutsideBounds() const {
     }
     return n;
 }
+
+rhi::BufferId FluidSim::ParticleBuffer() const { return impl_->particles; }
+
+float FluidSim::SmoothingRadius() const { return impl_->cfg.smoothing_radius; }
+
+// --- the surface -------------------------------------------------------------
+
+constexpr char kSurfaceSrc[] = {
+#embed "engine/shaders/fluid_surface.metal"
+    , 0};
+
+static_assert(sizeof(GpuSurfaceParams) == 80,
+              "GpuSurfaceParams layout drifted");
+
+namespace {
+
+std::string SurfaceSource() {
+    return std::string(kShaderTypesSrc) + "\n" + kSurfaceSrc;
+}
+
+}  // namespace
+
+struct FluidSurface::Impl {
+    rhi::Device* dev = nullptr;
+    int width = 0, height = 0;
+
+    rhi::BufferId sphere_vb;
+    rhi::BufferId sphere_ib;
+    int sphere_indices = 0;
+
+    rhi::PipelineId depth;
+    rhi::PipelineId smooth_h;
+    rhi::PipelineId smooth_v;
+    rhi::PipelineId shade;
+
+    rhi::TextureId depth_tex;
+    rhi::TextureId smooth_a;
+    rhi::TextureId smooth_b;
+};
+
+FluidSurface::FluidSurface() : impl_(std::make_unique<Impl>()) {}
+FluidSurface::~FluidSurface() = default;
+
+std::unique_ptr<FluidSurface> FluidSurface::Create(rhi::Device& dev,
+                                                  std::string& error) {
+    std::unique_ptr<FluidSurface> fs(new FluidSurface());
+    Impl& im = *fs->impl_;
+    im.dev = &dev;
+
+    // A unit sphere the vertex stage scales per particle. 8x12 is 216
+    // triangles: round enough that the smoother never sees a facet, cheap
+    // enough that ten thousand particles stay under three million of them.
+    const Mesh sphere =
+        MakeUVSphere(1.0f, 8, 12, Vec4{1, 1, 1, 1}, Vec4{1, 1, 1, 1});
+    im.sphere_vb = dev.CreateBuffer(sphere.vertices.data(),
+                                    sizeof(VertexIn) * sphere.vertices.size());
+    im.sphere_ib = dev.CreateBuffer(sphere.indices.data(),
+                                    sizeof(std::uint32_t) * sphere.indices.size());
+    im.sphere_indices = int(sphere.indices.size());
+    if (!Valid(im.sphere_vb) || !Valid(im.sphere_ib) || im.sphere_indices <= 0) {
+        error = "could not allocate the surface sphere";
+        return nullptr;
+    }
+
+    const std::string src = SurfaceSource();
+    auto full = [&](const char* frag, rhi::Format color) {
+        rhi::PipelineDesc pd;
+        pd.source = src;
+        pd.vertex_fn = "vs_surface_full";
+        pd.fragment_fn = frag;
+        pd.color = color;
+        pd.samples = 1;
+        pd.depth = false;
+        pd.blend = rhi::Blend::None;
+        return dev.CreatePipeline(pd, error);
+    };
+    rhi::PipelineDesc dd;
+    dd.source = src;
+    dd.vertex_fn = "vs_surface_depth";
+    dd.fragment_fn = "";  // depth-only: no fragment stage (see the shader)
+    dd.color = rhi::Format::RGBA8Unorm;  // unused; depth_only ignores it
+    dd.samples = 1;
+    dd.depth = true;
+    dd.depth_only = true;
+    dd.depth_write = true;
+    im.depth = dev.CreatePipeline(dd, error);
+    im.smooth_h = full("fs_surface_smooth_h", rhi::Format::RGBA16Float);
+    im.smooth_v = full("fs_surface_smooth_v", rhi::Format::RGBA16Float);
+    im.shade = full("fs_surface_shade", rhi::Format::RGBA16Float);
+    if (!Valid(im.depth) || !Valid(im.smooth_h) || !Valid(im.smooth_v) ||
+        !Valid(im.shade))
+        return nullptr;
+    return fs;
+}
+
+bool FluidSurface::BeginFrame(rhi::Device& dev, int width, int height,
+                              std::string& error) {
+    Impl& im = *impl_;
+    if (width <= 0 || height <= 0) {
+        error = "the surface needs a positive size";
+        return false;
+    }
+    if (width == im.width && height == im.height && Valid(im.depth_tex)) return true;
+    im.width = width;
+    im.height = height;
+    im.depth_tex = dev.CreateDepthTarget(width, height, /*sampleable=*/true);
+    im.smooth_a = dev.CreateRenderTarget(width, height, rhi::Format::RGBA16Float);
+    im.smooth_b = dev.CreateRenderTarget(width, height, rhi::Format::RGBA16Float);
+    if (!Valid(im.depth_tex) || !Valid(im.smooth_a) || !Valid(im.smooth_b)) {
+        error = "could not allocate the surface targets";
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
+FrameUniforms SurfaceUniforms(const Camera& camera, int width, int height) {
+    FrameUniforms u{};
+    u.viewProj = camera.ViewProj(float(width) / float(height));
+    u.invViewProj = Inverse(u.viewProj);
+    u.eyePos = Vec4{camera.eye.x, camera.eye.y, camera.eye.z, 1.0f};
+    return u;
+}
+
+GpuSurfaceParams SurfaceParams(const SurfaceLook& look, const Camera& camera,
+                               int width, int height, float h) {
+    GpuSurfaceParams s{};
+    const float radius =
+        look.sphere_radius > 0.0f ? look.sphere_radius * h : 0.5f * h;
+    s.misc = Vec4{radius, camera.nearZ, look.edge_stop, 0.0f};
+    s.screen = Vec4{float(width), float(height), 1.0f / float(width),
+                    1.0f / float(height)};
+    s.sun = Vec4{look.sun_dir.x, look.sun_dir.y, look.sun_dir.z,
+                 look.sun_intensity};
+    s.water = Vec4{look.water_tint.x, look.water_tint.y, look.water_tint.z,
+                   look.refract};
+    s.sky = Vec4{look.sky_horizon.x, look.sky_horizon.y, look.sky_horizon.z, 0.0f};
+    return s;
+}
+
+}  // namespace
+
+void FluidSurface::DrawDepth(rhi::Encoder& enc, const FluidSim& sim,
+                             const Camera& camera, const SurfaceLook& look,
+                             int width, int height) {
+    Impl& im = *impl_;
+    if (!Valid(im.depth) || sim.Count() <= 0) return;
+    const FrameUniforms u = SurfaceUniforms(camera, width, height);
+    const GpuSurfaceParams s =
+        SurfaceParams(look, camera, width, height, sim.SmoothingRadius());
+    enc.SetPipeline(im.depth);
+    enc.SetCull(rhi::Cull::Back, rhi::Winding::CounterClockwise);
+    enc.SetVertexBuffer(im.sphere_vb, 0, 0);
+    enc.SetVertexBuffer(sim.ParticleBuffer(), 0, 1);
+    enc.SetVertexBytes(&u, sizeof(u), 2);
+    enc.SetVertexBytes(&s, sizeof(s), 3);
+    enc.DrawIndexedInstancedU32(im.sphere_ib, std::size_t(im.sphere_indices),
+                                std::size_t(sim.Count()));
+}
+
+void FluidSurface::SmoothH(rhi::Encoder& enc, const Camera& camera,
+                             const SurfaceLook& look, int width, int height) {
+    Impl& im = *impl_;
+    if (!Valid(im.smooth_h) || !Valid(im.depth_tex)) return;
+    const GpuSurfaceParams s =
+        SurfaceParams(look, camera, width, height, /*h=*/0.0f);
+    enc.SetPipeline(im.smooth_h);
+    enc.SetFragmentTexture(im.depth_tex, 0);
+    enc.SetFragmentBytes(&s, sizeof(s), 2);
+    enc.Draw(3);
+}
+
+void FluidSurface::SmoothV(rhi::Encoder& enc, const Camera& camera,
+                             const SurfaceLook& look, int width, int height) {
+    Impl& im = *impl_;
+    if (!Valid(im.smooth_v) || !Valid(im.smooth_a)) return;
+    const GpuSurfaceParams s =
+        SurfaceParams(look, camera, width, height, /*h=*/0.0f);
+    enc.SetPipeline(im.smooth_v);
+    enc.SetFragmentTexture(im.smooth_a, 0);
+    enc.SetFragmentBytes(&s, sizeof(s), 2);
+    enc.Draw(3);
+}
+
+void FluidSurface::DrawShade(rhi::Encoder& enc, const Camera& camera,
+                             const SurfaceLook& look, int width, int height,
+                             rhi::TextureId background,
+                             rhi::TextureId tank_depth) {
+    Impl& im = *impl_;
+    if (!Valid(im.shade)) return;
+    const FrameUniforms u = SurfaceUniforms(camera, width, height);
+    const GpuSurfaceParams s =
+        SurfaceParams(look, camera, width, height, /*h=*/0.0f);
+    enc.SetPipeline(im.shade);
+    enc.SetFragmentTexture(im.smooth_b, 0);
+    enc.SetFragmentTexture(background, 1);
+    enc.SetFragmentTexture(tank_depth, 2);
+    enc.SetFragmentBytes(&u, sizeof(u), 1);
+    enc.SetFragmentBytes(&s, sizeof(s), 2);
+    enc.Draw(3);
+}
+
+rhi::TextureId FluidSurface::Depth() const { return impl_->depth_tex; }
+rhi::TextureId FluidSurface::SmoothH() const { return impl_->smooth_a; }
+rhi::TextureId FluidSurface::Smooth() const { return impl_->smooth_b; }
 
 }  // namespace eng

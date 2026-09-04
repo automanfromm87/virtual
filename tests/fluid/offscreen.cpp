@@ -452,6 +452,11 @@ int main() {
             if (px[i + 2] > px[i] + 20) ++watery;  // more blue than red
         std::printf("    %d pixels are blue-dominant\n", watery);
         Check(watery > 20000, "the fluid is on the screen");
+        // (No count of bright pixels here. Tried: the dam break is chaotic,
+        // so the splash lands differently run to run -- 30,249 neutral-bright
+        // pixels in one run, 533 in the next, same binary -- and any
+        // threshold between them is luck, not a test. The deterministic
+        // check for the specular path is the single droplet below.)
 
         std::FILE* f = std::fopen("/tmp/fluid.ppm", "wb");
         if (f) {
@@ -460,6 +465,183 @@ int main() {
                 std::fwrite(&px[i], 1, 3, f);
             std::fclose(f);
             std::printf("    wrote /tmp/fluid.ppm\n");
+        }
+    }
+
+    // --- the specular path, deterministically --------------------------------
+    //
+    // One still droplet, no simulation steps, head-on camera. The dam break
+    // above cannot carry a brightness check: the splash is chaotic and lands
+    // differently every run. A single particle has no neighbours and no
+    // chaos, so this frame is bit-stable.
+    //
+    // What it proves is the fragment binding, not the solver: without the
+    // SetFragmentBytes for the uniforms block, eyePos reads garbage and the
+    // glint either vanishes or lands somewhere absurd. Measured on the old
+    // shading (spec and rim reverted): 38. With them: 212. The threshold
+    // sits at 120, three times above the old ceiling and well below the new
+    // floor, so it separates the two shadings rather than the two runs.
+    {
+        const eng::rhi::TextureId color =
+            dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
+        const eng::rhi::TextureId depth = dev->CreateDepthTarget(kW, kH);
+        const eng::rhi::TextureId out =
+            dev->CreateRenderTarget(kW, kH, kFmt, true);
+        std::string se;
+        auto drop = eng::FluidSim::Create(*dev, cfg,
+                                          {eng::Vec3{0.0f, 0.35f, 0.0f}},
+                                          eng::Renderer::kSceneFormat, se, 1);
+        Check(drop != nullptr, "the single droplet was created");
+        eng::Scene still;
+        still.camera.eye = eng::Vec3{0.0f, 0.35f, 1.0f};
+        still.camera.target = eng::Vec3{0.0f, 0.35f, 0.0f};
+
+        eng::RenderGraph g;
+        eng::RenderGraph::Pass p;
+        p.name = "droplet";
+        p.color = color;
+        p.depth = depth;
+        p.clear_color[0] = 0.0f; p.clear_color[1] = 0.0f;
+        p.clear_color[2] = 0.0f; p.clear_color[3] = 1.0f;
+        p.clear_depth = 0.0f;
+        p.execute = [&](eng::rhi::Encoder& en) {
+            if (drop) drop->Draw(en, still.camera, kW, kH);
+        };
+        g.AddPass(std::move(p));
+        eng::RenderGraph::Pass c;
+        c.name = "composite";
+        c.color = out;
+        c.reads = {color};
+        c.execute = [&](eng::rhi::Encoder& en) {
+            renderer->DrawComposite(en, color, {}, {}, 0.0f, 0.6f);
+        };
+        g.AddPass(std::move(c));
+        std::string ge;
+        Check(g.Compile(ge), "the droplet graph compiles");
+        dev->BeginFrame();
+        g.Execute(*dev);
+        std::string we;
+        Check(dev->CommitAndWait(we), "the droplet frame submits");
+
+        std::vector<std::uint8_t> dpx(std::size_t(kW) * kH * 4, 0);
+        Check(dev->ReadPixels(out, kW, kH, dpx), "the droplet frame reads back");
+        // Centre crop: the droplet sits at the middle of the frame by
+        // construction, and the vignette is the identity there.
+        std::uint8_t peak = 0;
+        for (int y = kH / 2 - 100; y < kH / 2 + 100; ++y)
+            for (int x = kW / 2 - 100; x < kW / 2 + 100; ++x) {
+                const std::size_t i = (std::size_t(y) * kW + x) * 4;
+                peak = std::max(
+                    peak, std::min({dpx[i], dpx[i + 1], dpx[i + 2]}));
+            }
+        std::printf("    brightest neutral pixel in the droplet: %d\n", peak);
+        Check(peak > 120, "the droplet carries a sun glint");
+    }
+
+    // --- the surface has no holes ------------------------------------------------
+    //
+    // A settled two-deep layer, no simulation steps, camera straight down.
+    // Straight down is deliberate: every normal is +Y, fresnel is minimal and
+    // the whole sheet shades nearly uniformly, so this measures COVERAGE and
+    // nothing else. Static particles mean no chaos: this frame is bit-stable
+    // across runs and across machines, unlike the dam break above.
+    //
+    // What would fail it: spheres too small to merge (holes the smoother
+    // cannot close read as background), an edge stop so wide the background
+    // bleeds in, or a broken depth chain (everything reads as background).
+    {
+        const eng::rhi::TextureId color =
+            dev->CreateRenderTarget(kW, kH, eng::Renderer::kSceneFormat);
+        const eng::rhi::TextureId depth =
+            dev->CreateDepthTarget(kW, kH, /*sampleable=*/true);
+        const eng::rhi::TextureId out =
+            dev->CreateRenderTarget(kW, kH, kFmt, true);
+        std::vector<eng::Vec3> sheet;
+        for (float z = -0.20f; z <= 0.20f; z += 0.03f)
+            for (float y = 0.10f; y <= 0.13f; y += 0.03f)
+                for (float x = -0.30f; x <= 0.30f; x += 0.03f)
+                    sheet.push_back(eng::Vec3{x, y, z});
+        std::string se;
+        auto pond = eng::FluidSim::Create(*dev, cfg, sheet,
+                                          eng::Renderer::kSceneFormat, se, 1);
+        Check(pond != nullptr, "the still pond was created");
+        auto surface = eng::FluidSurface::Create(*dev, se);
+        Check(surface != nullptr, "the surface was created");
+        eng::SurfaceLook look;
+        if (pond && surface && surface->BeginFrame(*dev, kW, kH, se)) {
+            eng::Scene top;
+            top.camera.eye = eng::Vec3{0.05f, 1.20f, 0.05f};
+            top.camera.target = eng::Vec3{0.0f, 0.10f, 0.0f};
+            eng::RenderGraph g;
+            eng::RenderGraph::Pass tank;
+            tank.name = "tank";
+            tank.color = color;
+            tank.depth = depth;
+            // Mid-grey: the sheet refracts it darker, so water reads as a
+            // darkening of a known value rather than black on black.
+            tank.clear_color[0] = 0.5f;
+            tank.clear_color[1] = 0.5f;
+            tank.clear_color[2] = 0.5f;
+            tank.clear_color[3] = 1.0f;
+            tank.execute = [&](eng::rhi::Encoder& en) {};
+            g.AddPass(std::move(tank));
+            eng::RenderGraph::Pass sd;
+            sd.name = "surfacedepth";
+            sd.depth = surface->Depth();
+            sd.execute = [&](eng::rhi::Encoder& en) {
+                surface->DrawDepth(en, *pond, top.camera, look, kW, kH);
+            };
+            g.AddPass(std::move(sd));
+            const auto smooth = [&](const char* name,
+                                    eng::rhi::TextureId target,
+                                    bool horizontal) {
+                eng::RenderGraph::Pass p;
+                p.name = name;
+                p.color = target;
+                if (horizontal)
+                    p.execute = [&](eng::rhi::Encoder& en) {
+                        surface->SmoothH(en, top.camera, look, kW, kH);
+                    };
+                else
+                    p.execute = [&](eng::rhi::Encoder& en) {
+                        surface->SmoothV(en, top.camera, look, kW, kH);
+                    };
+                g.AddPass(std::move(p));
+            };
+            smooth("smoothh", surface->SmoothH(), true);
+            smooth("smoothv", surface->Smooth(), false);
+            eng::RenderGraph::Pass shade;
+            shade.name = "surfaceshade";
+            shade.color = out;
+            shade.execute = [&](eng::rhi::Encoder& en) {
+                // No tank here: color/depth hold clear values, so the shade
+                // sees one unbroken sheet against empty background.
+                surface->DrawShade(en, top.camera, look, kW, kH, color, depth);
+            };
+            g.AddPass(std::move(shade));
+            std::string ge;
+            Check(g.Compile(ge), "the surface graph compiles");
+            dev->BeginFrame();
+            g.Execute(*dev);
+            std::string we;
+            Check(dev->CommitAndWait(we), "the surface frame submits");
+            std::vector<std::uint8_t> spx(std::size_t(kW) * kH * 4, 0);
+            Check(dev->ReadPixels(out, kW, kH, spx),
+                  "the surface frame reads back");
+            // Centre crop, well inside the sheet's silhouette: every pixel
+            // here must be water. The background is mid-grey and the sheet
+            // refracts it darker, so "water" is anything that moved down by
+            // more than noise.
+            int water = 0, total = 0;
+            for (int y = kH / 2 - 60; y < kH / 2 + 60; ++y)
+                for (int x = kW / 2 - 80; x < kW / 2 + 80; ++x) {
+                    const std::size_t i = (std::size_t(y) * kW + x) * 4;
+                    ++total;
+                    if (128 - int(spx[i + 1]) > 12) ++water;
+                }
+            std::printf("    surface covers %d of %d centre pixels\n", water,
+                        total);
+            Check(water > total * 9 / 10, "the sheet has no holes");
         }
     }
 

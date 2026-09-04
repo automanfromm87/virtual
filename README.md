@@ -14,6 +14,7 @@ Around 68,000 lines, 70 test targets, everything built with Bazel.
 ```
 bazel run -c opt //apps/world:world                 # the demo: terrain + navmesh + character + sky + fog + post
 bazel run -c opt //apps/world:world -- --shot /tmp/a.png   # headless capture, opens no window
+bazel run -c opt //apps/fluid:fluid                 # dam break with a continuous water surface
 bazel test //...
 ```
 

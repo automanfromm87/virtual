@@ -104,6 +104,11 @@ class FluidSim {
 
     [[nodiscard]] int Count() const;
     [[nodiscard]] float ParticleMass() const;
+    // GPU-side particle buffer and smoothing radius, for the surface renderer
+    // below. The surface draws the same particles the solver integrates; it
+    // does not copy them.
+    [[nodiscard]] rhi::BufferId ParticleBuffer() const;
+    [[nodiscard]] float SmoothingRadius() const;
 
     // --- readbacks, for tests ------------------------------------------------
     //
@@ -122,6 +127,80 @@ class FluidSim {
 
   private:
     FluidSim();
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// A continuous water surface out of a FluidSim's particles, in screen space.
+//
+// The billboard Draw above is a debug visualisation; this is the look. Depth
+// from instanced spheres, a bilateral smooth into one sheet, then water
+// optics (fresnel sky reflection, background refraction, sun glint) shaded
+// from screen-space normals. See fluid_surface.metal for the passes.
+//
+// Owns its intermediate targets (sized in BeginFrame) but not the tank: the
+// app draws its scene into its own depth, and DrawShade compares the two.
+// Sharing one depth buffer was tried first and bakes the walls into the
+// surface -- the whole tank shades as water.
+struct SurfaceLook {
+    Vec3 sun_dir{0.4f, 0.7f, 0.6f};
+    float sun_intensity = 3.0f;
+    Vec3 water_tint{0.55f, 0.72f, 0.78f};
+    // Refraction pull in uv units per unit of surface slope. Real refraction
+    // bends by the index ratio over the thickness; without a thickness pass
+    // this linear pull is the approximation, and past ~0.1 the background
+    // visibly detaches from the water's edge.
+    float refract = 0.05f;
+    Vec3 sky_horizon{0.55f, 0.62f, 0.72f};
+    // Bilateral edge stop in metres: taps disagreeing by more are another
+    // surface and must not merge. Below the particle spacing the sheet falls
+    // apart into balls again; far above it, walls bleed into the water.
+    float edge_stop = 0.06f;
+    // Sphere radius in units of the smoothing radius. Below ~0.4 the depth
+    // has holes the smoother cannot close; above ~0.7 the surface floats a
+    // visible radius above where the particles are.
+    float sphere_radius = 0.5f;
+};
+
+class FluidSurface {
+  public:
+    [[nodiscard]] static std::unique_ptr<FluidSurface> Create(
+        rhi::Device&, std::string& error);
+    ~FluidSurface();
+
+    FluidSurface(const FluidSurface&) = delete;
+    FluidSurface& operator=(const FluidSurface&) = delete;
+
+    // (Re)allocates the depth and smooth targets for `width` x `height`.
+    // A no-op when the size is unchanged.
+    bool BeginFrame(rhi::Device&, int width, int height, std::string& error);
+
+    // Instanced spheres into Depth(), in a pass whose depth attachment is
+    // Depth(). Water only -- the tank has its own buffer (see DrawShade).
+    void DrawDepth(rhi::Encoder&, const FluidSim&, const Camera&,
+                   const SurfaceLook&, int width, int height);
+    // Bilateral H over Depth() into SmoothH(), then V over that into
+    // Smooth(). Two fullscreen passes -- the app issues one render pass per
+    // call, because a render target cannot be written and re-read in the
+    // same pass.
+    void SmoothH(rhi::Encoder&, const Camera&, const SurfaceLook&, int width,
+                 int height);
+    void SmoothV(rhi::Encoder&, const Camera&, const SurfaceLook&, int width,
+                 int height);
+    // Fullscreen shade of Smooth() over `background` into the current color
+    // target. Pass-through where there is no water, so no blending.
+    // `tank_depth` is the tank's own (sampleable) depth: Depth() holds water
+    // only and cannot tell a submerged-behind-wall sphere from a visible one.
+    void DrawShade(rhi::Encoder&, const Camera&, const SurfaceLook&, int width,
+                   int height, rhi::TextureId background,
+                   rhi::TextureId tank_depth);
+
+    [[nodiscard]] rhi::TextureId Depth() const;
+    [[nodiscard]] rhi::TextureId SmoothH() const;
+    [[nodiscard]] rhi::TextureId Smooth() const;
+
+  private:
+    FluidSurface();
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

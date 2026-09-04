@@ -28,6 +28,7 @@ cc_library(
         "sky.metal",
         "ssao.metal",
         "fluid.metal",
+        "fluid_surface.metal",
         "ibl.metal",
         "lit.metal",
         "particles.metal",

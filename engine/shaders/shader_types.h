@@ -342,6 +342,23 @@ struct GpuFluidParams {
     ENG_VEC4 artificial;
 };
 
+// Screen-space fluid surface (fluid_surface.metal). All Vec4: the constant
+// buffer packs float3 with 16-byte stride on both sides, so a shared struct
+// states the padding up front rather than discovering it per field.
+struct GpuSurfaceParams {
+    // x sphere radius (world units), y camera near, z smoothing edge-stop
+    // (metres), w unused.
+    ENG_VEC4 misc;
+    // xy framebuffer size, zw 1/size.
+    ENG_VEC4 screen;
+    // xyz direction toward the sun, w intensity.
+    ENG_VEC4 sun;
+    // xyz refraction tint, w refract pull (uv units per unit slope).
+    ENG_VEC4 water;
+    // xyz horizon reflection tint (zenith is derived), w unused.
+    ENG_VEC4 sky;
+};
+
 struct SkinIn {
     ENG_UVEC4 joints;
     ENG_VEC4 weights;

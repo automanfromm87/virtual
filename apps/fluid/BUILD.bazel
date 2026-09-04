@@ -1,0 +1,16 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# A tank of water with a continuous surface: dam break, screen-space surface
+# reconstruction (depth + bilateral smooth + water optics), orbit camera.
+cc_binary(
+    name = "fluid",
+    srcs = ["viewer.cpp"],
+    deps = [
+        "//engine/app",
+        "//engine/asset:png",
+        "//engine/geometry",
+        "//engine/render",
+    ],
+)
