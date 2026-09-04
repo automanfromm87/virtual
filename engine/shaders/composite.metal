@@ -111,9 +111,50 @@ fragment float4 fs_composite(CompositeOut in [[stage_in]],
     // has to know what it is mapping to.
     const int mode = int(g.output.x + 0.5f);
     if (mode == 0) {
-        const float a1 = 2.51f, b1 = 0.03f, c1 = 2.43f, d1 = 0.59f, e1 = 0.14f;
-        color = saturate((color * (a1 * color + b1)) /
-                         (color * (c1 * color + d1) + e1));
+        // THE KHRONOS PBR NEUTRAL CURVE, and the reason it replaced a
+        // per-channel fit of ACES is one measurement.
+        //
+        // A per-channel curve compresses each channel on its own, so the
+        // strongest channel of a saturated colour is squeezed hardest and the
+        // weakest barely at all. The ratio between them -- which IS the hue --
+        // is destroyed in proportion to how bright the pixel is. Measured as
+        // the fraction of the input's saturation still present at a matched
+        // output brightness:
+        //
+        //     output peak      0.50    0.70    0.85    0.95
+        //     ACES per-channel 0.945   0.660   0.385   0.175
+        //     this curve       1.080   1.057   1.036   0.924
+        //
+        // world2's grass sat at 0.84 and kept a third of its green. It did not
+        // clip -- nothing in that frame was above 250 -- it simply had its hue
+        // dissolved by the curve, which reads as haze and cannot be fixed by
+        // exposure, because exposure only chooses where on the curve to sit.
+        //
+        // The compression is applied to the PEAK CHANNEL and the others are
+        // scaled with it, so hue survives by construction rather than by fit.
+        // Highlights still go white, which is correct -- a bright enough
+        // surface does -- but only in the top few percent, and by an explicit
+        // desaturation term rather than as a side effect.
+        constexpr float kStart = 0.76f;   // below this the curve is the identity
+        constexpr float kDesat = 0.15f;   // how fast highlights roll to white
+
+        // A small black offset, so the darkest channel reaches zero rather than
+        // sitting on a grey floor. Quadratic near zero to avoid a visible kink.
+        const float dark = min(color.r, min(color.g, color.b));
+        color -= dark < 0.08f ? dark - 6.25f * dark * dark : 0.04f;
+
+        const float peak = max(color.r, max(color.g, color.b));
+        if (peak >= kStart) {
+            const float d = 1.0f - kStart;
+            // A hyperbola through (kStart, kStart) that approaches 1 without
+            // reaching it, so there is headroom for any finite input.
+            const float mapped = 1.0f - d * d / (peak + d - kStart);
+            color *= mapped / peak;
+            // Then toward white, by how far the peak had to be compressed.
+            const float w = 1.0f - 1.0f / (kDesat * (peak - mapped) + 1.0f);
+            color = mix(color, float3(mapped), w);
+        }
+        color = saturate(color);
     } else {
         // A SOFT SHOULDER instead of the SDR curve, rolling off only above the
         // headroom the display actually has. Below reference white the mapping

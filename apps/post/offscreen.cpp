@@ -169,7 +169,84 @@ int main() {
     };
 
     {
-        std::printf("an identity grade changes nothing\n");
+        // THE TONE MAP KEEPS THE HUE. This is the one property a per-channel
+        // curve cannot have, and the reason the composite no longer uses one.
+        //
+        // A saturated light on a white floor makes the scene's hue exactly the
+        // light's hue, so the input saturation is known to the digit: a light
+        // of {0.19, 0.38, 0.15} is (0.38 - 0.15) / 0.38 = 0.605 saturated,
+        // whatever intensity it is scaled to. Everything the curve does to that
+        // number is the curve's own doing.
+        std::printf("the tone map keeps the hue as the image brightens\n");
+        const eng::Vec4 saved_light = scene.lightColor;
+        const eng::Vec3 saved_sky = scene.ambientSky, saved_ground = scene.ambientGround;
+        // Ambient off: a grey ambient term would dilute the hue before the
+        // curve ever saw it, and this has to measure the curve.
+        scene.ambientSky = eng::Vec3{0.0f, 0.0f, 0.0f};
+        scene.ambientGround = eng::Vec3{0.0f, 0.0f, 0.0f};
+
+        // Mean saturation of the pixels whose peak channel lands in a band.
+        // Banding rather than sampling a fixed spot because the floor is a
+        // checkerboard: this selects "upper midtones, not clipped" wherever
+        // they happen to be, and a clipped pixel has no hue left to measure by
+        // definition.
+        //
+        // MEASURED AFTER UNDOING THE DISPLAY GAMMA, which is not a detail. The
+        // composite writes pow(1/2.2)-encoded bytes, and that curve lifts the
+        // low channels much more than the high ones, so the same colour scores
+        // a lower saturation encoded than it does linear -- 61% against 100% at
+        // this brightness, when this was first written against a linear
+        // reference. That number said nothing about the tone map; it was the
+        // display transfer function being counted twice.
+        const auto band_saturation = [&](int lo, int hi) {
+            double sum = 0.0;
+            int n = 0;
+            for (std::size_t i = 0; i + 3 < px.size(); i += 4) {
+                const int peak8 = std::max(int(px[i]),
+                                           std::max(int(px[i + 1]), int(px[i + 2])));
+                if (peak8 < lo || peak8 > hi) continue;
+                float lin[3];
+                for (int c = 0; c < 3; ++c)
+                    lin[c] = std::pow(float(px[i + c]) / 255.0f, 2.2f);
+                const float peak = std::max(lin[0], std::max(lin[1], lin[2]));
+                const float trough = std::min(lin[0], std::min(lin[1], lin[2]));
+                if (peak <= 1e-6f) continue;
+                sum += double((peak - trough) / peak);
+                ++n;
+            }
+            return n > 0 ? float(sum / double(n)) : -1.0f;
+        };
+
+        constexpr float kInputSaturation = 0.605f;
+        float dim = 0.0f, bright = 0.0f;
+        for (int pass = 0; pass < 2; ++pass) {
+            const float k = pass == 0 ? 1.6f : 9.0f;
+            scene.lightColor = eng::Vec4{0.19f * k, 0.38f * k, 0.15f * k, 1.0f};
+            if (!frame(0.016f, false, nullptr)) return 1;
+            const float kept = band_saturation(pass == 0 ? 60 : 190,
+                                               pass == 0 ? 140 : 245);
+            (pass == 0 ? dim : bright) = kept / kInputSaturation;
+            std::printf("    %-14s peak in %3d..%3d, saturation kept %.0f%%\n",
+                        pass == 0 ? "midtones:" : "upper mids:",
+                        pass == 0 ? 60 : 190, pass == 0 ? 140 : 245,
+                        100.0 * double(pass == 0 ? dim : bright));
+        }
+        // The midtones are the easy case -- every curve passes there.
+        Check(dim > 0.85f, "a dim image comes through with its colour");
+        // THE UPPER MIDTONES ARE THE CASE THAT MATTERS, and where a per-channel
+        // curve falls apart: it keeps 39% of the saturation at this brightness,
+        // measured, which is what turned world2's grass grey. Nothing here is
+        // clipped -- the band stops at 245 - so any loss is the curve
+        // dissolving the hue rather than the image running out of range.
+        Check(bright > 0.80f, "and so does a bright one, which is the hard case");
+
+        scene.lightColor = saved_light;
+        scene.ambientSky = saved_sky;
+        scene.ambientGround = saved_ground;
+    }
+
+    {
+        std::printf("\nan identity grade changes nothing\n");
         if (!frame(0.016f, false, nullptr)) return 1;
         const std::vector<std::uint8_t> before = px;
         eng::ColorGrade g;  // all defaults
@@ -398,8 +475,19 @@ int main() {
         scene.camera.target = eng::Vec3{1.6f, 0.6f, -40.0f};
         if (!blur_frame()) return 1;
         const float moving = Detail(px, kX0, kY0, kX1, kY1);
-        std::printf("    panning:      detail %.2f -> %.2f\n", unblurred, moving);
-        Check(moving < unblurred * 0.7f, "a panning one is");
+        std::printf("    panning:      detail %.2f -> %.2f (%.0f%% of it left)\n",
+                    unblurred, moving, 100.0 * double(moving / unblurred));
+        // 0.80, RE-DERIVED. It was 0.7, calibrated against the per-channel ACES
+        // curve the composite used to end with; the replacement has a different
+        // contrast response in the midtones and the same blur now measures
+        // 0.706 instead of just under 0.7. The blur is not weaker -- a pan
+        // still destroys 29% of the detail -- the number it is being compared
+        // against was a property of the old curve.
+        //
+        // Still a real threshold: a blur that does nothing scores 1.00, which
+        // is where the still-camera case above sits, so there is 20 points of
+        // separation on one side and 9 on the other.
+        Check(moving < unblurred * 0.80f, "a panning one is");
 
         post->config.motion_blur = false;
         scene.camera.eye = eng::Vec3{0.0f, 1.2f, 2.0f};
