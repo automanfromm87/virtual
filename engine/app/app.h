@@ -33,6 +33,27 @@ struct Config {
     // memory, and it removes the single most obvious "this was drawn by a
     // computer" tell there is.
     int samples = 4;
+
+    // NO WINDOW, NO SWAPCHAIN, and a fixed timestep.
+    //
+    // Everything in engine/ is already testable without one -- the offscreen
+    // tests build an rhi::Device directly -- but anything built on App was not,
+    // because App owns the window. So the demos, which are where whole scenes
+    // are assembled, could only be measured by opening one and watching. That
+    // is slow, it cannot run in CI, and it means the most integrated code in
+    // the repo has the least automated coverage.
+    //
+    // THE FIXED TIMESTEP MATTERS AS MUCH AS THE MISSING WINDOW. A wall-clock dt
+    // makes every run different: the exposure meter integrates it, the
+    // character integrates it, so two identical captures differ and nothing can
+    // be compared byte for byte. Headless runs at `fixed_dt` and is
+    // reproducible.
+    //
+    // Frame::drawable is null in this mode, so a headless caller has to render
+    // into a target of its own. It is not a way to run the same code unchanged;
+    // it is a way to run the same SCENE.
+    bool headless = false;
+    float fixed_dt = 1.0f / 60.0f;
 };
 
 // What BeginFrame established about this frame.

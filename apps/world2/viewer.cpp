@@ -106,6 +106,7 @@ int main(int argc, char** argv) {
     // flips hard under a sub-pixel move is aliasing, and that is the only way
     // to separate shimmer from honest motion.
     float yaw_offset = 0.0f;
+    float lod_near = 45.0f;
     // Sun elevation in degrees. Exposed so a capture can be taken at a stated
     // time of day rather than only at the one the demo starts with.
     float sun_start = 31.5f;
@@ -119,6 +120,8 @@ int main(int argc, char** argv) {
             yaw_offset = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--sun") == 0 && i + 1 < argc)
             sun_start = float(std::atof(argv[++i]));
+        else if (std::strcmp(argv[i], "--lodnear") == 0 && i + 1 < argc)
+            lod_near = float(std::atof(argv[++i]));
     }
 
     // LINE BUFFERED. Redirected to a file, stdout is fully buffered, and a
@@ -128,6 +131,13 @@ int main(int argc, char** argv) {
     std::string error;
     eng::app::Config config;
     config.title = "virtual — terrain, navigation, sky";
+    // A CAPTURE OPENS NO WINDOW. --shot already renders into a target of its
+    // own rather than the drawable, so the window was doing nothing but existing
+    // -- and it meant every measurement of this scene needed a window server.
+    // Headless also fixes the timestep, which is what makes two captures of the
+    // same frame byte-identical; with a wall-clock dt the exposure meter and the
+    // character both integrate a different number each run.
+    config.headless = !shot_path.empty();
     auto app = eng::app::App::Create(config, error);
     if (!app) return Fail(error);
 
@@ -229,7 +239,35 @@ int main(int argc, char** argv) {
     // distinct skeletons cost two hundred generations and nobody can tell six
     // apart once they are rotated and scaled differently.
     std::printf("growing trees...\n");
-    eng::Mesh forest_trunks, forest_leaves;
+    // A GRID OF CELLS, not one mesh for the whole forest.
+    //
+    // Merging every tree into a single pair of meshes made the forest two draw
+    // calls, which was the right trade when the alternative was four hundred --
+    // but one mesh is one bounding volume, so a forest that spans the world can
+    // never be culled and never has a distance. 2.5M triangles were submitted
+    // every frame regardless of where the camera pointed, and again into each
+    // of three shadow cascades.
+    //
+    // Six by six over 128 metres is a 21 m cell. Small enough that most of them
+    // are off screen at any moment and the far ones can drop detail, large
+    // enough that a full view is 72 draws rather than 400.
+    constexpr int kForestCells = 6;
+    // THREE LEVELS, REGENERATED rather than simplified.
+    //
+    // BuildLodChain was tried first and it destroys this content. It clusters
+    // vertices in cells scaled to the MESH, and a cell here is 21 metres across
+    // -- so at a thirty-second that is a 0.66 m cell, which is larger than a
+    // leaf blob. Every blob collapsed to a handful of vertices and the canopy
+    // became dark angular shards. It was not the simplifier being bad; a blob
+    // is 56 triangles and there is nothing in it to remove.
+    //
+    // The reduction a canopy actually admits is FEWER, BIGGER BLOBS -- which
+    // keeps the volume and the silhouette, the only things that survive to a
+    // distant pixel. That is a generation parameter, not a mesh operation, so
+    // the cheap versions are grown rather than crushed.
+    constexpr int kForestLods = 3;
+    struct ForestCell { eng::Mesh trunk, leaves; };
+    std::vector<ForestCell> cells(kForestLods * kForestCells * kForestCells);
     // ONE SPHERE PER CANOPY, kept for the light bake below. The forest is 2.5M
     // triangles and tracing rays against that is hopeless, but GI does not need
     // the shape of a leaf -- it needs to know that the sky is blocked here and
@@ -238,20 +276,33 @@ int main(int argc, char** argv) {
     struct CanopyProxy { eng::Vec3 centre; float radius; };
     std::vector<CanopyProxy> canopies;
     {
-        eng::Tree variants[6];
-        for (int i = 0; i < 6; ++i) {
-            eng::TreeParams tp;
-            tp.seed = 7919u + std::uint32_t(i) * 104729u;
-            tp.height = 4.4f + float(i) * 0.5f;
-            tp.trunk_radius = 0.17f;
-            tp.levels = 5;
-            tp.splits = 2;
-            tp.spread = 0.52f;
-            tp.leaf_clusters = 5;
-            tp.leaf_size = 0.52f;
-            tp.leaf_scatter = 0.42f;
-            variants[i] = eng::MakeTree(tp);
-        }
+        // sides and segments take no random draws, and the leaf stream is
+        // separate from the skeleton's, so all four of these can move without
+        // moving a single branch. tree_test asserts exactly that -- a cheap
+        // tree that stood somewhere else would pop sideways when it swapped.
+        static const int kSides[kForestLods] = {7, 6, 4};
+        static const int kSegments[kForestLods] = {4, 3, 1};
+        static const int kClusters[kForestLods] = {5, 3, 1};
+        // Bigger as they get fewer, so the canopy keeps roughly its volume:
+        // five at 0.52 and one at 0.95 are within a fifth of each other cubed.
+        static const float kLeafSize[kForestLods] = {0.52f, 0.63f, 0.95f};
+        eng::Tree variants[kForestLods][6];
+        for (int lod = 0; lod < kForestLods; ++lod)
+            for (int i = 0; i < 6; ++i) {
+                eng::TreeParams tp;
+                tp.seed = 7919u + std::uint32_t(i) * 104729u;
+                tp.height = 4.4f + float(i) * 0.5f;
+                tp.trunk_radius = 0.17f;
+                tp.levels = 5;
+                tp.splits = 2;
+                tp.spread = 0.52f;
+                tp.leaf_scatter = 0.42f;
+                tp.sides = kSides[lod];
+                tp.segments = kSegments[lod];
+                tp.leaf_clusters = kClusters[lod];
+                tp.leaf_size = kLeafSize[lod];
+                variants[lod][i] = eng::MakeTree(tp);
+            }
 
         // The same xorshift the generator uses, so the forest is identical on
         // every machine and every run -- a screenshot comparison is worthless
@@ -277,7 +328,8 @@ int main(int argc, char** argv) {
             // obvious scattering artefact and the cheapest one to avoid.
             if (terrain.NormalAt(x, z).y < 0.86f) { ++rejected_slope; continue; }
 
-            const eng::Tree& t = variants[int(rnd() * 6.0f) % 6];
+            const int which = int(rnd() * 6.0f) % 6;
+            const eng::Tree& t = variants[0][which];
             const float scale = 0.75f + rnd() * 0.7f;
             // Sunk slightly, so the trunk's flat base is never visible above a
             // terrain triangle that slopes away from it.
@@ -288,10 +340,18 @@ int main(int argc, char** argv) {
             // A tint per tree, so the canopy is not one flat green across the
             // whole valley. Warmer on some, cooler on others.
             const float warm = 0.88f + rnd() * 0.30f;
-            eng::AppendTransformed(forest_trunks, t.trunk, model,
-                                   eng::Vec4{1.0f, 1.0f, 1.0f, 1.0f});
-            eng::AppendTransformed(forest_leaves, t.foliage, model,
-                                   eng::Vec4{warm, 1.0f, 2.0f - warm, 1.0f});
+            const int gx = std::clamp(int((x + 64.0f) / 128.0f * kForestCells), 0,
+                                      kForestCells - 1);
+            const int gz = std::clamp(int((z + 64.0f) / 128.0f * kForestCells), 0,
+                                      kForestCells - 1);
+            for (int lod = 0; lod < kForestLods; ++lod) {
+                ForestCell& cell = cells[std::size_t(
+                    (lod * kForestCells + gz) * kForestCells + gx)];
+                eng::AppendTransformed(cell.trunk, variants[lod][which].trunk, model,
+                                       eng::Vec4{1.0f, 1.0f, 1.0f, 1.0f});
+                eng::AppendTransformed(cell.leaves, variants[lod][which].foliage, model,
+                                       eng::Vec4{warm, 1.0f, 2.0f - warm, 1.0f});
+            }
             const eng::Vec4 c = model * eng::Vec4{t.foliage.bounds.center.x,
                                                   t.foliage.bounds.center.y,
                                                   t.foliage.bounds.center.z, 1.0f};
@@ -314,10 +374,19 @@ int main(int argc, char** argv) {
                 {eng::Vec3{c.x, c.y, c.z}, t.foliage.bounds.radius * scale * 0.45f});
             ++planted;
         }
-        std::printf("  %d trees (%zu + %zu tris), rejected %d steep, %d in the clearing\n",
-                    planted, forest_trunks.indices.size() / 3,
-                    forest_leaves.indices.size() / 3, rejected_slope,
-                    rejected_clearing);
+        std::size_t per_lod[kForestLods] = {0, 0, 0}, used = 0;
+        for (int lod = 0; lod < kForestLods; ++lod)
+            for (int c = 0; c < kForestCells * kForestCells; ++c) {
+                const ForestCell& cell =
+                    cells[std::size_t(lod * kForestCells * kForestCells + c)];
+                per_lod[lod] +=
+                    (cell.trunk.indices.size() + cell.leaves.indices.size()) / 3;
+                if (lod == 0 && !cell.trunk.vertices.empty()) ++used;
+            }
+        std::printf("  %d trees over %zu of %d cells, %zu / %zu / %zu tris per "
+                    "level, rejected %d steep, %d in the clearing\n",
+                    planted, used, kForestCells * kForestCells, per_lod[0],
+                    per_lod[1], per_lod[2], rejected_slope, rejected_clearing);
     }
 
     eng::MaterialDesc bark_md;
@@ -595,18 +664,53 @@ int main(int argc, char** argv) {
     };
     if (!bake_indirect()) return Fail(error);
 
-    // Two instances, at the origin: the trees were baked into world space by
-    // AppendTransformed, so the model matrix is identity and the only reason
-    // these are instances at all is that a draw needs one.
+    // One instance per cell per material, with a LEVEL CHAIN behind each.
+    //
+    // The model matrix is identity throughout -- AppendTransformed baked the
+    // trees into world space -- so a cell's mesh bounds ARE its world bounds
+    // and the renderer's frustum cull works on them with nothing else to set
+    // up. That is the whole reason for splitting the mesh.
+    struct ForestChunk {
+        std::vector<eng::MeshHandle> trunk_lods, leaf_lods;
+        eng::Vec3 centre;
+        std::size_t trunk_instance = 0, leaf_instance = 0;
+    };
+    std::vector<ForestChunk> forest;
     {
-        eng::Instance trunks;
-        trunks.mesh = app->Draw().UploadMesh(forest_trunks);
-        trunks.material = bark_mat;
-        scene.instances.push_back(trunks);
-        eng::Instance leaves;
-        leaves.mesh = app->Draw().UploadMesh(forest_leaves);
-        leaves.material = leaf_mat;
-        scene.instances.push_back(leaves);
+        std::printf("building forest levels...\n");
+        const auto t0 = std::chrono::steady_clock::now();
+        std::size_t coarse_tris = 0, fine_tris = 0;
+        const int kCellCount = kForestCells * kForestCells;
+        for (int c = 0; c < kCellCount; ++c) {
+            const ForestCell& base = cells[std::size_t(c)];
+            if (base.trunk.vertices.empty() && base.leaves.vertices.empty()) continue;
+            ForestChunk chunk;
+            chunk.centre = base.leaves.vertices.empty() ? base.trunk.bounds.center
+                                                        : base.leaves.bounds.center;
+            for (int lod = 0; lod < kForestLods; ++lod) {
+                const ForestCell& cell = cells[std::size_t(lod * kCellCount + c)];
+                chunk.trunk_lods.push_back(app->Draw().UploadMesh(cell.trunk));
+                chunk.leaf_lods.push_back(app->Draw().UploadMesh(cell.leaves));
+                if (lod == 0) fine_tris += cell.leaves.indices.size() / 3;
+                if (lod == kForestLods - 1) coarse_tris += cell.leaves.indices.size() / 3;
+            }
+            eng::Instance ti;
+            ti.mesh = chunk.trunk_lods.front();
+            ti.material = bark_mat;
+            chunk.trunk_instance = scene.instances.size();
+            scene.instances.push_back(ti);
+            eng::Instance li;
+            li.mesh = chunk.leaf_lods.front();
+            li.material = leaf_mat;
+            chunk.leaf_instance = scene.instances.size();
+            scene.instances.push_back(li);
+            forest.push_back(std::move(chunk));
+        }
+        std::printf("  %zu cells, %zu draws, canopy %zu tris at level 0 and %zu "
+                    "at level 2 (%.2f s)\n",
+                    forest.size(), forest.size() * 2, fine_tris, coarse_tris,
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t0).count());
     }
 
     // --- the character -------------------------------------------------------
@@ -870,6 +974,24 @@ int main(int argc, char** argv) {
             ++lod_counts[lod];
         }
 
+        // The same distance thresholds as the terrain, for the same reason: a
+        // cell 90 m away is a few hundred pixels tall and cannot show the
+        // difference. The renderer culls whatever is off screen on its own,
+        // from the bounds of whichever level is selected here.
+        int forest_lod_counts[3] = {0, 0, 0};
+        const float kForestLodNear = lod_near, kForestLodFar = lod_near * 2.1f;
+        for (const ForestChunk& chunk : forest) {
+            const float distance = eng::Length(chunk.centre - scene.camera.eye);
+            int lod = 0;
+            if (distance > kForestLodNear) lod = 1;
+            if (distance > kForestLodFar) lod = 2;
+            const int t_lod = std::min(lod, int(chunk.trunk_lods.size()) - 1);
+            const int l_lod = std::min(lod, int(chunk.leaf_lods.size()) - 1);
+            scene.instances[chunk.trunk_instance].mesh = chunk.trunk_lods[std::size_t(t_lod)];
+            scene.instances[chunk.leaf_instance].mesh = chunk.leaf_lods[std::size_t(l_lod)];
+            ++forest_lod_counts[lod];
+        }
+
         // --- sky ---------------------------------------------------------------
         sky.sun_direction =
             eng::Vec3{std::cos(sun_azimuth) * std::cos(sun_elevation),
@@ -897,9 +1019,12 @@ int main(int argc, char** argv) {
         ui->Rect(12, 12, 470, 180, eng::Vec4{0.05f, 0.06f, 0.08f, 0.72f});
         ui->Outline(12, 12, 470, 180, 1.0f, eng::Vec4{0.35f, 0.40f, 0.48f, 0.9f});
         char line[192];
-        std::snprintf(line, sizeof(line), "%zu chunks   lod %d/%d/%d   %d nav polys",
+        const eng::RenderStats& rs = app->Draw().LastStats();
+        std::snprintf(line, sizeof(line),
+                      "%zu chunks lod %d/%d/%d   forest %d/%d/%d   %d draws, %d culled",
                       chunks.size(), lod_counts[0], lod_counts[1], lod_counts[2],
-                      navmesh.PolyCount());
+                      forest_lod_counts[0], forest_lod_counts[1],
+                      forest_lod_counts[2], rs.draws, rs.culled);
         ui->Text(26, 26, line, eng::Vec4{0.92f, 0.94f, 0.98f, 1.0f});
         std::snprintf(line, sizeof(line),
                       "sun %.0f deg   gi %s (%.0f ms, %d buried)",
@@ -1048,9 +1173,9 @@ int main(int argc, char** argv) {
         // be wrong in a screenshot are an exposure that has not settled and a
         // camera that is not where it was asked to be.
         if (!shot_path.empty())
-            std::printf("  frame %3d  exposure %.4f  eye %.6f %.6f %.6f\n",
-                        int(f.index), post->LastExposure(), scene.camera.eye.x,
-                        scene.camera.eye.y, scene.camera.eye.z);
+            std::printf("  frame %3d  gpu %.3f ms  draws %d  culled %d\n",
+                        int(f.index), app->Gpu().LastFrameGpuMilliseconds(),
+                        app->Draw().LastStats().draws, app->Draw().LastStats().culled);
 
         if (!shot_path.empty() && int(f.index) >= shot_frames) {
             std::vector<std::uint8_t> px(std::size_t(f.width) * f.height * 4);

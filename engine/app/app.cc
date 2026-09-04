@@ -28,6 +28,13 @@ struct App::Impl {
     Clock clock;
     Frame frame;
     bool running = true;
+    bool headless = false;
+    float fixed_dt = 1.0f / 60.0f;
+    // A synthetic monotonic clock, so the fixed step goes through the SAME
+    // Clock::Tick the windowed path uses -- clamping, pause and all -- rather
+    // than through a second code path that would drift away from it.
+    double fake_now = 0.0;
+    int width = 0, height = 0;
 };
 
 App::App() : impl_(std::make_unique<Impl>()) {}
@@ -39,13 +46,22 @@ std::unique_ptr<App> App::Create(const Config& config, std::string& error) {
 
     s.device = rhi::Device::Create(error);
     if (!s.device) return nullptr;
-    s.swapchain = s.device->CreateSwapchain(config.color, error);
-    if (!s.swapchain) return nullptr;
-    s.window = platform::Window::Create(config.title.c_str(), config.width,
-                                        config.height, error);
-    if (!s.window) return nullptr;
-    s.window->HostLayer(s.swapchain->NativeLayer());
-    s.swapchain->Resize(s.window->FramebufferWidth(), s.window->FramebufferHeight());
+    s.headless = config.headless;
+    s.fixed_dt = config.fixed_dt;
+    s.width = config.width;
+    s.height = config.height;
+    if (!s.headless) {
+        s.swapchain = s.device->CreateSwapchain(config.color, error);
+        if (!s.swapchain) return nullptr;
+        s.window = platform::Window::Create(config.title.c_str(), config.width,
+                                            config.height, error);
+        if (!s.window) return nullptr;
+        s.window->HostLayer(s.swapchain->NativeLayer());
+        s.swapchain->Resize(s.window->FramebufferWidth(),
+                            s.window->FramebufferHeight());
+        s.width = s.window->FramebufferWidth();
+        s.height = s.window->FramebufferHeight();
+    }
 
     s.renderer = Renderer::Create(*s.device, config.color, error, config.samples);
     if (!s.renderer) return nullptr;
@@ -60,14 +76,35 @@ Renderer& App::Draw() { return *impl_->renderer; }
 FrameTargets& App::Targets() { return *impl_->targets; }
 ActionMap& App::Actions() { return impl_->actions; }
 Clock& App::Time() { return impl_->clock; }
-void App::SetCursorLocked(bool locked) { impl_->window->SetCursorLocked(locked); }
-bool App::CursorLocked() const { return impl_->window->CursorLocked(); }
+void App::SetCursorLocked(bool locked) {
+    if (impl_->window) impl_->window->SetCursorLocked(locked);
+}
+bool App::CursorLocked() const {
+    return impl_->window && impl_->window->CursorLocked();
+}
 
 bool App::Running() const { return impl_->running; }
 const Frame& App::Current() const { return impl_->frame; }
 
 bool App::BeginFrame() {
     Impl& s = *impl_;
+    if (s.headless) {
+        // No events and no input: every action reads as released, which is what
+        // a caller driving the scene itself wants. It sets the camera and the
+        // state directly rather than pretending to press keys.
+        s.actions.Update(Keys{}, 0u);
+        s.fake_now += double(s.fixed_dt);
+        s.clock.Tick(s.fake_now);
+        s.frame.dt = s.clock.Dt();
+        s.frame.time = s.clock.Total();
+        s.frame.index = s.clock.Frame();
+        s.frame.width = s.width;
+        s.frame.height = s.height;
+        s.frame.drawable = {};
+        s.targets->Resize(s.width, s.height);
+        s.device->BeginFrame();
+        return true;
+    }
     if (!s.window->PumpEvents()) {
         s.running = false;
         return false;
@@ -124,7 +161,7 @@ bool App::BeginFrame() {
 
 void App::EndFrame() {
     Impl& s = *impl_;
-    s.device->Present(*s.swapchain);
+    if (!s.headless) s.device->Present(*s.swapchain);
     s.device->Commit();
 }
 

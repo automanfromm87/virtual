@@ -200,8 +200,8 @@ void AppendBlob(Mesh& m, Vec3 centre, float radius, float flatten, Vec4 colour,
         }
 }
 
-void Recurse(Tree& tree, const TreeParams& p, Rng& rng, Vec3 start, Vec3 dir,
-             float length, float radius, int level) {
+void Recurse(Tree& tree, const TreeParams& p, Rng& rng, Rng& leaf_rng, Vec3 start,
+             Vec3 dir, float length, float radius, int level) {
     const bool last = level >= p.levels;
     const float tip = radius * p.radius_falloff;
 
@@ -221,12 +221,22 @@ void Recurse(Tree& tree, const TreeParams& p, Rng& rng, Vec3 start, Vec3 dir,
 
     if (last) {
         for (int i = 0; i < std::max(p.leaf_clusters, 1); ++i) {
-            const Vec3 offset{rng.Signed(), rng.Signed() * 0.6f, rng.Signed()};
-            const float shade = 1.0f + rng.Signed() * p.leaf_variation;
+            // A SEPARATE STREAM for the leaves, and it is not tidiness.
+            //
+            // The recursion is depth first, so every draw taken here shifts
+            // every branch generated afterwards. With one stream, changing
+            // leaf_clusters changes the SKELETON -- which makes a level of
+            // detail impossible, because the cheap version would be a different
+            // tree standing in a different place rather than the same tree with
+            // fewer leaves. Splitting it is what lets the leaf count be a
+            // detail setting.
+            const Vec3 offset{leaf_rng.Signed(), leaf_rng.Signed() * 0.6f,
+                              leaf_rng.Signed()};
+            const float shade = 1.0f + leaf_rng.Signed() * p.leaf_variation;
             const Vec4 colour{p.leaf.x * shade, p.leaf.y * shade,
                               p.leaf.z * shade, 1.0f};
             AppendBlob(tree.foliage, end.position + offset * (length * p.leaf_scatter),
-                       length * p.leaf_size, p.leaf_flatten, colour, rng);
+                       length * p.leaf_size, p.leaf_flatten, colour, leaf_rng);
         }
         return;
     }
@@ -244,7 +254,7 @@ void Recurse(Tree& tree, const TreeParams& p, Rng& rng, Vec3 start, Vec3 dir,
         const float lean = p.spread + rng.Signed() * p.spread_jitter;
         Vec3 child = RotateAround(end.direction, axis, lean);
         child = Normalize(RotateAround(child, end.direction, around));
-        Recurse(tree, p, rng, end.position, child,
+        Recurse(tree, p, rng, leaf_rng, end.position, child,
                 length * p.length_falloff * (0.85f + rng.Unit() * 0.3f),
                 tip, level + 1);
     }
@@ -282,8 +292,11 @@ Tree MakeTree(const TreeParams& params) {
     // taste, it is the difference between a tree and running out of memory.
 
     Rng rng(p.seed);
-    Recurse(tree, p, rng, Vec3{0, 0, 0}, Vec3{0, 1, 0}, p.height, p.trunk_radius,
-            0);
+    // Derived from the same seed, so a tree is still reproducible from one
+    // number, but advanced independently -- see Recurse.
+    Rng leaf_rng(p.seed ^ 0x9E3779B9u);
+    Recurse(tree, p, rng, leaf_rng, Vec3{0, 0, 0}, Vec3{0, 1, 0}, p.height,
+            p.trunk_radius, 0);
 
     // TANGENT FRAMES, so bark can carry a normal map. Without them the shader's
     // degenerate-frame guard returns the geometric normal and the map silently

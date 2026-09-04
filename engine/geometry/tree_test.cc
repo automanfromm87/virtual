@@ -183,6 +183,53 @@ int main() {
     }
 
     {
+        std::printf("\nleaf detail does not disturb the skeleton\n");
+        // WHAT MAKES A LEVEL OF DETAIL POSSIBLE. The recursion is depth first,
+        // so with one random stream every draw taken for a leaf shifts every
+        // branch generated after it -- and the cheap version of a tree would be
+        // a DIFFERENT tree, in a different place, rather than the same one with
+        // fewer leaves. Popping between them would be a tree jumping sideways.
+        TreeParams full;
+        full.leaf_clusters = 5;
+        TreeParams sparse = full;
+        sparse.leaf_clusters = 1;
+        TreeParams coarse = full;
+        coarse.sides = 4;
+        coarse.segments = 2;
+
+        const Tree a = MakeTree(full), b = MakeTree(sparse), c = MakeTree(coarse);
+        // The trunk is the skeleton swept: same skeleton, same vertex count and
+        // the same positions, because sides and segments are unchanged.
+        bool identical = a.trunk.vertices.size() == b.trunk.vertices.size();
+        if (identical)
+            for (std::size_t i = 0; i < a.trunk.vertices.size(); ++i)
+                if (a.trunk.vertices[i].position.x != b.trunk.vertices[i].position.x ||
+                    a.trunk.vertices[i].position.y != b.trunk.vertices[i].position.y ||
+                    a.trunk.vertices[i].position.z != b.trunk.vertices[i].position.z)
+                    identical = false;
+        std::printf("    5 clusters -> %zu trunk verts, 1 cluster -> %zu\n",
+                    a.trunk.vertices.size(), b.trunk.vertices.size());
+        Check(identical, "dropping four leaf clusters leaves the trunk untouched");
+        Check(b.foliage.indices.size() * 4 < a.foliage.indices.size(),
+              "and does drop most of the canopy");
+
+        // Coarser TUBES keep the skeleton too -- sides and segments take no
+        // random draws -- so the branches end in the same places.
+        std::printf("    coarse tubes: %zu trunk tris against %zu, canopy %zu vs %zu\n",
+                    c.trunk.indices.size() / 3, a.trunk.indices.size() / 3,
+                    c.foliage.indices.size() / 3, a.foliage.indices.size() / 3);
+        Check(c.trunk.indices.size() * 2 < a.trunk.indices.size(),
+              "a coarser tube is much cheaper");
+        Check(c.foliage.indices.size() == a.foliage.indices.size(),
+              "and leaves the canopy alone, so the two knobs are independent");
+        const float reach_a = a.bounds.radius, reach_c = c.bounds.radius;
+        std::printf("    and the tree still reaches %.2f against %.2f\n",
+                    double(reach_c), double(reach_a));
+        Check(std::fabs(reach_c - reach_a) < reach_a * 0.05f,
+              "and stands in the same place, which is what stops it popping");
+    }
+
+    {
         std::printf("\nthe recursion is bounded\n");
         // levels and splits multiply: six levels of five splits is 15625
         // branches of 35 vertices each, over half a million for one tree. The
