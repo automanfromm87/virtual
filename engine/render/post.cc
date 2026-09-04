@@ -75,6 +75,9 @@ struct PostStack::Impl {
     rhi::SamplerId sampler;
 
     rhi::BufferId histogram_buf, exposure_buf;
+    // Whether the meter has ever run. The first reading SNAPS instead of
+    // adapting -- see MeterExposure.
+    bool metered = false;
     rhi::TextureId velocity;
     rhi::TextureId scratch, output;
     // TWO history buffers, swapped each frame. One would mean the resolve reads
@@ -333,6 +336,24 @@ void PostStack::MeterExposure(rhi::ComputeEncoder& enc, rhi::TextureId hdr) {
     Impl& im = *impl_;
     if (!config.auto_exposure || !Valid(im.histogram) || !Valid(hdr)) return;
     im.params.tune.x = std::exp2(config.exposure_compensation);
+
+    // THE FIRST READING SNAPS. The buffer is seeded to 1, because an app that
+    // binds it without metering needs a neutral multiplier there, and that
+    // defeats the shader's own "no previous value, take the target" branch --
+    // 1 is a perfectly plausible previous exposure. So the first frame opened
+    // at 1.0 and crawled: measured 1.0 -> 0.785 over 40 frames and still
+    // falling, which is a viewer that starts white and takes three seconds to
+    // become an image.
+    //
+    // Done with dt rather than a new uniform because the adaptation is
+    // 1 - exp(-dt * rate), so an enormous dt already MEANS "fully adapted".
+    // The eye has had as long as it likes before the first frame.
+    const float saved_dt = im.params.tune.y;
+    if (!im.metered) {
+        im.params.tune.y = 1e6f;
+        im.metered = true;
+    }
+
     enc.SetPipeline(im.histogram);
     enc.SetTexture(hdr, 0);
     enc.SetBuffer(im.histogram_buf, 0, 0);
@@ -346,6 +367,7 @@ void PostStack::MeterExposure(rhi::ComputeEncoder& enc, rhi::TextureId hdr) {
     enc.SetBuffer(im.exposure_buf, 0, 1);
     enc.SetBytes(&im.params, sizeof(im.params), 2);
     enc.Dispatch(1, 1);
+    im.params.tune.y = saved_dt;
 }
 
 }  // namespace eng

@@ -11,6 +11,7 @@ cc_binary(
     srcs = ["viewer.cpp"],
     deps = [
         "//engine/app",
+        "//engine/asset:png",
         "//engine/geometry",
         "//engine/nav",
         "//engine/physics",

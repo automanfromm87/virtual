@@ -99,6 +99,9 @@ struct Device::Impl {
     id<MTLDevice> dev = nil;
     id<MTLCommandQueue> queue = nil;
     id<MTLCommandBuffer> cb = nil;
+    // The last buffer handed to the GPU, kept alive after `cb` is cleared so a
+    // readback has something to wait on. See ReadPixels.
+    id<MTLCommandBuffer> submitted = nil;
     id<MTLRenderCommandEncoder> enc = nil;
     bool pass_has_depth = false;
     // The current pass's view count. Applied when a pipeline is BOUND rather
@@ -1466,12 +1469,14 @@ void Device::Present(Swapchain& sc) {
 void Device::Commit() {
     InstallFrameCompletion();
     [impl_->cb commit];
+    impl_->submitted = impl_->cb;
     impl_->cb = nil;
 }
 
 bool Device::CommitAndWait(std::string& error) {
     InstallFrameCompletion();
     [impl_->cb commit];
+    impl_->submitted = impl_->cb;
     [impl_->cb waitUntilCompleted];  // MUST sync before reading pixels back
     const bool ok = (impl_->cb.error == nil);
     if (!ok) {
@@ -1485,6 +1490,22 @@ bool Device::CommitAndWait(std::string& error) {
 bool Device::ReadPixels(TextureId tex, int width, int height,
                         std::span<std::uint8_t> out) {
     if (!Valid(tex) || width <= 0 || height <= 0) return false;
+
+    // WAIT FOR THE GPU FIRST. getBytes does not synchronise; it copies whatever
+    // is in the texture at the instant it is called, and on a tile-based GPU
+    // that is a partially finished image -- the tiles that happen to have
+    // retired. It showed up as a band of garbage across the middle of a capture
+    // from the interactive viewer, which commits with Commit() and does not
+    // wait, while apps/shot uses CommitAndWait and was always correct. The
+    // invariant was already written down one function up; it just was not
+    // enforced where it mattered.
+    //
+    // No-op on the CommitAndWait path, which has already waited.
+    if (impl_->submitted) {
+        [impl_->submitted waitUntilCompleted];
+        impl_->submitted = nil;
+    }
+
     // A Private texture has no CPU-visible contents; getBytes on one is a
     // Metal validation error rather than a silent zero fill.
     if (impl_->textures[tex.v].storageMode != MTLStorageModeShared) return false;

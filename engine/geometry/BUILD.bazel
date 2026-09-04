@@ -13,6 +13,7 @@ cc_library(
         "hull.cc",
         "mesh.cc",
         "meshlet.cc",
+        "tree.cc",
     ],
     hdrs = [
         "simplify.h",
@@ -21,6 +22,7 @@ cc_library(
         "hull.h",
         "mesh.h",
         "meshlet.h",
+        "tree.h",
     ],
     deps = [
         "//engine/core",
@@ -64,5 +66,14 @@ cc_test(
 cc_test(
     name = "meshlet_test",
     srcs = ["meshlet_test.cc"],
+    deps = [":geometry"],
+)
+
+# Procedural trees. "Does it look like a tree" is not testable and is not what
+# breaks -- two seeds giving the same tree, the recursion exploding, and
+# inverted normals are, and all three are arithmetic.
+cc_test(
+    name = "tree_test",
+    srcs = ["tree_test.cc"],
     deps = [":geometry"],
 )

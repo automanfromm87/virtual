@@ -23,6 +23,7 @@
 // reflect, and that is most of what "photographic" means for a curved surface.
 #include "engine/asset/png.h"
 #include "engine/geometry/mesh.h"
+#include "engine/geometry/tree.h"
 #include "engine/render/ibl.h"
 #include "engine/render/renderer.h"
 #include "engine/rhi/rhi.h"
@@ -134,8 +135,10 @@ int main(int argc, char** argv) {
     // the only way to tell "the AO pass is doing nothing" apart from "the AO
     // pass is doing something the composite is throwing away".
     bool dump_ao = false;
+    bool trees = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--studio") == 0) studio = true;
+        else if (std::strcmp(argv[i], "--trees") == 0) trees = true;
         else if (std::strcmp(argv[i], "--ao") == 0) dump_ao = true;
         else out = argv[i];
     }
@@ -214,8 +217,56 @@ int main(int argc, char** argv) {
     ground.model = eng::Mat4::Translation({0.0f, -0.15f, 0.0f});
     scene.instances.push_back(ground);
 
+    if (trees) {
+        // A row of trees, each a different seed, plus one close up. The seeds
+        // are what matters here: if two of them produced the same tree the
+        // generator would not be generating anything.
+        std::vector<eng::MeshHandle> trunks, canopies;
+        for (int i = 0; i < 5; ++i) {
+            eng::TreeParams tp;
+            tp.seed = 11u + std::uint32_t(i) * 7919u;
+            tp.height = 3.4f + 0.5f * float(i % 3);
+            tp.leaf_size = 0.52f;
+            tp.leaf_clusters = 5;
+            tp.leaf_scatter = 0.42f;
+            tp.levels = 5;
+            tp.splits = 2;
+            tp.spread = 0.52f;
+            tp.upward = 0.6f;
+            tp.trunk_radius = 0.17f;
+            trunks.push_back(r->UploadMesh(eng::MakeTree(tp).trunk));
+            canopies.push_back(r->UploadMesh(eng::MakeTree(tp).foliage));
+        }
+        eng::MaterialDesc bark;
+        bark.base_color = eng::Vec4{1, 1, 1, 1};
+        bark.roughness = 0.88f;
+        eng::MaterialDesc leaves;
+        leaves.base_color = eng::Vec4{1, 1, 1, 1};
+        leaves.roughness = 0.95f;
+        const eng::MaterialHandle bark_mat = r->CreateMaterial(bark, error);
+        const eng::MaterialHandle leaf_mat = r->CreateMaterial(leaves, error);
+        for (int i = 0; i < 5; ++i) {
+            const eng::Mat4 at = eng::Mat4::Translation(
+                {(float(i) - 2.0f) * 2.6f, 0.0f, -1.5f - float(i % 2) * 1.4f});
+            eng::Instance t;
+            t.mesh = trunks[std::size_t(i)];
+            t.material = bark_mat;
+            t.model = at;
+            scene.instances.push_back(t);
+            eng::Instance c;
+            c.mesh = canopies[std::size_t(i)];
+            c.material = leaf_mat;
+            c.model = at;
+            scene.instances.push_back(c);
+        }
+        scene.camera.eye = eng::Vec3{2.0f, 4.5f, 18.0f};
+        scene.camera.target = eng::Vec3{0.0f, 3.0f, 0.0f};
+        scene.camera.fovY = 0.72f;
+        scene.shadowExtent = 16.0f;
+    }
+
     // Roughness across, metal on the top row and a painted dielectric below.
-    for (int row = 0; row < kRows; ++row)
+    for (int row = 0; row < kRows && !trees; ++row)
         for (int col = 0; col < kCols; ++col) {
             eng::MaterialDesc md;
             md.roughness = 0.04f + 0.92f * float(col) / float(kCols - 1);

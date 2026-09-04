@@ -407,6 +407,42 @@ int main() {
     }
 
     {
+        // THE FIRST READING SNAPS, and this has to run before anything else
+        // meters: the snap fires once per PostStack, and MeterExposure returns
+        // early while auto_exposure is off, so nothing above here has armed it.
+        //
+        // Without it a viewer OPENS AT 1.0 and crawls. Measured in world2:
+        // 1.0 -> 0.785 over 40 frames and still falling, against a target of
+        // 0.44 -- three seconds of white before the image appears, which reads
+        // as a broken renderer rather than as an eye adjusting.
+        std::printf("\nthe first exposure reading snaps rather than crawling\n");
+        post->config.auto_exposure = true;
+        // SLOW on purpose. At this rate a crawl from 1.0 covers 2.5% per frame,
+        // so if the first reading did not snap, four frames leave it near 1.0
+        // and the check below cannot pass by luck.
+        post->config.adapt_brighter = 0.5f;
+        post->config.adapt_darker = 0.5f;
+        r->SetExposureBuffer(post->ExposureBuffer());
+        scene.lightColor = eng::Vec4{14.0f, 14.0f, 14.0f, 1.0f};
+        scene.ambientSky = eng::Vec3{2.0f, 2.1f, 2.4f};
+        scene.ambientGround = eng::Vec3{0.5f, 0.5f, 0.5f};
+        // Four, not one: LastExposure reads a buffer the GPU wrote and is one
+        // to three frames stale, so one frame would measure the readback lag
+        // rather than the meter.
+        for (int i = 0; i < 4; ++i)
+            if (!frame(0.05f, true, nullptr)) return 1;
+        const float snapped = post->LastExposure();
+        for (int i = 0; i < 90; ++i)
+            if (!frame(0.05f, true, nullptr)) return 1;
+        const float settled = post->LastExposure();
+        std::printf("    after 4 frames %.3f, after 94 frames %.3f (started at 1.000)\n",
+                    snapped, settled);
+        Check(std::fabs(snapped - settled) < settled * 0.25f,
+              "four frames in, the meter is already where it converges");
+        Check(snapped < 0.6f, "and nowhere near the 1.0 it was seeded with");
+    }
+
+    {
         std::printf("\nauto-exposure converges on middle grey\n");
         post->config.auto_exposure = true;
         post->config.adapt_brighter = 12.0f;

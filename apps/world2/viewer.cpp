@@ -17,10 +17,15 @@
 #include <string>
 #include <vector>
 
+#include <cstdlib>
+#include <cstring>
+
 #include "engine/app/app.h"
+#include "engine/asset/png.h"
 #include "engine/geometry/mesh.h"
 #include "engine/geometry/simplify.h"
 #include "engine/geometry/terrain.h"
+#include "engine/geometry/tree.h"
 #include "engine/nav/navmesh.h"
 #include "engine/physics/character.h"
 #include "engine/physics/physics.h"
@@ -82,7 +87,24 @@ struct Chunk {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // CAPTURE MODE. Renders a fixed number of frames into a readable target and
+    // writes a PNG instead of opening on the drawable.
+    //
+    // The drawable cannot be read back, so a bug that only shows on screen
+    // cannot be looked at from a terminal -- which is how this demo came to be
+    // washed out without anyone noticing.
+    std::string shot_path;
+    int shot_frames = 12;
+    bool start_fog = true;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc)
+            shot_path = argv[++i];
+        else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
+            shot_frames = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--nofog") == 0) start_fog = false;
+    }
+
     // LINE BUFFERED. Redirected to a file, stdout is fully buffered, and a
     // windowed app that is quit rather than returning never flushes -- so the
     // load-time diagnostics below simply never appear.
@@ -98,7 +120,16 @@ int main() {
     if (!font.Valid()) return Fail(error.empty() ? "font" : error);
     auto ui = eng::ui::Canvas::Create(app->Gpu(), font, config.color, error, 1);
     if (!ui) return Fail(error);
-    auto env = eng::Environment::Create(app->Gpu(), error, 256, config.color,
+    // RGBA16Float, NOT config.color. This argument is the format of the target
+    // the SKY is drawn into, and that is the scene's HDR buffer -- the swapchain
+    // format was passed here, so the pipeline was built for BGRA8Unorm and
+    // bound to an RGBA16Float attachment. A mismatched attachment format does
+    // not fail, it produces undefined pixels: 1.3% of the frame came back with
+    // green and blue annihilated and red stuck at 0 or 255, speckled through
+    // the sky and along the treeline. The default is RGBA16Float for exactly
+    // this reason and naming a format here was the mistake.
+    auto env = eng::Environment::Create(app->Gpu(), error, 256,
+                                        eng::rhi::Format::RGBA16Float,
                                         config.samples);
     if (!env) return Fail(error);
     auto post = eng::PostStack::Create(app->Gpu(), error);
@@ -121,6 +152,100 @@ int main() {
     ground_md.roughness = 0.92f;
     const eng::MaterialHandle ground_mat = app->Draw().CreateMaterial(ground_md, error);
     if (!eng::Valid(ground_mat)) return Fail(error);
+
+    // --- the forest ------------------------------------------------------------
+    //
+    // ONE MESH FOR EVERY TRUNK and one for every canopy. A hundred trees as a
+    // hundred instances is two hundred draw calls for scenery that never moves;
+    // merged, it is two, and the whole forest costs less to submit than the
+    // character does. The cost is that it cannot be culled per tree -- which is
+    // the right trade here, because at 128 m across the whole forest is on
+    // screen most of the time anyway.
+    //
+    // SIX SEEDS, not two hundred. Every tree from one seed is identical, and a
+    // row of identical trees is the most obvious tell there is; but two hundred
+    // distinct skeletons cost two hundred generations and nobody can tell six
+    // apart once they are rotated and scaled differently.
+    std::printf("growing trees...\n");
+    eng::Mesh forest_trunks, forest_leaves;
+    {
+        eng::Tree variants[6];
+        for (int i = 0; i < 6; ++i) {
+            eng::TreeParams tp;
+            tp.seed = 7919u + std::uint32_t(i) * 104729u;
+            tp.height = 4.4f + float(i) * 0.5f;
+            tp.trunk_radius = 0.17f;
+            tp.levels = 5;
+            tp.splits = 2;
+            tp.spread = 0.52f;
+            tp.leaf_clusters = 5;
+            tp.leaf_size = 0.52f;
+            tp.leaf_scatter = 0.42f;
+            variants[i] = eng::MakeTree(tp);
+        }
+
+        // The same xorshift the generator uses, so the forest is identical on
+        // every machine and every run -- a screenshot comparison is worthless
+        // otherwise.
+        std::uint32_t rs = 20260904u;
+        const auto rnd = [&] {
+            rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5;
+            return float(rs & 0xFFFFFFu) / float(0x1000000u);
+        };
+
+        int planted = 0, rejected_slope = 0, rejected_clearing = 0;
+        for (int attempt = 0; attempt < 2000 && planted < 200; ++attempt) {
+            const float x = (rnd() - 0.5f) * 118.0f;
+            const float z = (rnd() - 0.5f) * 118.0f;
+            // A CLEARING around the origin, because that is where the
+            // character spawns and where the camera starts. It has to be wider
+            // than the camera's orbit distance or the camera itself stands
+            // inside the treeline -- which at 12 m it did, and the whole first
+            // shot was one trunk filling the frame.
+            if (x * x + z * z < 17.0f * 17.0f) { ++rejected_clearing; continue; }
+            // NOT ON A CLIFF. A tree planted on a steep face floats with its
+            // roots in the air on the downhill side, which is the single most
+            // obvious scattering artefact and the cheapest one to avoid.
+            if (terrain.NormalAt(x, z).y < 0.86f) { ++rejected_slope; continue; }
+
+            const eng::Tree& t = variants[int(rnd() * 6.0f) % 6];
+            const float scale = 0.75f + rnd() * 0.7f;
+            // Sunk slightly, so the trunk's flat base is never visible above a
+            // terrain triangle that slopes away from it.
+            const eng::Vec3 at{x, terrain.HeightAt(x, z) - 0.15f * scale, z};
+            const eng::Mat4 model = eng::Mat4::Translation(at) *
+                                    eng::Mat4::RotationY(rnd() * 6.2831853f) *
+                                    eng::Mat4::Scale(scale);
+            // A tint per tree, so the canopy is not one flat green across the
+            // whole valley. Warmer on some, cooler on others.
+            const float warm = 0.88f + rnd() * 0.30f;
+            eng::AppendTransformed(forest_trunks, t.trunk, model,
+                                   eng::Vec4{1.0f, 1.0f, 1.0f, 1.0f});
+            eng::AppendTransformed(forest_leaves, t.foliage, model,
+                                   eng::Vec4{warm, 1.0f, 2.0f - warm, 1.0f});
+            ++planted;
+        }
+        std::printf("  %d trees (%zu + %zu tris), rejected %d steep, %d in the clearing\n",
+                    planted, forest_trunks.indices.size() / 3,
+                    forest_leaves.indices.size() / 3, rejected_slope,
+                    rejected_clearing);
+    }
+
+    eng::MaterialDesc bark_md;
+    bark_md.shading = eng::Shading::Lit;
+    bark_md.base_color = eng::Vec4{0.30f, 0.22f, 0.16f, 1.0f};
+    bark_md.roughness = 0.88f;
+    const eng::MaterialHandle bark_mat = app->Draw().CreateMaterial(bark_md, error);
+    if (!eng::Valid(bark_mat)) return Fail(error);
+
+    eng::MaterialDesc leaf_md;
+    leaf_md.shading = eng::Shading::Lit;
+    leaf_md.base_color = eng::Vec4{0.19f, 0.38f, 0.15f, 1.0f};
+    // Leaves are rougher than almost anything else outdoors and not at all
+    // metallic; a smooth canopy picks up a sheen that reads as wet plastic.
+    leaf_md.roughness = 0.95f;
+    const eng::MaterialHandle leaf_mat = app->Draw().CreateMaterial(leaf_md, error);
+    if (!eng::Valid(leaf_mat)) return Fail(error);
 
     eng::Scene scene;
     std::vector<Chunk> chunks;
@@ -192,6 +317,20 @@ int main() {
     std::printf("  %d polygons, %d portals, %.0f ms\n", navmesh.PolyCount(),
                 navmesh.Stats().portals, navmesh.Stats().build_seconds * 1000.0);
 
+    // Two instances, at the origin: the trees were baked into world space by
+    // AppendTransformed, so the model matrix is identity and the only reason
+    // these are instances at all is that a draw needs one.
+    {
+        eng::Instance trunks;
+        trunks.mesh = app->Draw().UploadMesh(forest_trunks);
+        trunks.material = bark_mat;
+        scene.instances.push_back(trunks);
+        eng::Instance leaves;
+        leaves.mesh = app->Draw().UploadMesh(forest_leaves);
+        leaves.material = leaf_mat;
+        scene.instances.push_back(leaves);
+    }
+
     // --- the character -------------------------------------------------------
     const eng::MeshHandle capsule_mesh = app->Draw().UploadMesh(
         eng::MakeUVSphere(0.45f, 16, 20, eng::Vec4{1, 1, 1, 1}, eng::Vec4{1, 1, 1, 1}));
@@ -234,14 +373,36 @@ int main() {
 
     eng::SkyConfig sky;
     float sun_azimuth = 1.1f, sun_elevation = 0.55f;
-    post->config.fog = true;
+    // AUTO EXPOSURE. Without it the composite applies a fixed exposure of 1,
+    // and this scene is far too bright for that: the ground's albedo is
+    // {0.34, 0.40, 0.26}, a green-grey, and it was rendering at 209,202,189 --
+    // not just too light but DESATURATED, because all three channels had been
+    // pushed past the tone-map's knee where they compress toward white
+    // together. That is what "白茫茫" is. The meter puts the scene's middle
+    // fifth at 0.18, which is what a light meter does and what makes the green
+    // come back.
+    post->config.auto_exposure = true;
+    // Half a stop under the meter. The meter puts the middle fifth of the
+    // histogram at middle grey, which is right, but this scene is bimodal --
+    // hard sun and deep shade, about three and a half stops apart -- so the
+    // middle fifth falls between the two modes and the sunlit ground sits at
+    // 214 of 255. Nothing clips, measured, but it is a high-key image and half
+    // a stop down puts the sun side where it reads as grass.
+    post->config.exposure_compensation = -0.5f;
+    app->Draw().SetExposureBuffer(post->ExposureBuffer());
+    post->config.fog = start_fog;
     post->config.fog_density = 0.0055f;
     post->config.fog_height_falloff = 0.035f;
     post->config.fog_start = 6.0f;
 
     std::vector<eng::Vec3> path;
     std::size_t path_at = 0;
-    float camera_yaw = 0.7f, camera_pitch = 0.55f, camera_distance = 22.0f;
+        // PITCHED DOWN 17 DEGREES, NOT 31. At 0.55 rad the camera looks at the
+    // ground: the frame was all terrain, no horizon, no canopy and no sky, and
+    // a scene photographed straight down has nothing in it to judge the light
+    // by. Looking ACROSS the clearing puts the treeline and the sky in frame,
+    // which is what the trees were added for.
+    float camera_yaw = 0.7f, camera_pitch = 0.26f, camera_distance = 13.0f;
     float baked_az = 1e9f, baked_el = 1e9f;
 
     app->Actions().BindMouse("click", eng::app::MouseButton::Left);
@@ -250,6 +411,9 @@ int main() {
     app->Actions().Bind("reset", 'r');
 
     eng::RenderGraph graph;
+    // Allocated lazily on the first frame, when the framebuffer size is known.
+    eng::rhi::TextureId shot_target;
+
     while (app->Running()) {
         if (!app->BeginFrame()) continue;
         const eng::app::Frame& f = app->Current();
@@ -376,9 +540,11 @@ int main() {
                       path.size(), path_at, terrain.HeightAt(player.Feet().x,
                                                              player.Feet().z));
         ui->Text(26, 50, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
-        std::snprintf(line, sizeof(line), "gpu %.2f ms   fog %s   %s",
+        std::snprintf(line, sizeof(line),
+                      "gpu %.2f ms   fog %s   exposure %.2f (%+.1f EV)   %s",
                       app->Gpu().LastFrameGpuMilliseconds(),
-                      post->config.fog ? "on" : "off",
+                      post->config.fog ? "on" : "off", post->LastExposure(),
+                      std::log2(std::max(post->LastExposure(), 1e-6f)),
                       player.Grounded() ? "grounded" : "airborne");
         ui->Text(26, 74, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
         ui->Text(26, 104, "click: walk there    right-drag: orbit    scroll: zoom",
@@ -387,6 +553,10 @@ int main() {
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
 
         // --- passes --------------------------------------------------------------
+        if (!shot_path.empty() && !eng::rhi::Valid(shot_target))
+            shot_target = app->Gpu().CreateRenderTarget(
+                f.width, f.height, eng::rhi::Format::RGBA8Unorm,
+                /*cpu_readable=*/true);
         const eng::rhi::TextureId color = app->Targets().Hdr("color");
         const eng::rhi::TextureId ms_color = app->Targets().Msaa("ms");
         const eng::rhi::TextureId ms_depth = app->Targets().MsaaDepth("ms_depth");
@@ -452,7 +622,7 @@ int main() {
         {
             eng::RenderGraph::Pass p;
             p.name = "composite";
-            p.color = f.drawable;
+            p.color = shot_path.empty() ? f.drawable : shot_target;
             p.reads = {color};
             p.timer = "composite";
             p.execute = [&](eng::rhi::Encoder& e) {
@@ -463,8 +633,38 @@ int main() {
         }
         if (!graph.Compile(error)) return Fail(error);
         graph.Execute(app->Gpu());
+
+        // METERING RUNS OUTSIDE THE GRAPH, and the graph is what insisted:
+        // what this produces is a BUFFER, the graph orders passes by the
+        // textures they write, and a pass writing nothing it tracks has no
+        // defined place in the order. It said so and refused to compile.
+        //
+        // So it goes here, after the composite, reading the colour this frame
+        // produced and leaving the exposure for the NEXT frame to apply. That
+        // is not a workaround, it is how metering is normally done -- exposing
+        // the frame you are about to composite means waiting for it to finish
+        // first, and one frame of lag in a value already smoothed over half a
+        // second is invisible.
+        {
+            auto e = app->Gpu().BeginCompute();
+            post->MeterExposure(e, color);
+            app->Gpu().EndCompute();
+        }
         post->EndFrame();
         app->EndFrame();
+        if (!shot_path.empty())
+            std::printf("  frame %2d  exposure %.4f\n", int(f.index),
+                        post->LastExposure());
+
+        if (!shot_path.empty() && int(f.index) >= shot_frames) {
+            std::vector<std::uint8_t> px(std::size_t(f.width) * f.height * 4);
+            if (!app->Gpu().ReadPixels(shot_target, f.width, f.height, px))
+                return Fail("readback");
+            if (!eng::png::EncodeFile(shot_path, px, f.width, f.height, error))
+                return Fail(error);
+            std::printf("wrote %s (%dx%d)\n", shot_path.c_str(), f.width, f.height);
+            return 0;
+        }
     }
     return 0;
 }
