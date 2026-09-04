@@ -161,11 +161,30 @@ fragment float4 fs_composite(CompositeOut in [[stage_in]],
         // is the identity, so an SDR-looking image on an HDR display looks the
         // same rather than washed out -- which is the failure everyone
         // remembers from early HDR games.
+        //
+        // APPLIED TO THE PEAK CHANNEL, with the others scaled to follow. This
+        // was per-channel, and per-channel is the same mistake the SDR path was
+        // fixed for: the strongest channel of a saturated colour is compressed
+        // hardest and the weakest barely at all, so the ratio between them --
+        // which is the hue -- is destroyed in proportion to brightness. It was
+        // missed because the HDR path's test only ever fed it grey, and grey
+        // has no hue to lose.
+        //
+        // AND NO DESATURATION TERM, unlike the SDR curve. There it exists
+        // because a display that stops at reference white has to put something
+        // in place of a highlight it cannot show, and white is the honest
+        // answer. A display with four times the headroom can show a saturated
+        // highlight, so throwing the saturation away would be discarding the
+        // one thing the extra range was for.
         const float peak = max(g.output.y, 1.0f);   // display headroom, x white
         const float knee = min(g.output.z, peak * 0.99f);
-        const float3 over = max(color - knee, 0.0f);
         const float range = max(peak - knee, 1e-3f);
-        color = min(color, knee) + range * over / (range + over);
+        const float top = max(color.r, max(color.g, color.b));
+        if (top > knee) {
+            const float over = top - knee;
+            const float mapped = knee + range * over / (range + over);
+            color *= mapped / top;
+        }
     }
 
     // --- the grade, in display-referred space ---------------------------------

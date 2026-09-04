@@ -75,7 +75,10 @@ int main() {
         r->UploadMesh(MakeBox(Vec3{40.0f, 40.0f, 0.1f}, Vec4{1, 1, 1, 1}));
 
     std::vector<std::uint8_t> raw(std::size_t(kW) * kH * 8);
-    const auto composite_of = [&](float radiance, const ColorGrade& grade) {
+    // Returns all three channels, because a curve that is applied per channel
+    // is only detectable with a colour -- and everything below used to ask for
+    // grey.
+    const auto composite_rgb = [&](Vec3 radiance, const ColorGrade& grade) {
         Scene s;
         s.camera.eye = Vec3{0.0f, 0.0f, 3.0f};
         s.camera.target = Vec3{0.0f, 0.0f, 0.0f};
@@ -86,7 +89,7 @@ int main() {
         md.base_color = Vec4{0, 0, 0, 1};
         // EMISSIVE, so the value on the surface is exactly the number asked
         // for. Anything lit goes through a BRDF and a cosine first.
-        md.emissive = Vec3{radiance, radiance, radiance};
+        md.emissive = radiance;
         Instance in;
         in.mesh = quad;
         in.material = r->CreateMaterial(md, error);
@@ -120,11 +123,18 @@ int main() {
         }
         // Half-float, read back as bytes. The centre texel.
         const std::size_t i = (std::size_t(kH / 2) * kW + kW / 2) * 8;
-        std::uint16_t bits;
-        std::memcpy(&bits, raw.data() + i, 2);
-        __fp16 h;
-        std::memcpy(&h, &bits, 2);
-        return float(h);
+        Vec3 out_rgb{0.0f, 0.0f, 0.0f};
+        for (int c = 0; c < 3; ++c) {
+            std::uint16_t bits;
+            std::memcpy(&bits, raw.data() + i + std::size_t(c) * 2, 2);
+            __fp16 h;
+            std::memcpy(&h, &bits, 2);
+            (&out_rgb.x)[c] = float(h);
+        }
+        return out_rgb;
+    };
+    const auto composite_of = [&](float radiance, const ColorGrade& grade) {
+        return composite_rgb(Vec3{radiance, radiance, radiance}, grade).x;
     };
 
     {
@@ -170,6 +180,41 @@ int main() {
               "with everything rolled into the display's headroom");
         Check(at10 > at2 && at2 > at1,
               "and a brighter input is still a brighter output");
+
+        // AND IT KEEPS THE HUE. The shoulder used to be applied per channel,
+        // which is the same fault the SDR curve was replaced for: the strongest
+        // channel of a saturated colour is compressed hardest and the weakest
+        // barely at all, so the ratio between them -- the hue -- dissolves in
+        // proportion to how bright the pixel is.
+        //
+        // It survived because every reading above asks for GREY, and grey has
+        // no hue to lose. A tone curve cannot be tested with an achromatic
+        // input; that is not a detail of this test, it is the whole shape of
+        // the mistake.
+        const auto chroma = [](Vec3 c) {
+            const float sum = c.x + c.y + c.z;
+            return sum > 1e-6f ? Vec3{c.x / sum, c.y / sum, c.z / sum}
+                               : Vec3{1.0f / 3, 1.0f / 3, 1.0f / 3};
+        };
+        // Well past the roll-off, where a per-channel curve does its damage,
+        // and saturated enough that losing it is unmistakable.
+        const Vec3 in{6.0f, 2.4f, 1.2f};
+        const Vec3 out_rgb = composite_rgb(in, g);
+        const Vec3 ci = chroma(in), co = chroma(out_rgb);
+        const float drift = std::sqrt((ci.x - co.x) * (ci.x - co.x) +
+                                      (ci.y - co.y) * (ci.y - co.y));
+        std::printf("    %.1f %.1f %.1f -> %.3f %.3f %.3f, chromaticity moved %.4f\n",
+                    double(in.x), double(in.y), double(in.z), double(out_rgb.x),
+                    double(out_rgb.y), double(out_rgb.z), double(drift));
+        // 0.01 is a hue shift nobody can see; a per-channel shoulder on this
+        // input moves it by twenty times that.
+        Check(drift < 0.01f, "and the colour comes out the colour that went in");
+        // NOT BY DESATURATING TO WHITE either, which would also score well on
+        // chromaticity drift only if the drift were measured wrong. A display
+        // with four times the headroom can show a saturated highlight, and
+        // throwing that away is discarding what the range was for.
+        Check(out_rgb.x > out_rgb.y * 1.8f,
+              "with the saturation the extra headroom exists to carry");
     }
 
     {

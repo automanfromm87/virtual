@@ -37,6 +37,53 @@ float Valley(float x, float z) {
     return 0.02f * x * x - 1.0f;
 }
 
+// world2's terrain, verbatim, because that is where a character was found
+// bouncing forever and the smooth valley above does not reproduce it. Four
+// octaves of value noise in a bowl -- the difference that matters is that this
+// one has SLOPE at every scale, including the scale of a single cell.
+std::uint32_t LandHash32(int x, int z) {
+    std::uint32_t h = std::uint32_t(x) * 374761393u + std::uint32_t(z) * 668265263u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return h ^ (h >> 16);
+}
+float LandNoise(float x, float z) {
+    const int ix = int(std::floor(x)), iz = int(std::floor(z));
+    const float fx = x - float(ix), fz = z - float(iz);
+    const float sx = fx * fx * (3.0f - 2.0f * fx);
+    const float sz = fz * fz * (3.0f - 2.0f * fz);
+    const auto h = [](int a, int b) {
+        return float(LandHash32(a, b) & 0xFFFFFFu) / 16777215.0f;
+    };
+    const float a = h(ix, iz), b = h(ix + 1, iz);
+    const float c = h(ix, iz + 1), d = h(ix + 1, iz + 1);
+    const float top = a + (b - a) * sx;
+    return top + ((c + (d - c) * sx) - top) * sz;
+}
+float Landscape(float x, float z) {
+    float height = 0.0f, amplitude = 6.0f, frequency = 0.012f;
+    for (int octave = 0; octave < 4; ++octave) {
+        height += (LandNoise(x * frequency, z * frequency) - 0.5f) * amplitude;
+        amplitude *= 0.5f;
+        frequency *= 2.1f;
+    }
+    const float r = std::sqrt(x * x + z * z);
+    return height + std::max(0.0f, (r - 46.0f) * 0.55f);
+}
+
+std::shared_ptr<const eng::physics::HeightfieldData> MakeFieldFrom(
+    int n, float spacing, Vec3 origin, float (*fn)(float, float)) {
+    auto data = std::make_shared<eng::physics::HeightfieldData>();
+    data->resolution = n;
+    data->spacing = spacing;
+    data->origin = origin;
+    data->heights.resize(std::size_t(n) * std::size_t(n));
+    for (int z = 0; z < n; ++z)
+        for (int x = 0; x < n; ++x)
+            data->heights[std::size_t(z) * std::size_t(n) + std::size_t(x)] =
+                fn(origin.x + float(x) * spacing, origin.z + float(z) * spacing);
+    return data;
+}
+
 std::shared_ptr<const eng::physics::HeightfieldData> MakeField(int n, float spacing,
                                                                Vec3 origin) {
     auto data = std::make_shared<eng::physics::HeightfieldData>();
@@ -293,6 +340,106 @@ int main() {
         std::printf("    and drifts %.4f mm horizontally over another 200\n",
                     double(drift * 1000.0f));
         Check(drift == 0.0f, "and does not slide across a surface it is resting on");
+    }
+
+    {
+        std::printf("\nthe ground stick has a window, and it is narrow\n");
+        // THE MECHANISM behind a character that bounced forever in world2, and
+        // it needed world2's OWN terrain to show: the smooth valley above does
+        // not reproduce it at any step size. What is different is that this
+        // ground has slope at every scale.
+        //
+        // Swing over 200 frames while standing still, in millimetres:
+        //
+        //     stick     0.3 deg slope    10.2 deg slope
+        //      1 mm        199              199
+        //      5 mm        185              181
+        //      7 mm         65               61
+        //    7.5 mm          0                0
+        //     12 mm          0                0
+        //     13 mm          0               64
+        //   14.9 mm          0              112
+        //     30 mm          0              219
+        //
+        // TWO different failures with a good window between them.
+        //
+        // TOO SMALL and the character is never caught: the swing is very nearly
+        // the step times the frame count, so it is simply falling. Something in
+        // the ground probe needs a minimum push to register a contact.
+        //
+        // TOO LARGE and it penetrates, and depenetration pushes it back out
+        // along the surface NORMAL -- which on a slope has a horizontal
+        // component. So it moves sideways, lands on ground at a different
+        // height, and does it again. That is why the swing grows with the slope
+        // and vanishes on the flat, and it is why world2's character was
+        // drifting in x and z as well as bouncing.
+        //
+        // world2 pushed 16.3 mm, which is past the upper edge. The first fix
+        // used half the skin -- 7.5 mm -- which is EXACTLY the lower edge, one
+        // step from a 65 mm failure. Right by luck. Two thirds of the skin sits
+        // in the middle of the window, and the check below is on the MARGIN
+        // rather than on the value, because a number that only works at one
+        // point is not a fix.
+        const auto rough = MakeFieldFrom(257, 0.5f, Vec3{-64.0f, 0.0f, -64.0f},
+                                         Landscape);
+        eng::physics::World world;
+        eng::physics::Body ground;
+        ground.shape = eng::physics::Shape::MakeHeightfield(rough);
+        ground.inverse_mass = 0.0f;
+        world.Add(ground);
+
+        eng::physics::CharacterConfig cc;
+        cc.radius = 0.4f;
+        cc.height = 1.8f;
+        cc.slope_limit_degrees = 45.0f;
+        cc.step_height = 0.4f;
+
+        const auto swing_at = [&](Vec3 where, float stick) {
+            eng::physics::CharacterController p(cc);
+            p.Teleport(Vec3{where.x, rough->HeightAt(where.x, where.z) + 0.5f, where.z});
+            for (int i = 0; i < 60; ++i) p.Move(world, Vec3{0.0f, -stick, 0.0f});
+            float lo = 1e30f, hi = -1e30f;
+            for (int i = 0; i < 200; ++i) {
+                p.Move(world, Vec3{0.0f, -stick, 0.0f});
+                lo = std::min(lo, p.Feet().y);
+                hi = std::max(hi, p.Feet().y);
+            }
+            return hi - lo;
+        };
+
+        // Five places, because a failure that depends on the local slope will
+        // not show at one spot chosen by hand -- and the flat one would have
+        // passed every step size in the table above.
+        const Vec3 spots[] = {{0, 0, 0}, {12, 0, -7}, {-20, 0, 15},
+                              {30, 0, 30}, {-35, 0, -5}};
+        const float stick = cc.skin * (2.0f / 3.0f);
+        float worst = 0.0f, worst_low = 0.0f, worst_high = 0.0f, worst_old = 0.0f;
+        for (const Vec3& v : spots) {
+            worst = std::max(worst, swing_at(v, stick));
+            worst_low = std::max(worst_low, swing_at(v, stick * 0.8f));
+            worst_high = std::max(worst_high, swing_at(v, stick * 1.2f));
+            // 9.81 * dt * dt * 6 at 60 Hz, which is what world2 had.
+            worst_old = std::max(worst_old, swing_at(v, 9.81f / 3600.0f * 6.0f));
+        }
+        std::printf("    worst swing over 5 spots: %.1f mm at the old 16.3 mm step, "
+                    "%.4f mm at %.1f mm\n",
+                    double(worst_old * 1000.0f), double(worst * 1000.0f),
+                    double(stick * 1000.0f));
+        std::printf("    and %.1f / %.1f nm at 20%% either side of it\n",
+                    double(worst_low * 1e9f), double(worst_high * 1e9f));
+        Check(worst == 0.0f, "the chosen stick holds the character exactly still");
+        // THE MARGIN, which is the part worth guarding. If the controller ever
+        // changes so that the window moves or narrows, this fails while the
+        // check above still passes -- and a stick sitting on a cliff edge is a
+        // bug that appears on somebody else's terrain, not on this one.
+        // A MICRON, not zero, for the off-centre pair. They come out at tens
+        // of NANOMETRES -- about one float bit at this magnitude -- because a
+        // different step size is different arithmetic and lands on a different
+        // last digit. The chosen value above is bit-exact and is asserted as
+        // such; requiring that of its neighbours would be asserting a property
+        // of float rounding rather than of the controller.
+        Check(worst_low < 1e-6f && worst_high < 1e-6f,
+              "and so does 20% either side of it, so it is not on an edge");
     }
 
     {

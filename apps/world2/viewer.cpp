@@ -758,36 +758,32 @@ int main(int argc, char** argv) {
         }
         const float dt = std::min(f.dt, 0.05f);
 
-        // A CONSTANT GROUND STICK, not a gravity term recomputed from dt.
+        // A CONSTANT GROUND STICK, sized into the middle of a narrow window.
         //
-        // This used to push the character down by 9.81 * dt * dt * 6 every
-        // frame -- 16.3 mm at 60 Hz, and a different distance whenever the
-        // frame time changed, because it goes as the SQUARE of it. The
-        // character never came to rest: measured at feet.y alternating between
-        // -5.609918 and -5.623887 for as long as the demo ran, a 14 mm bounce
-        // that never decayed.
+        // This used to push down by 9.81 * dt * dt * 6 every frame -- 16.3 mm
+        // at 60 Hz -- and the character never came to rest: feet.y alternating
+        // between -5.609918 and -5.623887 for as long as the demo ran, while x
+        // and z crept. The camera is rigidly attached to it, so that went
+        // straight into the view matrix, and against branches a pixel wide it
+        // read as the whole PICTURE flickering. 0.68% of pixels changed between
+        // two consecutive frames of a completely still shot; it is 0.011% now,
+        // all of it the HUD's exposure readout.
         //
-        // The camera is rigidly attached to the character, so that went
-        // straight into the view matrix. What it looked like was the PICTURE
-        // flickering, not a physics bug -- 0.68% of pixels changed between two
-        // consecutive frames of a completely still shot, some by three quarters
-        // of the range, because a 14 mm camera judder against branches a pixel
-        // wide flips them on and off. After this it is 0.011%, and all of that
-        // is the exposure readout in the HUD.
+        // heightfield_test has the mechanism, measured on this exact terrain.
+        // There are TWO failures either side of a good window: below about half
+        // the controller's skin the character is never caught and simply falls,
+        // and above about four fifths of it the step penetrates, depenetration
+        // pushes back out along the surface NORMAL, and on a slope that has a
+        // horizontal component -- so it slides, lands at a different height and
+        // does it again. Which is exactly the sideways creep in the trace.
         //
-        // WHY IT OSCILLATED IS NOT SETTLED. Two mechanisms were tried in
-        // heightfield_test -- a step longer than the controller's 15 mm skin,
-        // and the dt-squared jitter -- and neither reproduces it on a smooth
-        // field; both come out under a hundredth of a millimetre. This terrain
-        // is four octaves of noise in a bowl, so it is probably a particular
-        // slope this test does not have. What is established, and tested, is
-        // that a CONSTANT stick holds the character exactly still.
-        //
-        // A grounded character does not need to accelerate downward anyway. It
-        // needs just enough push to stay glued to a slope it walks down, and
-        // that wants to be inside the skin so there is nothing to resolve.
+        // The window is 7.5 to 12 mm for a 15 mm skin. Two thirds of the skin
+        // is the middle of it, and the test asserts the MARGIN rather than the
+        // value: the first version of this fix used half the skin, which is
+        // exactly the lower edge, one step away from a 65 mm failure. It worked
+        // by luck.
         if (player.Grounded()) {
-            fall_speed = -cc.skin * 0.5f / std::max(dt, 1e-4f);
+            fall_speed = -cc.skin * (2.0f / 3.0f) / std::max(dt, 1e-4f);
         } else {
             fall_speed -= 9.81f * dt;
             // Terminal velocity, so a long fall cannot produce a step longer
