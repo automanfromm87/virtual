@@ -16,6 +16,7 @@
 namespace {
 
 int g_failures = 0;
+int local_shadow_draws = 0, local_shadow_culled = 0;
 
 void Check(bool ok, const char* what) {
     std::printf("  %-58s %s\n", what, ok ? "ok" : "FAIL");
@@ -84,6 +85,13 @@ int main() {
             p.keep_depth = true;
             p.execute = [&](eng::rhi::Encoder& e) {
                 renderer->DrawLightShadows(e, scene);
+                // WHAT THE PER-FACE CULL SAVES. This pass is a light by face by
+                // instance triple loop and had no bounds test of any kind, so
+                // every caster in the scene went into every tile of the atlas.
+                // The pair is the assertion: it still draws something, and it
+                // does not draw everything.
+                local_shadow_draws = renderer->ShadowDrawCount();
+                local_shadow_culled = renderer->ShadowCulledCount();
             };
             graph.AddPass(std::move(p));
         }
@@ -637,6 +645,15 @@ int main() {
         }
         std::printf("    %d pixels darkened by the spot shadows\n", darkened);
         Check(darkened > 4000, "turning them on darkens a substantial area");
+        // NOT a ratio: this is a small interior and every caster really is
+        // inside every spot's cone, so the cull correctly rejects none of them.
+        // What the pair pins is that the pass still records casters after the
+        // cull was added -- a frustum built the wrong way round would take this
+        // to zero, and the shadow checks above would then fail for a reason
+        // that looks like a lighting bug.
+        std::printf("    local shadows: %d casters submitted, %d rejected\n",
+                    local_shadow_draws, local_shadow_culled);
+        Check(local_shadow_draws > 0, "the local lights still record casters");
 
         // The shadow must be UNDER its own plinth, not somewhere else. A
         // light-space shadow map with the wrong matrix still darkens plenty of

@@ -1598,6 +1598,10 @@ int Renderer::ShadowedLightCount() const {
 
 int Renderer::ShadowTilesUsed() const { return impl_->shadow_tiles_used; }
 
+// ADDS TO the same caster counters DrawShadow resets, rather than resetting
+// them again: they are the FRAME's shadow casters, and the two passes are two
+// halves of one answer. Reading them between the passes gives the sun's alone,
+// which is what the HUD wants and what it gets.
 void Renderer::DrawLightShadows(rhi::Encoder& enc, const Scene& scene) {
     impl_->shadow_tile_of_light.assign(scene.lights.size(), -1);
     impl_->shadow_tiles_used = 0;
@@ -1632,6 +1636,17 @@ void Renderer::DrawLightShadows(rhi::Encoder& enc, const Scene& scene) {
 
             const Mat4 light_vp = faces == 1 ? light.ViewProj()
                                              : light.CubeFaceViewProj(f);
+            // CULLED PER FACE, which this pass never did at all. It is a light
+            // by face by instance triple loop, so an atlas of sixteen tiles
+            // over a scene of five hundred casters submitted eight thousand
+            // draws -- and, before the DepthPass split, eight thousand slices
+            // of a uniform ring that holds 8192. Turning local shadows on in a
+            // real scene was the black frame from the other direction.
+            //
+            // A cube face is a 90-degree perspective frustum and a spot is its
+            // cone's; either way the projection IS the clip volume, so a caster
+            // this rejects could not have written a texel of that tile.
+            const Frustum face_frustum = Frustum::FromViewProj(light_vp);
             // ONE SLICE PER FACE, as in DrawShadow. Sixteen tiles over sixty
             // lights used to be sixteen slices per caster.
             const std::size_t pass_offset = impl_->AllocUniform();
@@ -1654,6 +1669,19 @@ void Renderer::DrawLightShadows(rhi::Encoder& enc, const Scene& scene) {
                     continue;
                 const GpuMesh& gm = impl_->meshes[inst.mesh.v];
                 const bool skinned = IsSkinned(gm, inst, scene);
+                // Skinned casters exempt for the same reason as the sun's
+                // cascades: gm.bounds is the bind pose and a pose may leave it.
+                if (!skinned) {
+                    const Vec4 bc = inst.model * Vec4{gm.bounds.center.x,
+                                                      gm.bounds.center.y,
+                                                      gm.bounds.center.z, 1.0f};
+                    if (!face_frustum.IntersectsSphere(
+                            Vec3{bc.x, bc.y, bc.z},
+                            gm.bounds.radius * MaxScale(inst.model))) {
+                        ++impl_->shadow_culled;
+                        continue;
+                    }
+                }
                 std::size_t palette_offset = Impl::kNoSpace;
                 if (skinned) {
                     palette_offset = impl_->AllocPalette();

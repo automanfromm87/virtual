@@ -180,6 +180,34 @@ int main(int argc, char** argv) {
     // per bake and deadlocked the app outright on the third, and a defect that
     // needs three keypresses to reproduce is a defect no test will ever see.
     int rebake_every = 0;
+    // BLOOM, in LINEAR radiance before the tone map. The threshold has to sit
+    // above the brightest thing that is merely lit and below the things that
+    // are sources: sunlit grass in this valley comes in under one, the lantern
+    // glass is at 7 and the sparks at 14.
+    // MEASURED on this valley, not carried over from tests/gallery, which uses
+    // 3.2 -- that scene's lamps run into the tens of units and this one's
+    // radiance tops out near 1.2, so a threshold of 3.2 here selects nothing at
+    // all and the pass is a no-op that costs 0.9 ms. At 1.0 the mean rises by
+    // 3.10 at the lantern hall, 0.70 in the clearing and 0.33 at the fire pit:
+    // strongest where the emissive sources are, which is the shape it should
+    // have.
+    // LOCAL-LIGHT SHADOWS, off by default and the reason is arithmetic, not
+    // taste: the atlas is 16 tiles and this valley has 60 lanterns, so at best
+    // a quarter of them cast and DrawLightShadows takes the first sixteen it
+    // finds. Shadowing an arbitrary subset of a colonnade of identical lamps
+    // looks worse than shadowing none of them. The flag exists so the cost can
+    // be measured and so the tile budget has something to be measured against.
+    // MEASURED once it was wired: the valley's 61 lanterns request no shadow at
+    // all -- Light::ShadowFaces() is zero for every one of them -- so the pass
+    // records nothing and reports 0 tiles of 61 lights. Making them cast is
+    // content work in districts.h, and even then 16 tiles over 61 lamps means
+    // an arbitrary sixteen of a colonnade of identical lights cast and the rest
+    // do not, which reads worse than none of them casting. The flag is here so
+    // the cost has something to be measured against when the tile budget grows.
+    bool local_shadows_start = false;
+    bool bloom_start = true;
+    float bloom_threshold = 1.0f;
+    float bloom_strength = 0.6f;
     // 4096, MEASURED against an 8192 render of the same frame. The fraction of
     // pixels more than 20 of 255 away from that reference:
     //
@@ -250,6 +278,13 @@ int main(int argc, char** argv) {
             exposure_comp = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--scale") == 0 && i + 1 < argc)
             render_scale = float(std::atof(argv[++i]));
+        else if (std::strcmp(argv[i], "--localshadows") == 0)
+            local_shadows_start = true;
+        else if (std::strcmp(argv[i], "--nobloom") == 0) bloom_start = false;
+        else if (std::strcmp(argv[i], "--bloom") == 0 && i + 2 < argc) {
+            bloom_threshold = float(std::atof(argv[++i]));
+            bloom_strength = float(std::atof(argv[++i]));
+        }
         else if (std::strcmp(argv[i], "--rebake") == 0 && i + 1 < argc)
             rebake_every = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--indirect") == 0) indirect_on = true;
@@ -1569,6 +1604,9 @@ int main(int argc, char** argv) {
     float baked_az = 1e9f, baked_el = 1e9f;
     bool ssao_on = ssao_start;
     bool shafts_on = shafts_start;
+    bool bloom_on = bloom_start;
+    const bool local_shadows_on = local_shadows_start;
+    int lamp_draws = 0, lamp_culled = 0;
     bool sparks_on = sparks_start;
     int here = tour_start;      // which stop was last jumped to, for the HUD
     int goto_stop = tour_start; // -1 when there is nothing to jump to
@@ -1591,6 +1629,7 @@ int main(int argc, char** argv) {
     app->Actions().Bind("stop5", '5');
     app->Actions().Bind("reset", 'r');
     app->Actions().Bind("passes", 'p');
+    app->Actions().Bind("bloom", 'b');
     app->Actions().Bind("forward", 'w');
     app->Actions().Bind("back", 's');
     app->Actions().Bind("left", 'a');
@@ -1674,6 +1713,7 @@ int main(int argc, char** argv) {
         if (app->Actions().Pressed("ssao")) ssao_on = !ssao_on;
         if (app->Actions().Pressed("shafts")) shafts_on = !shafts_on;
         if (app->Actions().Pressed("passes")) profile_panel = !profile_panel;
+        if (app->Actions().Pressed("bloom")) bloom_on = !bloom_on;
 
         // --- the sun, and the indirect light that has to follow it -------------
         //
@@ -2261,9 +2301,10 @@ int main(int argc, char** argv) {
                       app->Time().Fps(), slowest, slowest_ms);
         ui->Text(26, 122, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
         std::snprintf(line, sizeof(line),
-                      "fog %s  taa %s  ao %s  exposure %.2f (%+.1f EV)  %s",
+                      "fog %s  taa %s  ao %s  bloom %s  exposure %.2f (%+.1f EV)  %s",
                       post->config.fog ? "on" : "off",
                       post->config.taa ? "on" : "off", ssao_on ? "on" : "off",
+                      bloom_on ? "on" : "off",
                       post->LastExposure(),
                       std::log2(std::max(post->LastExposure(), 1e-6f)),
                       player.Grounded() ? "grounded" : "airborne");
@@ -2293,7 +2334,7 @@ int main(int argc, char** argv) {
         std::snprintf(line, sizeof(line), "at: %s   (0-5 to travel)",
                       kStopList[std::clamp(here, 0, kStops - 1)].name);
         ui->Text(26, 200, line, eng::Vec4{0.92f, 0.94f, 0.98f, 1.0f});
-        ui->Text(26, 248, "wasd: walk  space: run  qe: look down/up  f t o v: effects  [ ]: sun  r: reset  p: passes",
+        ui->Text(26, 248, "wasd: walk  space: run  qe: look down/up  f t o v b: effects  [ ]: sun  r: reset  p: passes",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
 
         // --- the pass table -------------------------------------------------
@@ -2372,6 +2413,23 @@ int main(int argc, char** argv) {
             p.keep_depth = true;
             p.timer = "shadow";
             p.execute = [&](eng::rhi::Encoder& e) { app->Draw().DrawShadow(e, scene); };
+            graph.AddPass(p);
+        }
+        if (local_shadows_on) {
+            eng::RenderGraph::Pass p;
+            p.name = "lampshadow";
+            p.depth = app->Draw().ShadowAtlas();
+            p.keep_depth = true;
+            p.timer = "lampshadow";
+            p.execute = [&](eng::rhi::Encoder& e) {
+                // The counters accumulate across both shadow passes, so the
+                // lamps' own contribution is the difference.
+                const int before = app->Draw().ShadowDrawCount();
+                const int before_culled = app->Draw().ShadowCulledCount();
+                app->Draw().DrawLightShadows(e, scene);
+                lamp_draws = app->Draw().ShadowDrawCount() - before;
+                lamp_culled = app->Draw().ShadowCulledCount() - before_culled;
+            };
             graph.AddPass(p);
         }
         // THE DEPTH PREPASS IS GONE. It existed only to manufacture a
@@ -2576,15 +2634,68 @@ int main(int argc, char** argv) {
                 app->Gpu().EndCompute();
             }
         }
+        // --- bloom ---------------------------------------------------------
+        //
+        // THE ENGINE HAD IT AND THE VALLEY NEVER RAN IT. DrawComposite was
+        // called with its bloom texture and strength left at their defaults, in
+        // a scene whose lantern glass is emissive at {7.0, 4.6, 2.2}, whose fire
+        // pit throws embers, and whose sparks sit at a radiance of {14, 4.2,
+        // 0.9} with a comment saying that value "is what puts the sparks above
+        // the tone curve's knee" -- above a knee that nothing was looking at, so
+        // they clipped to white instead of glowing.
+        //
+        // Bright pass at half, two separable blurs, then two more at quarter.
+        // Separable because a flat kernel costs n squared taps where two
+        // one-dimensional passes cost 2n, and two scales because one blur wide
+        // enough to read as a halo is also wide enough to be expensive.
+        const eng::rhi::TextureId b_half = scene_targets.Hdr("bloomHalf", 2);
+        const eng::rhi::TextureId b_half2 = scene_targets.Hdr("bloomHalf2", 2);
+        const eng::rhi::TextureId b_quarter = scene_targets.Hdr("bloomQuarter", 4);
+        const eng::rhi::TextureId b_quarter2 = scene_targets.Hdr("bloomQuarter2", 4);
+        const eng::rhi::TextureId b_out = scene_targets.Hdr("bloomOut", 4);
+        if (bloom_on) {
+            const float hw = 2.0f / float(rw), hh = 2.0f / float(rh);
+            const float qw = 4.0f / float(rw), qh = 4.0f / float(rh);
+            const struct { const char* name; eng::rhi::TextureId out, in; float x, y; }
+                kBlurs[] = {{"blurAx", b_half2, b_half, hw, 0.0f},
+                            {"blurAy", b_quarter, b_half2, 0.0f, hh},
+                            {"blurBx", b_quarter2, b_quarter, qw, 0.0f},
+                            {"blurBy", b_out, b_quarter2, 0.0f, qh}};
+            {
+                eng::RenderGraph::Pass p;
+                p.name = "bright";
+                p.color = b_half;
+                p.reads = {composited};
+                p.timer = "bright";
+                p.execute = [&](eng::rhi::Encoder& e) {
+                    app->Draw().DrawBloomBright(e, composited, bloom_threshold, 0.9f);
+                };
+                graph.AddPass(p);
+            }
+            for (const auto& b : kBlurs) {
+                eng::RenderGraph::Pass p;
+                p.name = b.name;
+                p.color = b.out;
+                p.reads = {b.in};
+                p.execute = [&, b](eng::rhi::Encoder& e) {
+                    app->Draw().DrawBloomBlur(e, b.in, b.x, b.y);
+                };
+                graph.AddPass(p);
+            }
+        }
         {
             eng::RenderGraph::Pass p;
             p.name = "composite";
             p.color = shot_path.empty() ? f.drawable : shot_target;
             p.reads = ssao_on ? std::vector<eng::rhi::TextureId>{composited, ao}
                               : std::vector<eng::rhi::TextureId>{composited};
+            if (bloom_on) p.reads.push_back(b_out);
             p.timer = "composite";
             p.execute = [&](eng::rhi::Encoder& e) {
-                app->Draw().DrawComposite(e, composited, ssao_on ? ao : eng::rhi::TextureId{});
+                app->Draw().DrawComposite(e, composited,
+                                          ssao_on ? ao : eng::rhi::TextureId{},
+                                          bloom_on ? b_out : eng::rhi::TextureId{},
+                                          bloom_on ? bloom_strength : 0.0f);
                 ui->Draw(e);
             };
             graph.AddPass(p);
@@ -2697,6 +2808,10 @@ int main(int argc, char** argv) {
                         app->Draw().LastStats().draws, app->Draw().ShadowDrawCount(),
                         app->Draw().ShadowCulledCount(),
                         app->Draw().UniformSlicesThisFrame());
+            if (local_shadows_on)
+                std::printf("lamps: %d casters submitted, %d rejected, %d tiles of %d lights\n",
+                            lamp_draws, lamp_culled, app->Draw().ShadowTilesUsed(),
+                            int(scene.lights.size()));
             return 0;
         }
     }
