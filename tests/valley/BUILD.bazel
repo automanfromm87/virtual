@@ -1,0 +1,21 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# THE GATE ON apps/world. It drives the real binary rather than linking a
+# library extracted from it -- see the comment at the top of main.cpp for why
+# that is the deliberate choice and not the lazy one.
+#
+# `enormous` because it renders six captures of a valley whose startup includes
+# a GI bake, and `exclusive` because they contend for one GPU with every other
+# offscreen test in this repository; sharing it makes the timings meaningless
+# and, on a loaded machine, makes the runs slow enough to look like hangs.
+cc_test(
+    name = "valley_test",
+    size = "enormous",
+    srcs = ["main.cpp"],
+    data = ["//apps/world"],
+    tags = ["exclusive"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = ["//engine/asset:png"],
+)

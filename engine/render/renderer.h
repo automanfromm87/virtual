@@ -294,6 +294,13 @@ class Renderer {
     // How many skinned instances one frame can draw before the palette ring is
     // full. Overflowing drops the draw, and shows up in RenderStats::overflowed.
     static constexpr int kMaxSkinnedPerFrame = 16;
+    // How many uniform slices one frame may allocate, across EVERY pass -- the
+    // ring is shared. Public because a test that guards the allocator's
+    // per-frame reset has to outrun it, and a test that hard-codes the number
+    // stops guarding anything the day the number changes. tests/frames did
+    // exactly that: both its loops were sized against 1024 and the ring has
+    // been 8192 for some time, so neither reached the cliff any more.
+    static constexpr int kMaxInstancesPerFrame = 8192;
 
     // Joints the mesh was uploaded with, or 0 if it is not skinned.
     [[nodiscard]] int JointCount(MeshHandle) const;

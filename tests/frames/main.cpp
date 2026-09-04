@@ -28,11 +28,16 @@ void Check(bool ok, const char* what) {
 
 int main() {
     constexpr int kW = 320, kH = 320;
-    // 400 * 3 draws = 1200 uniform allocations, comfortably past
-    // kMaxInstancesPerFrame (1024). If the per-frame cursor reset were deleted
-    // the allocator would starve before the end and the final draws==3 check
-    // below would fail. At 120 frames it would not.
-    constexpr int kFrames = 400;
+    // DERIVED, not written down. This has to outrun the uniform ring: if the
+    // per-frame cursor reset were deleted the allocator would starve before the
+    // end and the final draws == 3 check would fail. It was 400 frames against
+    // a ring of 1024, and the ring has been 8192 for some time -- so 1200
+    // allocations against 8192 slices, and the guard had quietly stopped
+    // guarding. Spelling out the relationship is what stops that happening
+    // again the next time the ring changes size.
+    constexpr int kDrawsPerFrame = 3;
+    constexpr int kFrames =
+        eng::Renderer::kMaxInstancesPerFrame / kDrawsPerFrame + 40;
 
     std::string error;
     auto dev = eng::rhi::Device::Create(error);
@@ -213,11 +218,12 @@ int main() {
     // and from then on DrawScene bails on its first instance — a scene that
     // goes permanently blank with draws == 0 and no error anywhere.
     //
-    // 3 draws per call, so this needs more than 1024/3 == 342 drawing frames to
-    // reach the cliff. The every-frame loop above cannot expose it, because
-    // there the slot really does change every frame.
+    // 3 draws per call, so this needs more than kMaxInstancesPerFrame/3 drawing
+    // frames to reach the cliff. The every-frame loop above cannot expose it,
+    // because there the slot really does change every frame.
     {
-        constexpr int kDrawingFrames = 360;
+        constexpr int kDrawingFrames =
+            eng::Renderer::kMaxInstancesPerFrame / 3 + 20;
         eng::RenderStats last{};
         for (int f = 0; f < kDrawingFrames * eng::rhi::kFramesInFlight; ++f) {
             dev->BeginFrame();

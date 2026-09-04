@@ -174,6 +174,12 @@ int main(int argc, char** argv) {
     // ordinary path submits one draw each; the indirect path batches them
     // into one. 0 is off.
     int crowd_count = 0;
+    // FORCES THE DEBOUNCED GI RE-BAKE every N frames, with no input. It exists
+    // so tests/valley can exercise the re-bake path from a headless capture:
+    // that path opened a nested device frame, leaked a frames-in-flight permit
+    // per bake and deadlocked the app outright on the third, and a defect that
+    // needs three keypresses to reproduce is a defect no test will ever see.
+    int rebake_every = 0;
     // 4096, MEASURED against an 8192 render of the same frame. The fraction of
     // pixels more than 20 of 255 away from that reference:
     //
@@ -244,6 +250,8 @@ int main(int argc, char** argv) {
             exposure_comp = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--scale") == 0 && i + 1 < argc)
             render_scale = float(std::atof(argv[++i]));
+        else if (std::strcmp(argv[i], "--rebake") == 0 && i + 1 < argc)
+            rebake_every = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--indirect") == 0) indirect_on = true;
         else if (std::strcmp(argv[i], "--crowd") == 0 && i + 1 < argc)
             crowd_count = std::atoi(argv[++i]);
@@ -1690,6 +1698,9 @@ int main(int argc, char** argv) {
             sun_azimuth += sun_input * f.dt * 0.45f;
             gi_stale = true;
             gi_still_frames = 0;
+        } else if (rebake_every > 0 && f.index > 0 &&
+                   int(f.index) % rebake_every == 0) {
+            gi_rebake_pending = true;
         } else if (gi_stale && ++gi_still_frames > 12) {
             // QUEUED, not run. bake_indirect opens a device frame and blocks on
             // it, and this is the middle of one -- see the top of the loop.
@@ -2664,6 +2675,15 @@ int main(int argc, char** argv) {
             if (!eng::png::EncodeFile(shot_path, px, f.width, f.height, error))
                 return Fail(error);
             std::printf("wrote %s (%dx%d)\n", shot_path.c_str(), f.width, f.height);
+            // ONE LINE A TEST CAN READ. peak in flight is the one that matters:
+            // it must never exceed kFramesInFlight, and the GI re-bake used to
+            // leak a permit per bake until the third one blocked forever.
+            std::printf("summary: peak in flight %d, gpu faults %d, dropped %d, "
+                        "instances %zu, draws %d, shadow %d/%d culled\n",
+                        app->Gpu().PeakFramesInFlight(), app->Gpu().GpuFaultCount(),
+                        app->Draw().DroppedThisFrame(), scene.instances.size(),
+                        app->Draw().LastStats().draws, app->Draw().ShadowDrawCount(),
+                        app->Draw().ShadowCulledCount());
             return 0;
         }
     }

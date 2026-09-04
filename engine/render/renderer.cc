@@ -133,7 +133,8 @@ constexpr int kInstanceSlot = 4;
 // real cost and it is the right trade: past 8192 draws in one frame the answer
 // is CullScene and DrawSceneIndirect, which need three slices for six thousand
 // objects instead of six thousand.
-constexpr std::size_t kMaxInstancesPerFrame = 8192;
+constexpr std::size_t kMaxInstancesPerFrame =
+    std::size_t(Renderer::kMaxInstancesPerFrame);
 
 std::size_t AlignUp(std::size_t v, std::size_t a) { return ((v + a - 1) / a) * a; }
 
