@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <deque>
 #include <unordered_map>
@@ -29,8 +30,26 @@ Address Address::Parse(const std::string& text, bool* ok) {
     in_addr addr{};
     if (inet_pton(AF_INET, host.c_str(), &addr) != 1) return a;
     a.ip = ntohl(addr.s_addr);
-    a.port = std::uint16_t(std::strtoul(text.c_str() + colon + 1, nullptr, 10));
-    if (ok) *ok = a.port != 0;
+
+    // THE PORT IS VALIDATED, not merely converted. strtoul with a null endptr
+    // and no range check accepts things that are not ports and turns them into
+    // ports that were never asked for:
+    //
+    //   "host:99999"  -> 99999 truncated by the uint16_t cast to 33983
+    //   "host:-1"     -> strtoul wraps to ULONG_MAX, truncates to 65535
+    //   "host:80xyz"  -> 80, trailing garbage ignored
+    //
+    // Every one of those used to report success. Connecting to a port the
+    // caller did not name is worse than refusing the string.
+    const char* first = text.c_str() + colon + 1;
+    if (*first < '0' || *first > '9') return a;  // no sign, no space, no empty
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long port = std::strtoul(first, &end, 10);
+    if (errno == ERANGE || end == first || *end != '\0') return a;
+    if (port < 1 || port > 65535) return a;
+    a.port = std::uint16_t(port);
+    if (ok) *ok = true;
     return a;
 }
 

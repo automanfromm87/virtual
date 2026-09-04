@@ -943,6 +943,45 @@ int main() {
         CHECK(tunnelled == 0);
         CHECK(unresolved == 0);
 
+        // TWO BULLETS HEAD-ON, which is the case the sweep used to refuse.
+        //
+        // It skipped any body that was itself awake and moving, on the grounds
+        // that sweeping against a stale position would be worse than the gap.
+        // TimeOfImpact takes motion_a AND motion_b and works on their relative
+        // motion -- the call site was passing zero for the second. The right
+        // answer was implemented and simply not asked for.
+        //
+        // Neither one's own sweep sees the other move, so at a closing speed
+        // where each covers half the distance in a step, BOTH discrete tests
+        // miss and they pass through each other.
+        {
+            const auto duel = [](float speed) {
+                World w;
+                w.gravity = Vec3{0, 0, 0};
+                Body a = Ball(Vec3{-4, 0, 0}, 0.05f, 0.0f);
+                a.bullet = true;
+                a.velocity = Vec3{speed, 0, 0};
+                a.SetMass(0.02f);
+                Body b = Ball(Vec3{4, 0, 0}, 0.05f, 0.0f);
+                b.bullet = true;
+                b.velocity = Vec3{-speed, 0, 0};
+                b.SetMass(0.02f);
+                const int ia = w.Add(a), ib = w.Add(b);
+                for (int i = 0; i < 120; ++i) w.StepFixed();
+                // They started with a to the LEFT of b. If a ends up on the
+                // right they went through each other.
+                return w[ia].position.x - w[ib].position.x;
+            };
+            int passed_through = 0;
+            for (int i = 0; i < 24; ++i) {
+                const float speed = 30.0f + float(i) * 45.0f;
+                if (duel(speed) > 0.0f) ++passed_through;
+            }
+            std::printf("    24 head-on pairs from 30 to 1065 m/s each: %d passed "
+                        "through\n", passed_through);
+            CHECK(passed_through == 0);
+        }
+
         // A BOUNCING bullet. This is what distinguishes "the solver stopped
         // it" from "the sweep froze it": with restitution the correct answer is
         // that it comes back, and a body whose velocity was zeroed by the sweep

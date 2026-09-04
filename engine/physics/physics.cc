@@ -2029,22 +2029,37 @@ void World::StepFixed() {
             float toi = 1.0f;
             for (const Body& other : bodies_) {
                 if (&other == &b) continue;
-                // Only against things that are not themselves moving fast: two
-                // bullets meeting is a case this does not claim to handle, and
-                // pretending otherwise by sweeping against a stale position
-                // would be worse than the honest gap.
-                if (!other.IsStatic() && !other.sleeping) continue;
+                // AGAINST MOVING BODIES TOO. This used to skip anything awake
+                // and dynamic, on the stated grounds that "pretending otherwise
+                // by sweeping against a stale position would be worse than the
+                // honest gap" -- and that justification was simply wrong.
+                // TimeOfImpact takes motion_a AND motion_b, advances both, and
+                // works on their relative motion; this call site was passing
+                // zero for the second one. The correct answer was already
+                // implemented and was not being asked for.
+                //
+                // It matters most in the case the gap was named after: two
+                // bullets head-on, each covering half the distance in a step.
+                // Neither one's own sweep sees the other move, so both discrete
+                // tests miss and they pass through each other.
+                const Vec3 other_motion =
+                    other.IsStatic() ? Vec3{0.0f, 0.0f, 0.0f} : other.velocity * fixed_dt;
                 // A cheap reject first. If the swept sphere of one cannot reach
                 // the bounding sphere of the other, no sweep is needed -- and
                 // that is the overwhelmingly common case, which is what keeps
                 // this affordable at all.
+                //
+                // RELATIVE motion in the reach, not just this body's: two
+                // bodies closing at a combined speed cover more ground between
+                // them than either one does alone, and using one side's motion
+                // rejects the pair that needs the sweep most.
                 const float reach = b.shape.bounds_radius +
                                     other.shape.bounds_radius +
-                                    Length(motion);
+                                    Length(motion - other_motion);
                 if (Dot(other.position - b.position, other.position - b.position) >
                     reach * reach)
                     continue;
-                toi = std::fmin(toi, TimeOfImpact(b, other, motion, Vec3{0, 0, 0}));
+                toi = std::fmin(toi, TimeOfImpact(b, other, motion, other_motion));
             }
             if (toi < 1.0f) {
                 // Stop a little PAST the touch point, not exactly on it.

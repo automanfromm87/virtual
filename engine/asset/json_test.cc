@@ -103,6 +103,43 @@ int main() {
         CHECK(v["str"].IsString() && v["str"].Str() == "box");
     }
 
+    // --- deep nesting is refused, not crashed on -------------------------------
+    {
+        std::printf("deep nesting\n");
+        // ParseValue calls ParseArray which calls ParseValue: nesting in the
+        // INPUT is nesting on the C stack, one frame per bracket. Without a
+        // limit a few kilobytes of brackets takes the process down before any
+        // error can be returned -- and this is the one format here that is
+        // routinely handed bytes from somewhere else.
+        const auto nested = [](int n) {
+            return std::string(std::size_t(n), '[') + std::string(std::size_t(n), ']');
+        };
+        std::string error;
+        const Value shallow = Parse(nested(64), error);
+        std::printf("    64 deep: error \"%s\"\n", error.c_str());
+        CHECK(error.empty());
+        CHECK(shallow.IsArray());
+
+        error.clear();
+        Parse(nested(100000), error);
+        std::printf("    100000 deep: error \"%s\"\n", error.c_str());
+        CHECK(!error.empty());
+        CHECK(error.find("deep") != std::string::npos);
+
+        // AND THE COUNTER UNWINDS. A depth that is incremented on the way in
+        // and not decremented on the way out makes a long FLAT document fail
+        // as though it were deep -- which would be a worse bug than the one
+        // being fixed, and it would only show on real files.
+        error.clear();
+        std::string flat = "[";
+        for (int i = 0; i < 5000; ++i) flat += (i ? ",[1,[2]]" : "[1,[2]]");
+        flat += "]";
+        const Value wide = Parse(flat, error);
+        std::printf("    5000 siblings each 3 deep: error \"%s\"\n", error.c_str());
+        CHECK(error.empty());
+        CHECK(wide.Size() == 5000);
+    }
+
     if (g_failures == 0) std::printf("json_test: all checks passed\n");
     return g_failures == 0 ? 0 : 1;
 }

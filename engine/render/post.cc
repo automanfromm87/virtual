@@ -174,6 +174,20 @@ void PostStack::Impl::Resize(int w, int h) {
     output = dev->CreateRenderTarget(w, h, hdr_format);
     history[0] = dev->CreateRenderTarget(w, h, hdr_format);
     history[1] = dev->CreateRenderTarget(w, h, hdr_format);
+    // THE HISTORY IS GONE, so say so. These are brand new textures with
+    // undefined contents, and prev_view_proj still describes a frame at the OLD
+    // size -- so the velocity pass reprojects through a matrix for a
+    // differently shaped screen and every pixel samples the wrong place.
+    //
+    // NOT a flash of garbage, and it is worth being exact about that: the
+    // resolve clamps the history sample into the colour box of the current
+    // frame's 3x3 neighbourhood, so whatever is in that memory is bounded by
+    // what is plausible for the pixel. What it costs is one frame of history
+    // that is wrong rather than absent -- reduced antialiasing and a little
+    // smearing on the frame after a window resize. Small, but it is one line
+    // to not have, and "the previous frame does not exist" is exactly what this
+    // flag is for.
+    have_prev = false;
 }
 
 void PostStack::BeginFrame(const Camera& camera, int width, int height, float dt) {

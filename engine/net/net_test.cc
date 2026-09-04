@@ -608,6 +608,35 @@ int main() {
               "in roughly the right place after all that");
     }
 
+    {
+        std::printf("\naddresses are parsed or refused, never guessed\n");
+        // strtoul with no endptr and no range check converts things that are
+        // not ports into ports nobody asked for. Connecting to a port the
+        // caller did not name is worse than refusing the string.
+        const auto port_of = [](const char* text, bool* ok) {
+            return eng::net::Address::Parse(text, ok).port;
+        };
+        bool ok = false;
+        Check(port_of("127.0.0.1:7777", &ok) == 7777 && ok, "a real one works");
+        Check(port_of("127.0.0.1:65535", &ok) == 65535 && ok, "and so does the top of the range");
+
+        struct { const char* text; const char* why; } bad[] = {
+            {"127.0.0.1:99999", "out of range, and 99999 & 0xFFFF is 33983"},
+            {"127.0.0.1:-1", "negative, and strtoul wraps it to 65535"},
+            {"127.0.0.1:80xyz", "trailing junk, silently taken as 80"},
+            {"127.0.0.1:0", "port zero is not a port"},
+            {"127.0.0.1:", "empty"},
+            {"127.0.0.1: 80", "a space is not a digit"},
+            {"127.0.0.1:+80", "nor is a sign"},
+        };
+        for (const auto& b : bad) {
+            ok = true;
+            const std::uint16_t p = port_of(b.text, &ok);
+            std::printf("    %-18s -> port %5u, ok %d   (%s)\n", b.text, p, int(ok), b.why);
+            Check(!ok, b.why);
+        }
+    }
+
     std::printf(g_failures == 0 ? "\nnet_test: all checks passed\n"
                                 : "\nnet_test: %d FAILED\n", g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -311,6 +311,77 @@ int main() {
         CHECK(error.find("magic") != std::string::npos);
     }
 
+    // --- a sparse accessor cannot read past its own buffer ---------------------
+    {
+        std::printf("  sparse bounds\n");
+        // A HAND-WRITTEN MALICIOUS DOCUMENT, because the point is a count that
+        // does not match the bytes behind it and that is easier to state than
+        // to patch into a binary fixture.
+        //
+        // Four positions, and a sparse override list that CLAIMS nine entries
+        // over bufferViews holding two. Everything else is well formed. The
+        // reader used to check only that the override list STARTED inside the
+        // buffer and then read nine elements from it -- seven of them past the
+        // end, at offsets taken straight out of the file.
+        const char* kJson = R"({
+          "asset": {"version": "2.0"},
+          "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+          "accessors": [{
+            "bufferView": 0, "componentType": 5126, "count": 4, "type": "VEC3",
+            "sparse": {
+              "count": COUNT,
+              "indices": {"bufferView": 1, "componentType": 5125},
+              "values": {"bufferView": 2}
+            }
+          }],
+          "bufferViews": [
+            {"buffer": 0, "byteOffset": 0,  "byteLength": 48},
+            {"buffer": 0, "byteOffset": 48, "byteLength": 8},
+            {"buffer": 0, "byteOffset": 56, "byteLength": 24}
+          ],
+          "buffers": [{"byteLength": 80}]
+        })";
+        // 4 vec3 positions, 2 uint32 indices, 2 vec3 values = 80 bytes exactly.
+        std::vector<std::uint8_t> bin(80, 0);
+
+        const auto with_count = [&](const char* n) {
+            std::string j(kJson);
+            j.replace(j.find("COUNT"), 5, n);
+            return j;
+        };
+
+        // The honest version loads.
+        std::string error;
+        const gltf::Document ok = gltf::ParseGltf(with_count("2"), bin, error);
+        std::printf("    count 2 (the truth): %zu primitives, error \"%s\"\n",
+                    ok.primitives.size(), error.c_str());
+        CHECK(error.empty());
+        CHECK(ok.primitives.size() == 1);
+
+        // The lie is REFUSED rather than read.
+        error.clear();
+        const gltf::Document bad = gltf::ParseGltf(with_count("9"), bin, error);
+        std::printf("    count 9 over a 2-element list: error \"%s\"\n", error.c_str());
+        CHECK(bad.primitives.empty());
+        // THE SPECIFIC ERROR, not merely some error. With the old
+        // start-offset-only check this still failed -- but on the NEXT check
+        // along, "overrides an element that is not there", because the value it
+        // read from past the end of the buffer happened to be a large index.
+        // That is the out-of-bounds read succeeding and then being caught by
+        // luck downstream, which is exactly what this is supposed to prevent,
+        // and a test that accepts any error cannot tell the two apart.
+        CHECK(error.find("runs past its buffer") != std::string::npos);
+
+        // AND SO IS A NEGATIVE ONE. A signed count that goes negative turns
+        // into an enormous size_t the moment it is used as a length, which is
+        // the same bug wearing a different sign.
+        error.clear();
+        const gltf::Document neg = gltf::ParseGltf(with_count("-1"), bin, error);
+        std::printf("    count -1: error \"%s\"\n", error.c_str());
+        CHECK(neg.primitives.empty());
+        CHECK(!error.empty());
+    }
+
     // --- morph targets --------------------------------------------------
     {
         std::printf("morph targets\n");

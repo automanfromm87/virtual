@@ -1487,6 +1487,12 @@ bool Device::CommitAndWait(std::string& error) {
     return ok;
 }
 
+void Device::WaitForGpu() {
+    if (!impl_->submitted) return;  // nothing in flight, or already waited
+    [impl_->submitted waitUntilCompleted];
+    impl_->submitted = nil;
+}
+
 bool Device::ReadPixels(TextureId tex, int width, int height,
                         std::span<std::uint8_t> out) {
     if (!Valid(tex) || width <= 0 || height <= 0) return false;
@@ -1500,11 +1506,7 @@ bool Device::ReadPixels(TextureId tex, int width, int height,
     // invariant was already written down one function up; it just was not
     // enforced where it mattered.
     //
-    // No-op on the CommitAndWait path, which has already waited.
-    if (impl_->submitted) {
-        [impl_->submitted waitUntilCompleted];
-        impl_->submitted = nil;
-    }
+    WaitForGpu();
 
     // A Private texture has no CPU-visible contents; getBytes on one is a
     // Metal validation error rather than a silent zero fill.

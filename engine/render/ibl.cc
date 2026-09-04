@@ -440,6 +440,11 @@ void Environment::ReadLut(rhi::ComputeEncoder& enc, int size) {
 
 std::vector<Vec4> Environment::TakeCube() const {
     std::vector<Vec4> out;
+    // The copy ReadCube scheduled is GPU work, and a mapped pointer does not
+    // wait for it. Without this the caller gets whatever was in the buffer when
+    // it asked -- the previous bake, or half of this one -- and there is
+    // nothing in the values to say which.
+    impl_->dev->WaitForGpu();
     const auto* src = static_cast<const Vec4*>(impl_->dev->MapBuffer(impl_->readback));
     if (!src) return out;
     out.assign(src, src + impl_->readback_count);

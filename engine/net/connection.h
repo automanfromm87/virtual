@@ -59,9 +59,28 @@ struct ConnectionConfig {
     // accepting new ones rather than growing without bound -- an unbounded
     // queue on a dead connection is a memory leak that looks like lag.
     int max_pending_reliable = 256;
+    // The most OUT-OF-ORDER reliable messages held while waiting for the gap
+    // ahead of them to fill.
+    //
+    // The send side has had a bound since it was written; the receive side had
+    // none, and the receive side is the one fed by the network. A peer that
+    // sends ids scattered across the sequence space and never fills the gap
+    // makes this map grow until it has half the sequence space in it -- 32768
+    // messages of up to a packet each, which is not literally unbounded but is
+    // nine figures of memory arriving from someone else's decision.
+    //
+    // Over the limit the newest are DROPPED rather than the oldest evicted:
+    // reliable delivery is in order, so the oldest held message is the one
+    // closest to being deliverable and throwing it away guarantees the stall
+    // it is waiting on never resolves.
+    int max_held_reliable = 512;
 };
 
 struct ConnectionStats {
+    // Out-of-order reliable messages refused because the hold table was full.
+    // Non-zero means either a badly reordering path or a peer feeding gaps it
+    // never intends to fill.
+    std::uint32_t held_dropped = 0;
     std::uint32_t packets_sent = 0;
     std::uint32_t packets_received = 0;
     std::uint32_t packets_acked = 0;

@@ -297,6 +297,15 @@ std::vector<Received> Connection::Receive(float dt) {
             ++im.stats.duplicates_rejected;
             continue;
         }
+        if (int(im.held.size()) >= im.config.max_held_reliable &&
+            im.held.find(h.reliable_id) == im.held.end()) {
+            // Full, and this is not one already held. See max_held_reliable:
+            // the sender will resend it, and if the gap is never filled the
+            // connection is dead anyway -- which is a better outcome than
+            // holding everything it can invent.
+            ++im.stats.held_dropped;
+            continue;
+        }
         im.held[h.reliable_id] = std::vector<std::uint8_t>(payload.begin(), payload.end());
     }
 

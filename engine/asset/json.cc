@@ -31,9 +31,29 @@ class Parser {
   public:
     Parser(std::string_view text, std::string& error) : s_(text), error_(error) {}
 
+    // Counts nesting for the check in ParseValue, and un-counts it however the
+    // parse leaves -- there are early returns on every failure path.
+    struct DepthGuard {
+        int& d;
+        explicit DepthGuard(int& depth) : d(depth) { ++d; }
+        ~DepthGuard() { --d; }
+    };
+
+    // A GUARD, not a style choice. ParseValue calls ParseArray and ParseObject
+    // and both call back into ParseValue, so nesting in the INPUT becomes
+    // nesting on the C stack one frame per bracket. A few kilobytes of "[[[[["
+    // overflows it and the process dies before any error can be returned --
+    // and JSON is the one format here that is routinely handed untrusted bytes.
+    //
+    // 128 is far past anything a real document reaches; glTF's deepest
+    // structure is about six.
+    static constexpr int kMaxDepth = 128;
+
     Value ParseValue() {
         SkipSpace();
         if (Done()) return Fail("unexpected end of input");
+        if (depth_ >= kMaxDepth) return Fail("nested too deeply");
+        const DepthGuard guard(depth_);
         switch (Peek()) {
             case '{': return ParseObject();
             case '[': return ParseArray();
@@ -193,6 +213,7 @@ class Parser {
 
     std::string_view s_;
     std::string& error_;
+    int depth_ = 0;
     std::size_t i_ = 0;
 };
 

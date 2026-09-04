@@ -173,9 +173,12 @@ class Reader {
         }
 
         if (n > 0) {
-            const AccessorView idx = ViewOfBufferView(sp["indices"], 1);
-            const AccessorView val = ViewOfBufferView(sp["values"], v.components);
-            if (!idx.valid || !val.valid) { Fail("sparse accessor is malformed"); return v; }
+            const AccessorView idx = ViewOfBufferView(sp["indices"], 1, n);
+            const AccessorView val = ViewOfBufferView(sp["values"], v.components, n);
+            if (!idx.valid || !val.valid) {
+                Fail("sparse accessor's index or value list runs past its buffer");
+                return v;
+            }
             for (int i = 0; i < n; ++i) {
                 const std::uint32_t target = ReadIndex(idx, i);
                 // An override aimed past the end is a corrupt file, not a
@@ -198,7 +201,21 @@ class Reader {
 
     // A bufferView referenced directly, the way a sparse accessor's index and
     // value arrays are — they carry their own componentType and no count.
-    AccessorView ViewOfBufferView(const json::Value& spec, int components) {
+    // A view over a bufferView for a sparse accessor's index or value list.
+    //
+    // `count` IS NOT OPTIONAL, and leaving it out was a genuine out-of-bounds
+    // read. This used to check only that the start offset was inside the
+    // buffer; the caller then read `count` elements from it, with `count`
+    // taken straight out of the file. A .glb claiming 9 overrides over a
+    // bufferView holding 2 reads 7 elements past the end of the buffer, and
+    // the offsets are entirely attacker-controlled.
+    //
+    // The main accessor path in View() has always had this check. Only this
+    // one, reached solely by a sparse accessor, did not -- which is why it
+    // survived: sparse is the rare path, and the base of a sparse accessor is
+    // bounds-checked a few lines up, so the code around it looked careful.
+    AccessorView ViewOfBufferView(const json::Value& spec, int components,
+                                  int count) {
         AccessorView v;
         const int bv_index = spec["bufferView"].Int(-1);
         if (bv_index < 0) return v;
@@ -213,7 +230,13 @@ class Reader {
         const std::size_t off = std::size_t(bv["byteOffset"].Int(0)) +
                                 std::size_t(spec["byteOffset"].Int(0));
         const std::vector<std::uint8_t>& data = buffers_[std::size_t(buf)];
-        if (off >= data.size()) return v;
+        if (count < 0) return v;
+        // The same bound View() uses: the last element has to end inside the
+        // buffer, not merely start inside it.
+        const std::size_t need =
+            off + v.stride * std::size_t(count > 0 ? count - 1 : 0) + v.stride;
+        if (count > 0 && (off >= data.size() || need > data.size())) return v;
+        v.count = count;
         v.base = data.data() + off;
         v.valid = true;
         return v;

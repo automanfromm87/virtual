@@ -697,6 +697,19 @@ class Device {
     [[nodiscard]] bool CommitAndWait(std::string& error);
 
     // Blocking readback of a render target. Offscreen paths only.
+    // Blocks until the most recently submitted work has finished.
+    //
+    // ANY CPU READ OF SOMETHING THE GPU WROTE NEEDS THIS FIRST. Neither
+    // getBytes nor a mapped pointer synchronises -- they hand back whatever is
+    // in memory at the instant they are called, which for work still in flight
+    // is a partial result with no indication that it is one. ReadPixels calls
+    // it for you; a caller reading a storage buffer through MapBuffer has to
+    // call it itself, because MapBuffer is also how per-frame uploads are
+    // written and waiting there would stall every one of them.
+    //
+    // A no-op after CommitAndWait, which has already waited.
+    void WaitForGpu();
+
     [[nodiscard]] bool ReadPixels(TextureId, int width, int height,
                                   std::span<std::uint8_t> out_rgba);
 
