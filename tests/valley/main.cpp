@@ -58,6 +58,7 @@ struct Run {
     int draws = 0;
     int shadow_draws = 0;
     int shadow_culled = 0;
+    int slices = -1;
     double mean = -1.0;  // mean channel value of the capture, HUD excluded
     std::string log;
 };
@@ -153,9 +154,9 @@ Run RunWorld(const std::string& tag, std::vector<std::string> args,
     if (at != std::string::npos)
         std::sscanf(r.log.c_str() + at,
                     "summary: peak in flight %d, gpu faults %d, dropped %d, "
-                    "instances %d, draws %d, shadow %d/%d culled",
+                    "instances %d, draws %d, shadow %d/%d culled, slices %d",
                     &r.peak_in_flight, &r.faults, &r.dropped, &r.instances,
-                    &r.draws, &r.shadow_draws, &r.shadow_culled);
+                    &r.draws, &r.shadow_draws, &r.shadow_culled, &r.slices);
 
     std::string error;
     const eng::Texture2D img = eng::png::DecodeFile(shot, error);
@@ -189,6 +190,14 @@ int main() {
     Check(base.faults == 0, "the GPU reported no fault");
     Check(base.peak_in_flight > 0 && base.peak_in_flight <= 3,
           "no more frames were in flight than the ring has slots");
+    // THE DEPTH-ONLY PASSES TAKE ONE SLICE EACH, however many casters they
+    // draw. Before the DepthPass/DepthDraw split they took one per caster per
+    // cascade, which is 478 + 164 of the frame's 806. Six slices of slack in
+    // the bound, for the fullscreen passes and the UI.
+    std::printf("    %d ring slices for %d draws + %d shadow draws\n", base.slices,
+                base.draws, base.shadow_draws);
+    Check(base.slices > 0 && base.slices <= base.draws + 8,
+          "the shadow and depth passes cost one uniform slice each, not one per draw");
 
     // --- the shadow pass culls ----------------------------------------------
     //
@@ -234,6 +243,20 @@ int main() {
     Check(c2000.draws > 0, "the scene pass drew something");
     Check(c2000.mean > base.mean * 0.5,
           "and the frame is lit, not the black one the ring used to produce");
+
+    // --- the headroom the split bought --------------------------------------
+    //
+    // 6000 boulders is 12,010 shadow draws. Before the split that was 12,010
+    // ring slices against a ceiling of 8192 and the frame was black; it is 2703
+    // now, because the depth-only passes stopped paying per caster.
+    std::printf("--crowd 6000, which the ring could not hold at all\n");
+    const Run c6000 = RunWorld("c6000", {"--frames", "60", "--crowd", "6000"});
+    std::printf("    %d instances, %d shadow draws, %d slices, %d dropped, mean %.2f\n",
+                c6000.instances, c6000.shadow_draws, c6000.slices, c6000.dropped,
+                c6000.mean);
+    Check(c6000.exited && c6000.status == 0, "6000 boulders runs clean");
+    Check(c6000.dropped == 0 && c6000.mean > base.mean * 0.5,
+          "12,010 shadow draws fit in a ring of 8192, and the frame is lit");
 
     // --- the GPU-driven path ------------------------------------------------
     std::printf("--indirect\n");

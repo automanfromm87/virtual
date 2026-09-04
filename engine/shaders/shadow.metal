@@ -4,9 +4,14 @@
 // nothing is being shaded: the pass exists purely to record, for every texel of
 // the light's view, how far away the nearest surface is.
 //
-// It reuses FrameUniforms rather than declaring its own block, so the model
-// matrix means the same thing in both passes. Two structs that must agree is
-// exactly the drift this engine's layout contract exists to prevent.
+// TWO BLOCKS, not one. It read the whole of FrameUniforms to use three of its
+// fields, which cost a 656-byte write and a slice of the frame-wide uniform
+// ring for every caster in every cascade -- and that ring going dry is what
+// makes a frame come out black. DepthPass is bound once per cascade; DepthDraw
+// is the model matrix and goes straight into the command buffer.
+//
+// The model matrix still means the same thing it does in the lit pass, which is
+// what the shared shader_types.h contract is for.
 
 struct ShadowOut {
     float4 position [[position]];
@@ -15,12 +20,14 @@ struct ShadowOut {
 
 vertex ShadowOut vs_shadow(uint                     vid   [[vertex_id]],
                            device const VertexIn*   verts [[buffer(0)]],
-                           constant FrameUniforms&  u     [[buffer(1)]])
+                           constant DepthPass&      p     [[buffer(1)]],
+                           constant DepthDraw&      d     [[buffer(5)]])
 {
-    const float4 world = u.model * float4(verts[vid].position.xyz, 1.0f);
+    const float4 world = d.model * float4(verts[vid].position.xyz, 1.0f);
     ShadowOut o;
-    // lightViewProj, NOT viewProj: this is the world seen from the light.
-    o.position = u.lightViewProj * world;
+    // The LIGHT's viewProj in a cascade, the camera's in the prepass. One field
+    // rather than two, because a pass is only ever one of the two.
+    o.position = p.viewProj * world;
     o.worldY = world.y;
     return o;
 }
@@ -30,9 +37,10 @@ vertex ShadowOut vs_shadow(uint                     vid   [[vertex_id]],
 // and in the wrong place, which reads as a lighting bug.
 vertex ShadowOut vs_shadow_skinned(uint                     vid     [[vertex_id]],
                                    device const VertexIn*   verts   [[buffer(0)]],
-                                   constant FrameUniforms&  u       [[buffer(1)]],
+                                   constant DepthPass&      p       [[buffer(1)]],
                                    device const SkinIn*     skin    [[buffer(2)]],
-                                   device const float4x4*   palette [[buffer(3)]])
+                                   device const float4x4*   palette [[buffer(3)]],
+                                   constant DepthDraw&      d       [[buffer(5)]])
 {
     const SkinIn s = skin[vid];
     float4x4 blend = float4x4(0.0f);
@@ -45,9 +53,9 @@ vertex ShadowOut vs_shadow_skinned(uint                     vid     [[vertex_id]
     }
     if (total <= 0.0f) blend = float4x4(1.0f);
 
-    const float4 world = u.model * (blend * float4(verts[vid].position.xyz, 1.0f));
+    const float4 world = d.model * (blend * float4(verts[vid].position.xyz, 1.0f));
     ShadowOut o;
-    o.position = u.lightViewProj * world;
+    o.position = p.viewProj * world;
     o.worldY = world.y;
     return o;
 }
@@ -60,7 +68,7 @@ vertex ShadowOut vs_shadow_skinned(uint                     vid     [[vertex_id]
 // full height, so every room sits in the shadow of a roof you already removed.
 // The symptom looks like a lighting bug and is a shadow-pass bug.
 fragment void fs_shadow(ShadowOut in [[stage_in]],
-                        constant FrameUniforms& u [[buffer(1)]])
+                        constant DepthPass& p [[buffer(1)]])
 {
-    if (in.worldY > u.surface.w) discard_fragment();
+    if (in.worldY > p.cut.x) discard_fragment();
 }

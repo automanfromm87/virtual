@@ -83,6 +83,8 @@ constexpr char kMeshletSrc[] = {
 
 // CPU and GPU must agree byte-for-byte. Assert it — do not hope for it.
 static_assert(sizeof(FrameUniforms) == 656, "FrameUniforms layout drifted");
+static_assert(sizeof(DepthPass) == 80, "DepthPass layout drifted");
+static_assert(sizeof(DepthDraw) == 64, "DepthDraw layout drifted");
 static_assert(sizeof(GpuClusters) == 64, "GpuClusters layout drifted");
 static_assert(sizeof(GpuLight) == 144, "GpuLight layout drifted");
 static_assert(sizeof(GpuCascades) == 288, "GpuCascades layout drifted");
@@ -118,23 +120,13 @@ constexpr int kClusterIndexSlot = 7;    // FRAGMENT: the per-cell light indices
 // name says "skin" is how a future skinned-and-instanced draw gets one of them
 // silently overwritten.
 constexpr int kInstanceSlot = 4;
+// VERTEX stage: the per-draw block of a depth-only pass -- DepthDraw, which is
+// one matrix. Sent with SetVertexBytes rather than out of the uniform ring, so
+// a shadow cascade over a thousand casters allocates nothing.
+constexpr int kDrawSlot = 5;
 
-// Ring capacity per frame slot. Exceeding it drops draws rather than corrupting
-// the frame -- see the clamp in DrawScene.
-//
-// It was 1024, and a scene of 6000 objects showed why that is not merely
-// "some objects go missing". The ring is shared by EVERY pass: when the scene
-// pass exhausts it, the composite that follows asks for a slice, gets none, and
-// silently draws nothing. The frame comes out BLACK -- not partially drawn --
-// and the only clue is a stats field nobody reads on a frame that rendered
-// nothing at all.
-//
-// 8192 at 512 bytes a slice is 4 MB per frame slot, 12 MB in flight. That is a
-// real cost and it is the right trade: past 8192 draws in one frame the answer
-// is CullScene and DrawSceneIndirect, which need three slices for six thousand
-// objects instead of six thousand.
-constexpr std::size_t kMaxInstancesPerFrame =
-    std::size_t(Renderer::kMaxInstancesPerFrame);
+// kMaxInstancesPerFrame lives on Renderer now, so a test can size itself against
+// it rather than writing the number down. See renderer.h for what it costs.
 
 std::size_t AlignUp(std::size_t v, std::size_t a) { return ((v + a - 1) / a) * a; }
 
@@ -741,6 +733,9 @@ int Renderer::ShadowDrawCount() const { return impl_->shadow_draws; }
 int Renderer::ShadowCulledCount() const { return impl_->shadow_culled; }
 int Renderer::ShadowOverflowCount() const { return impl_->shadow_overflowed; }
 int Renderer::DroppedThisFrame() const { return impl_->DroppedThisFrame(); }
+int Renderer::UniformSlicesThisFrame() const {
+    return impl_->dev->FrameIndex() == impl_->last_frame ? int(impl_->cursor) : 0;
+}
 
 std::uint32_t Renderer::PipelineOf(MaterialHandle m) const {
     if (!Valid(m) || m.v >= impl_->materials.size()) return 0;
@@ -1499,12 +1494,7 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
     // mesh in this engine is closed.
     enc.SetCull(rhi::Cull::Front, rhi::Winding::CounterClockwise);
 
-    // Once the shared ring is dry it stays dry for the rest of the frame, so
-    // the remaining cascades have nothing to do but re-discover that. The old
-    // `break` left the instance loop only, and the cascades after it rendered
-    // empty tiles at full price.
-    bool ring_dry = false;
-    for (int cascade = 0; cascade < cascades && !ring_dry; ++cascade) {
+    for (int cascade = 0; cascade < cascades; ++cascade) {
     const Mat4 lightViewProj =
         cascades > 1 ? scene.CascadeViewProj(cascade, aspect) : scene.LightViewProj();
     // CULLED PER CASCADE, and the reason is that this loop is per cascade:
@@ -1519,6 +1509,27 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
     // are inside it, and anything still outside cannot write a texel. Which
     // makes this free work removed, not shadows removed.
     const Frustum light_frustum = Frustum::FromViewProj(lightViewProj);
+    // ONE SLICE FOR THE WHOLE CASCADE. What varies per draw is the model
+    // matrix, and that goes into the command buffer directly below -- so a
+    // cascade over a thousand casters costs one ring slice, not a thousand.
+    const std::size_t pass_offset = impl_->AllocUniform();
+    if (pass_offset == Impl::kNoSpace) {
+        impl_->shadow_overflowed += int(scene.instances.size()) * (cascades - cascade);
+        impl_->NoteDrop(int(scene.instances.size()) * (cascades - cascade));
+        break;
+    }
+    {
+        DepthPass p{};
+        p.viewProj = lightViewProj;
+        p.cut = Vec4{scene.clipY, 0.0f, 0.0f, 0.0f};
+        std::memcpy(impl_->uniform_map + pass_offset, &p, sizeof(p));
+    }
+    enc.SetVertexBuffer(impl_->uniforms, pass_offset, kUniformSlot);
+    // FRAGMENT too. fs_shadow reads the cut out of the same block, and an
+    // unbound fragment buffer reads as zero rather than failing -- so the cut
+    // plane silently becomes y = 0 and every caster above the origin stops
+    // casting. The symptom looks like a lighting bug and is a missing bind.
+    enc.SetFragmentBuffer(impl_->uniforms, pass_offset, kUniformSlot);
     if (cascades > 1) {
         enc.SetViewport((cascade % per_side) * tile_px, (cascade / per_side) * tile_px,
                         tile_px, tile_px);
@@ -1562,21 +1573,6 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
             }
         }
 
-        const std::size_t offset = impl_->AllocUniform();
-        if (offset == Impl::kNoSpace) {
-            // THE RING IS SHARED WITH EVERY PASS THAT FOLLOWS. Breaking out
-            // quietly is how the scene pass gets no slices at all and the frame
-            // comes out black with nothing to point at, so count what was lost
-            // and let the caller see it: the rest of this cascade, and all of
-            // every cascade after it.
-            const int lost = int(scene.instances.size() - n) +
-                             int(scene.instances.size()) * (cascades - 1 - cascade);
-            impl_->shadow_overflowed += lost;
-            impl_->NoteDrop(lost);
-            ring_dry = true;
-            break;
-        }
-
         std::size_t palette_offset = Impl::kNoSpace;
         if (skinned) {
             palette_offset = impl_->AllocPalette();
@@ -1592,23 +1588,9 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
             bound_shadow = want;
         }
 
-        FrameUniforms u{};
-        u.lightViewProj = lightViewProj;
-        u.model = inst.model;
-        // The cut has to reach the shadow map too, or a cutaway renders its
-        // interior in the shadow of the roof it just removed.
-        u.surface = Vec4{0.0f, 0.0f, 0.0f, scene.clipY};
-        std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
-
+        const DepthDraw d{inst.model};
         enc.SetVertexBuffer(gm.vb, 0, kVertexSlot);
-        enc.SetVertexBuffer(impl_->uniforms, offset, kUniformSlot);
-        // FRAGMENT too. fs_shadow reads clipY out of the same block, and an
-        // unbound fragment buffer reads as zero rather than failing — so the
-        // cut plane silently becomes y = 0 and every caster above the origin
-        // is discarded from the shadow map. The symptom is that objects high
-        // off the ground stop casting, which looks like a lighting bug and is
-        // a missing bind.
-        enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
+        enc.SetVertexBytes(&d, sizeof(d), kDrawSlot);
         if (skinned) {
             enc.SetVertexBuffer(gm.skin_vb, 0, kSkinSlot);
             enc.SetVertexBuffer(impl_->palettes, palette_offset, kPaletteSlot);
@@ -1676,15 +1658,27 @@ void Renderer::DrawLightShadows(rhi::Encoder& enc, const Scene& scene) {
 
             const Mat4 light_vp = faces == 1 ? light.ViewProj()
                                              : light.CubeFaceViewProj(f);
+            // ONE SLICE PER FACE, as in DrawShadow. Sixteen tiles over sixty
+            // lights used to be sixteen slices per caster.
+            const std::size_t pass_offset = impl_->AllocUniform();
+            if (pass_offset == Impl::kNoSpace) {
+                impl_->NoteDrop(int(scene.instances.size()));
+                break;
+            }
+            {
+                DepthPass p{};
+                p.viewProj = light_vp;
+                p.cut = Vec4{scene.clipY, 0.0f, 0.0f, 0.0f};
+                std::memcpy(impl_->uniform_map + pass_offset, &p, sizeof(p));
+            }
+            enc.SetVertexBuffer(impl_->uniforms, pass_offset, kUniformSlot);
+            enc.SetFragmentBuffer(impl_->uniforms, pass_offset, kUniformSlot);
             for (const Instance& inst : scene.instances) {
                 if (!Valid(inst.mesh) || inst.mesh.v >= impl_->meshes.size()) continue;
                 if (Valid(inst.material) && inst.material.v < impl_->materials.size() &&
                     impl_->materials[inst.material.v].transparent)
                     continue;
                 const GpuMesh& gm = impl_->meshes[inst.mesh.v];
-                const std::size_t offset = impl_->AllocUniform();
-                if (offset == Impl::kNoSpace) { impl_->NoteDrop(1); break; }
-
                 const bool skinned = IsSkinned(gm, inst, scene);
                 std::size_t palette_offset = Impl::kNoSpace;
                 if (skinned) {
@@ -1701,15 +1695,9 @@ void Renderer::DrawLightShadows(rhi::Encoder& enc, const Scene& scene) {
                     bound = want;
                 }
 
-                FrameUniforms u{};
-                u.lightViewProj = light_vp;
-                u.model = inst.model;
-                u.surface = Vec4{0.0f, 0.0f, 0.0f, scene.clipY};
-                std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
-
+                const DepthDraw d{inst.model};
                 enc.SetVertexBuffer(gm.vb, 0, kVertexSlot);
-                enc.SetVertexBuffer(impl_->uniforms, offset, kUniformSlot);
-                enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
+                enc.SetVertexBytes(&d, sizeof(d), kDrawSlot);
                 if (skinned) {
                     enc.SetVertexBuffer(gm.skin_vb, 0, kSkinSlot);
                     enc.SetVertexBuffer(impl_->palettes, palette_offset, kPaletteSlot);
@@ -1742,8 +1730,23 @@ void Renderer::DrawSceneDepth(rhi::Encoder& enc, const Scene& scene, int width,
     // exists to accelerate.
     const Frustum frustum = Frustum::FromViewProj(viewProj);
 
+    // ONE SLICE FOR THE PASS, as in DrawShadow and for the same reason.
+    const std::size_t pass_offset = impl_->AllocUniform();
+    if (pass_offset == Impl::kNoSpace) {
+        impl_->NoteDrop(int(scene.instances.size()));
+        return;
+    }
+    {
+        DepthPass p{};
+        p.viewProj = viewProj;
+        p.cut = Vec4{scene.clipY, 0.0f, 0.0f, 0.0f};
+        std::memcpy(impl_->uniform_map + pass_offset, &p, sizeof(p));
+    }
+
     rhi::PipelineId bound;
     enc.SetCull(rhi::Cull::Back, rhi::Winding::CounterClockwise);
+    enc.SetVertexBuffer(impl_->uniforms, pass_offset, kUniformSlot);
+    enc.SetFragmentBuffer(impl_->uniforms, pass_offset, kUniformSlot);
     for (const Instance& inst : scene.instances) {
         if (!Valid(inst.mesh) || inst.mesh.v >= impl_->meshes.size()) continue;
         if (Valid(inst.material) && inst.material.v < impl_->materials.size() &&
@@ -1761,9 +1764,6 @@ void Renderer::DrawSceneDepth(rhi::Encoder& enc, const Scene& scene, int width,
                                           gm.bounds.radius * MaxScale(inst.model)))
                 continue;
         }
-        const std::size_t offset = impl_->AllocUniform();
-        if (offset == Impl::kNoSpace) { impl_->NoteDrop(1); break; }
-
         std::size_t palette_offset = Impl::kNoSpace;
         if (skinned) {
             palette_offset = impl_->AllocPalette();
@@ -1778,15 +1778,9 @@ void Renderer::DrawSceneDepth(rhi::Encoder& enc, const Scene& scene, int width,
             bound = want;
         }
 
-        FrameUniforms u{};
-        u.lightViewProj = viewProj;
-        u.model = inst.model;
-        u.surface = Vec4{0.0f, 0.0f, 0.0f, scene.clipY};
-        std::memcpy(impl_->uniform_map + offset, &u, sizeof(u));
-
+        const DepthDraw d{inst.model};
         enc.SetVertexBuffer(gm.vb, 0, kVertexSlot);
-        enc.SetVertexBuffer(impl_->uniforms, offset, kUniformSlot);
-        enc.SetFragmentBuffer(impl_->uniforms, offset, kUniformSlot);
+        enc.SetVertexBytes(&d, sizeof(d), kDrawSlot);
         if (skinned) {
             enc.SetVertexBuffer(gm.skin_vb, 0, kSkinSlot);
             enc.SetVertexBuffer(impl_->palettes, palette_offset, kPaletteSlot);

@@ -2679,11 +2679,12 @@ int main(int argc, char** argv) {
             // it must never exceed kFramesInFlight, and the GI re-bake used to
             // leak a permit per bake until the third one blocked forever.
             std::printf("summary: peak in flight %d, gpu faults %d, dropped %d, "
-                        "instances %zu, draws %d, shadow %d/%d culled\n",
+                        "instances %zu, draws %d, shadow %d/%d culled, slices %d\n",
                         app->Gpu().PeakFramesInFlight(), app->Gpu().GpuFaultCount(),
                         app->Draw().DroppedThisFrame(), scene.instances.size(),
                         app->Draw().LastStats().draws, app->Draw().ShadowDrawCount(),
-                        app->Draw().ShadowCulledCount());
+                        app->Draw().ShadowCulledCount(),
+                        app->Draw().UniformSlicesThisFrame());
             return 0;
         }
     }

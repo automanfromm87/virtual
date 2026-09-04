@@ -23,6 +23,32 @@ struct EngUVec4 { std::uint32_t x = 0, y = 0, z = 0, w = 0; };
 #  define ENG_UVEC4 ::EngUVec4
 #endif
 
+// --- the depth-only passes -------------------------------------------------
+//
+// The shadow cascades and the camera depth prepass read three things between
+// them, and only ONE of them varies per draw. They used to be handed the whole
+// of FrameUniforms -- 656 bytes written to set a matrix and a float, once per
+// caster per cascade -- out of a ring shared with every other pass in the
+// frame. That is the ring whose exhaustion turns the frame black, and these two
+// passes were 80% of its traffic.
+//
+// So: the pass block goes in the ring once per cascade, and the model matrix
+// goes straight into the command buffer with SetVertexBytes, which allocates
+// nothing at all.
+struct DepthPass {
+    // The light's, for a shadow cascade; the camera's, for the prepass.
+    ENG_MAT4 viewProj;
+    // .x is the section cut's world Y -- fragments above it are discarded, and
+    // it has to reach the shadow map too or a cutaway sits in the shadow of the
+    // roof it just removed. The rest is padding, and stays padding: anything
+    // that varies per DRAW does not belong in this block.
+    ENG_VEC4 cut;
+};
+
+struct DepthDraw {
+    ENG_MAT4 model;  // object -> world, and the only thing that varies per draw
+};
+
 struct FrameUniforms {
     ENG_MAT4 viewProj;
     ENG_MAT4 model;  // object -> world. Normals use this too (rotation only).

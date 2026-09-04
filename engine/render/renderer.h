@@ -295,11 +295,23 @@ class Renderer {
     // full. Overflowing drops the draw, and shows up in RenderStats::overflowed.
     static constexpr int kMaxSkinnedPerFrame = 16;
     // How many uniform slices one frame may allocate, across EVERY pass -- the
-    // ring is shared. Public because a test that guards the allocator's
-    // per-frame reset has to outrun it, and a test that hard-codes the number
-    // stops guarding anything the day the number changes. tests/frames did
-    // exactly that: both its loops were sized against 1024 and the ring has
-    // been 8192 for some time, so neither reached the cliff any more.
+    // ring is shared, and that sharing is the whole hazard. It was 1024, and a
+    // scene of 6000 objects showed why exceeding it is not merely "some objects
+    // go missing": when one pass exhausts the ring the composite that follows
+    // asks for a slice, gets none, and silently draws nothing, so the frame
+    // comes out BLACK rather than partially drawn. Renderer::DroppedThisFrame
+    // is what makes that visible now.
+    //
+    // 8192 at 768 bytes a slice is 6.3 MB per frame slot and 18.9 MB in flight.
+    // A real cost and the right trade: past 8192 draws in one frame the answer
+    // is CullScene and DrawSceneIndirect, which need three slices for six
+    // thousand objects instead of six thousand. The depth-only passes need one
+    // slice each however many casters they draw -- see DepthPass.
+    //
+    // Public because a test that guards the allocator's per-frame reset has to
+    // outrun it, and a test that hard-codes the number stops guarding anything
+    // the day the number changes. tests/frames did exactly that: both its loops
+    // were sized against 1024, so neither reached the cliff any more.
     static constexpr int kMaxInstancesPerFrame = 8192;
 
     // Joints the mesh was uploaded with, or 0 if it is not skinned.
@@ -773,6 +785,10 @@ class Renderer {
     // frame on screen is wrong. Reset per frame, keyed on the device's frame
     // index, so it is correct whichever pass asks.
     [[nodiscard]] int DroppedThisFrame() const;
+    // Slices of the shared uniform ring this frame has taken, against
+    // kMaxInstancesPerFrame. The pair is the point: `dropped` says the ring ran
+    // out, this says how close the frame is to it before it does.
+    [[nodiscard]] int UniformSlicesThisFrame() const;
     // Which pipeline a material resolved to. Exposed so a test can assert the
     // cache's actual INVARIANT — that two materials differing only in encoder
     // state share one pipeline — instead of a total count, which goes stale
