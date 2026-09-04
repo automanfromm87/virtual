@@ -91,8 +91,16 @@ int main() {
         Check(std::memcmp(cooked.vertices.data(), sphere.vertices.data(),
                           sphere.vertices.size() * sizeof(VertexIn)) == 0,
               "and vertex data identical to the source");
-        Check(std::memcmp(cooked.indices.data(), sphere.indices.data(),
-                          sphere.indices.size() * sizeof(std::uint16_t)) == 0,
+        // THE LENGTH IS THE ASSERTION. This compared sizeof(uint16_t) per
+        // index against a std::vector<std::uint32_t>, which is the same wrong
+        // number the writer used -- so the two halves of the bug agreed and the
+        // check could not fail. Comparing the span's own size is what makes it
+        // an assertion about the file rather than about the test's arithmetic.
+        Check(cooked.indices.size() == sphere.indices.size() * sizeof(std::uint32_t),
+              "and the index block is 32-bit, as Mesh::indices is");
+        Check(cooked.indices.size() == sphere.indices.size() * sizeof(std::uint32_t) &&
+                  std::memcmp(cooked.indices.data(), sphere.indices.data(),
+                              cooked.indices.size()) == 0,
               "and index data identical too");
 
         // ALIGNED. A vertex block starting on an odd byte works on Apple

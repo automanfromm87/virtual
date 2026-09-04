@@ -2590,14 +2590,13 @@ int main(int argc, char** argv) {
             graph.AddPass(p);
         }
         if (!graph.Compile(error)) return Fail(error);
-        // SKINNING, before anything draws the mesh it produces. Outside the
-        // graph because it writes vertex BUFFERS, which the graph does not
-        // track -- the same reason the light binning below is out here.
-        {
-            auto e = app->Gpu().BeginCompute("skin");
-            (void)app->Draw().SkinToBuffers(e, scene);
-            app->Gpu().EndCompute();
-        }
+        // NO SKINNING DISPATCH. It was here, and it produced a buffer this app
+        // never read: SkinToBuffers' output reaches the world only through
+        // Renderer::PosedVertices, whose only consumer is BuildSceneAccel,
+        // which apps/world does not call. The forward path poses the mesh in
+        // its own vertex stage. One compute encoder and one palette upload a
+        // frame, for nothing. The engine keeps the entry point -- ray-traced
+        // shadows from a posed mesh need it, and tests/skinned covers that.
         // BINNING, outside the graph for the same reason the exposure meter is:
         // it writes BUFFERS, and the graph orders passes by the textures they
         // write. Before the scene pass, not after -- unlike the meter, this

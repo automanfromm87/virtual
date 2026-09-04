@@ -58,7 +58,6 @@ enum class Shading : std::uint8_t {
     RayShadow,
     // STEREO. The same fragment stage as Lit, with a vertex stage that emits
     // both eyes from one invocation.
-    LitStereo,
     // ORDER-INDEPENDENT TRANSPARENCY. OitAccumulate writes the two commutative
     // buffers; OitResolve is the fullscreen pass that turns them into one
     // premultiplied colour to blend over the opaque frame.
@@ -724,18 +723,6 @@ class Renderer {
     // pipeline built. A no-op that says nothing is indistinguishable from an
     // empty scene.
     [[nodiscard]] const std::string& MeshletError() const;
-
-    // STEREO RENDERING, into a two-layer target, in ONE pass.
-    //
-    // `right` is the second eye's camera. The scene's own camera is the left
-    // eye, so a monoscopic caller changes nothing.
-    //
-    // One pass and not two. The vertex stage runs once and emits both views, so
-    // the draw calls, the state changes, the index fetches and the frustum
-    // culling are all paid once -- and the geometry submitted for the two eyes
-    // is identical anyway, which is why paying twice for it is pure waste.
-    void DrawSceneStereo(rhi::Encoder&, const Scene&, const Camera& right,
-                         int width, int height, rhi::TextureId shadow_map = {});
 
     // The light list and the cascade block this frame, for a pass outside the
     // renderer that has to agree with it.

@@ -57,7 +57,7 @@ enum class AssetType : std::uint32_t {
 // to know about them without looking.
 //
 // The vertex block is an array of VertexIn and the index block an array of
-// uint16, both in the engine's one and only layout -- so `CreateBuffer(vertices)`
+// uint32, both in the engine's one and only layout -- so `CreateBuffer(vertices)`
 // is the whole of loading it. A format that stored positions and normals in
 // separate streams, or in a different precision, would need a conversion pass
 // and would stop being a memcpy.

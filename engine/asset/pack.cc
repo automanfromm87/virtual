@@ -104,14 +104,24 @@ void PackWriter::AddMesh(std::string_view name, const Mesh& mesh) {
     h.vertex_count = std::uint32_t(mesh.vertices.size());
     h.index_count = std::uint32_t(mesh.indices.size());
     h.vertex_stride = std::uint32_t(sizeof(VertexIn));
-    h.index_stride = std::uint32_t(sizeof(std::uint16_t));
+    // 32-BIT, which is what Mesh::indices actually holds. It said uint16_t --
+    // so the header advertised a stride the data did not have, the index block
+    // was sized at HALF what the indices need, and the memcpy below copied that
+    // many bytes out of a uint32 array. What came back was the low half of the
+    // index list reinterpreted as pairs of shorts. It survived because
+    // pack_test compared the same halved length, under a comment reading
+    // "BYTE FOR BYTE, which is the whole claim" -- a test that cannot fail.
+    //
+    // 32-bit indices are not an option here either: engine/render uploads
+    // uint32 and the README's "a mesh has no vertex ceiling" depends on it.
+    h.index_stride = std::uint32_t(sizeof(std::uint32_t));
     h.centre[0] = mesh.bounds.center.x;
     h.centre[1] = mesh.bounds.center.y;
     h.centre[2] = mesh.bounds.center.z;
     h.radius = mesh.bounds.radius;
 
     const std::size_t vertex_bytes = mesh.vertices.size() * sizeof(VertexIn);
-    const std::size_t index_bytes = mesh.indices.size() * sizeof(std::uint16_t);
+    const std::size_t index_bytes = mesh.indices.size() * sizeof(std::uint32_t);
     // The vertex block starts on a sixteen-byte boundary WITHIN the payload, so
     // that an aligned payload gives an aligned vertex block.
     const std::size_t vertex_at = Align16(sizeof(MeshHeader));
@@ -323,7 +333,7 @@ bool Pack::GetMesh(std::string_view name, CookedMesh* out) const {
     // layout -- and a mesh reinterpreted at the wrong stride is not a crash,
     // it is a shape nobody recognises, which reads as a broken exporter.
     if (h.vertex_stride != sizeof(VertexIn) ||
-        h.index_stride != sizeof(std::uint16_t))
+        h.index_stride != sizeof(std::uint32_t))
         return false;
 
     const std::size_t vertex_at = Align16(sizeof(MeshHeader));
