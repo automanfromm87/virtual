@@ -374,16 +374,27 @@ class Renderer {
     // Depth-only pass from the light's point of view. Must run BEFORE
     // DrawScene, into a pass whose depth target is `shadow_map`.
     //
-    // Does NOT frustum-cull: an object outside the CAMERA's view can still cast
-    // a shadow into it, so culling here with the camera's frustum would make
-    // shadows pop as you turn around.
+    // Culls against each CASCADE's ortho box, not against the camera: an object
+    // outside the camera's view can still cast a shadow into it. The box is the
+    // clip volume the rasteriser would apply anyway, so this removes work and
+    // never a shadow -- with one exception, a SKINNED caster, whose bind-pose
+    // bounds do not bound its posed geometry.
     void DrawShadow(rhi::Encoder&, const Scene&);
 
-    // Depth only, from the CAMERA. A depth prepass, and the reason it exists
-    // here: SSAO reads depth back, and a multisample depth buffer cannot be
-    // resolved into one that means anything — averaging two distances across a
-    // silhouette gives a value describing no surface. So when the colour pass
-    // runs multisampled, the occlusion pass gets its own single-sampled depth.
+    // Depth only, from the CAMERA.
+    //
+    // IT IS NO LONGER A PREPASS and apps/world no longer runs one. The comment
+    // here used to justify it: SSAO needs a depth texture, "and a multisample
+    // depth buffer cannot be resolved into one that means anything -- averaging
+    // two distances across a silhouette gives a value describing no surface".
+    // True of an average, and Metal never offers one -- the depth resolve
+    // filters are sample-zero, min and max, and under reversed-Z max is the
+    // nearest sample, which is a distance some real surface actually had. So
+    // rhi::PassDesc::depth_resolve gets the same texture out of the pass that
+    // was drawing anyway, and the second walk over the scene is gone.
+    //
+    // Kept because a caller may still want a depth-only render of a scene into
+    // a target of its own -- tests/frames uses it to check the resolve itself.
     void DrawSceneDepth(rhi::Encoder&, const Scene&, int width, int height);
 
     // `shadow_map` is the depth target DrawShadow wrote, or a null handle for

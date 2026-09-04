@@ -279,6 +279,28 @@ struct PassDesc {
     bool load = false;
     TextureId depth;             // null handle = no depth attachment
     float clear_depth = 0.0f;    // reversed-Z: 0 is the FAR plane
+    // KEEP the existing depth instead of clearing it, the depth twin of `load`.
+    // A second pass drawing into the geometry a first pass already recorded
+    // needs it; without it BeginPass clears unconditionally, which is why no
+    // pass in this engine could ever inherit another's depth.
+    bool load_depth = false;
+    // WHERE THE MULTISAMPLE DEPTH IS RESOLVED TO, the depth twin of `resolve`,
+    // and its absence cost this engine a whole extra pass over the scene.
+    //
+    // A multisample depth attachment cannot be sampled, so anything wanting the
+    // frame's depth as a texture -- fog, SSAO, light shafts, motion vectors --
+    // had no way to get it, and apps/world rendered the ENTIRE SCENE a second
+    // time into a single-sample target to manufacture one. That prepass bought
+    // no early-Z either, because the colour pass attaches its own multisample
+    // depth which is cleared on entry. It measured 1.27 ms of a 5.05 ms frame
+    // at 2200x1520.
+    //
+    // The filter is MAX, and under reversed-Z max is NEAREST. The comment this
+    // replaces argued a depth resolve was meaningless because "averaging two
+    // distances across a silhouette gives a value describing no surface" --
+    // true of an average, and Metal never offers one: the filters are sample
+    // zero, min and max.
+    TextureId depth_resolve;
     // Keep the depth results after the pass. Off by default because a depth
     // buffer is normally transient; a shadow map is the exception.
     bool keep_depth = false;
@@ -461,9 +483,14 @@ class Device {
     // `sampleable` gives up memoryless storage in exchange for being readable
     // by a later pass — which SSAO needs and an ordinary depth buffer does not.
     // `samples` must match the colour attachment it is paired with.
+    // `cpu_readable` picks Shared storage so ReadPixels works, exactly as it
+    // does for a colour target. Off by default and it should stay off outside a
+    // test: a depth buffer another pass samples wants Private, and one nothing
+    // samples wants Memoryless and never touches DRAM at all.
     [[nodiscard]] TextureId CreateDepthTarget(int width, int height,
                                               bool sampleable = false,
-                                              int samples = 1);
+                                              int samples = 1,
+                                              bool cpu_readable = false);
     // Like CreateDepthTarget, but SAMPLEABLE and backed by real memory. The
     // ordinary one is memoryless: perfect for a depth buffer you throw away at
     // end of pass, useless for one another pass has to read.

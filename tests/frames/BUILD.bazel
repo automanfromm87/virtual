@@ -10,6 +10,7 @@ cc_test(
         "//engine/render",
         "//engine/rhi",
         "//engine/core",
+        "//engine/geometry",
         "//engine/scene",
     ],
 )

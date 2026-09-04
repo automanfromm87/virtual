@@ -2374,25 +2374,22 @@ int main(int argc, char** argv) {
             p.execute = [&](eng::rhi::Encoder& e) { app->Draw().DrawShadow(e, scene); };
             graph.AddPass(p);
         }
-        {
-            // A DEPTH PREPASS, so the fog has a depth buffer it can sample. The
-            // scene pass's own depth is multisampled and cannot be read.
-            eng::RenderGraph::Pass p;
-            p.name = "depth";
-            p.depth = depth;
-            p.keep_depth = true;
-            p.timer = "depth";
-            p.execute = [&](eng::rhi::Encoder& e) {
-                app->Draw().DrawSceneDepth(e, scene, rw, rh);
-            };
-            graph.AddPass(p);
-        }
+        // THE DEPTH PREPASS IS GONE. It existed only to manufacture a
+        // single-sample depth texture for the passes that sample one -- fog,
+        // SSAO, shafts, motion vectors -- because a multisample depth
+        // attachment cannot be read, and it bought no early-Z at all: the scene
+        // pass attaches its own multisample depth and clears it on entry. It
+        // was a second full pass over the scene, 1.27 ms of a 5.05 ms frame at
+        // 2200x1520. rhi::PassDesc::depth_resolve makes the hardware produce
+        // the same texture for free at the end of the pass that was drawing
+        // anyway.
         {
             eng::RenderGraph::Pass p;
             p.name = "scene";
             p.color = ms_color;
             p.resolve = color;
             p.depth = ms_depth;
+            p.depth_resolve = depth;
             p.reads = {shadow_map};
             p.timer = "scene";
             p.execute = [&](eng::rhi::Encoder& e) {
@@ -2409,11 +2406,27 @@ int main(int argc, char** argv) {
                     app->Draw().DrawScene(e, scene, rw, rh, shadow_map);
                 }
                 env->DrawSky(e, scene.camera, rw, rh);
-                // After the opaque geometry and the sky, so they test against
-                // both. `depth` is the prepass copy -- the pass's own depth is
-                // multisampled and cannot be sampled, and without it the sparks
-                // cut a hard edge into the ground instead of fading into it.
-                if (sparks_on) sparks->Draw(e, scene.camera, rw, rh, depth);
+            };
+            graph.AddPass(p);
+        }
+        if (sparks_on) {
+            // THE SPARKS MOVED OUT of the scene pass, and had to: they sample
+            // the frame's depth to fade where they meet a surface, and the
+            // resolve that produces a sampleable depth only happens when the
+            // pass ENDS. So they blend over the resolved colour instead of the
+            // multisample one -- a soft additive billboard loses nothing worth
+            // measuring by being rasterised once rather than four times, and
+            // what it gains is that the scene is no longer drawn twice.
+            eng::RenderGraph::Pass p;
+            // Not "sparks": the compute encoder that steps them already has
+            // that name, and two rows with one label in a profile is worse than
+            // no profile.
+            p.name = "sparkdraw";
+            p.modifies = color;
+            p.reads = {depth};
+            p.timer = "sparkdraw";
+            p.execute = [&](eng::rhi::Encoder& e) {
+                sparks->Draw(e, scene.camera, rw, rh, depth);
             };
             graph.AddPass(p);
         }

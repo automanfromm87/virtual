@@ -86,6 +86,17 @@ bool RenderGraph::Compile(std::string& error) {
                 return false;
             }
         }
+        // The DEPTH resolve, on exactly the same footing and for exactly the
+        // same reason: it is the only form of this pass's depth that anything
+        // downstream can sample.
+        if (Valid(passes_[i].depth_resolve)) {
+            auto [dit, dok] = producer.emplace(passes_[i].depth_resolve.v, i);
+            if (!dok) {
+                error = "passes '" + passes_[dit->second].name + "' and '" +
+                        passes_[i].name + "' both write the same depth resolve target";
+                return false;
+            }
+        }
         // The G-buffer's extra attachments, on the same footing as the first:
         // a lighting pass reads all of them, and leaving them out of the map
         // would have the graph reject it for reading a texture nobody writes.
@@ -243,6 +254,8 @@ void RenderGraph::Execute(rhi::Device& dev) {
         desc.resolve = p.resolve;
         desc.extra_colors = p.extra_colors;
         desc.depth = p.depth;
+        desc.depth_resolve = p.depth_resolve;
+        desc.load_depth = p.load_depth;
         for (int c = 0; c < 4; ++c) desc.clear_color[c] = p.clear_color[c];
         desc.clear_depth = p.clear_depth;
         desc.keep_depth = p.keep_depth;

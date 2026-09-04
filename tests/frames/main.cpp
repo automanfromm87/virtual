@@ -8,8 +8,11 @@
 #include "engine/render/renderer.h"
 #include "engine/rhi/rhi.h"
 #include "engine/core/math.h"
+#include "engine/geometry/mesh.h"
 #include "engine/scene/scene.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <set>
 #include <span>
@@ -435,6 +438,100 @@ int main() {
         Check(st.invalid == 2, "bad mesh and null material counted as invalid");
         Check(st.incompatible == 1, "depth-less material in a depth pass counted");
         Check(st.draws == 1, "only the valid instance drew");
+    }
+
+    // --- the multisample depth resolve ---------------------------------------
+    //
+    // PassDesc had a colour resolve and no depth one, so a multisample depth
+    // attachment could not be turned into anything sampleable and apps/world
+    // rendered the whole scene a SECOND time to manufacture one. The filter is
+    // MAX because this engine is reversed-Z, where the larger value is the
+    // nearer surface.
+    //
+    // DIFFERENTIAL, because max only differs from min at a silhouette: where
+    // every sample of a texel is covered the two agree, and asserting a depth
+    // value alone would pass with either. So the same tilted cube goes into a
+    // 1x target and a 4x-plus-resolve one, and the resolve must keep MORE
+    // texels -- a texel with one covered sample of four holds a real surface
+    // under max and the cleared far plane under min.
+    {
+        constexpr int kD = 64;
+        const eng::rhi::TextureId one = dev->CreateDepthTarget(
+            kD, kD, /*sampleable=*/true, /*samples=*/1, /*cpu_readable=*/true);
+        const eng::rhi::TextureId ms =
+            dev->CreateDepthTarget(kD, kD, /*sampleable=*/false, /*samples=*/4);
+        const eng::rhi::TextureId resolved = dev->CreateDepthTarget(
+            kD, kD, /*sampleable=*/true, /*samples=*/1, /*cpu_readable=*/true);
+        eng::MaterialDesc md;
+        md.shading = eng::Shading::Flat;
+        const eng::MaterialHandle mat = renderer->CreateMaterial(md, error);
+        const eng::MeshHandle box = renderer->UploadMesh(
+            eng::MakeCube(1.0f, eng::Vec4{1, 1, 1, 1}, eng::Vec4{1, 1, 1, 1}));
+
+        // Orthographic down -Z, so a world z maps onto a depth by arithmetic
+        // rather than by guesswork, and TILTED so its silhouette cuts across
+        // texels instead of landing on their boundaries.
+        eng::Scene s2;
+        s2.camera.projection = eng::Projection::Orthographic;
+        s2.camera.orthoHeight = 2.0f;
+        s2.camera.orthoFar = 21.0f;
+        s2.camera.nearZ = 1.0f;
+        s2.camera.eye = eng::Vec3{0.0f, 0.0f, 10.0f};
+        s2.camera.target = eng::Vec3{0.0f, 0.0f, 0.0f};
+        // FAR ONE FIRST, so a depth test with the comparison backwards would
+        // leave the far depth behind and fail the value check below.
+        for (float z : {-4.0f, 4.0f}) {
+            eng::Instance q;
+            q.mesh = box;
+            q.material = mat;
+            q.model = eng::Mat4::Translation(eng::Vec3{0.0f, 0.0f, z}) *
+                      eng::Mat4::RotationY(0.35f) * eng::Mat4::RotationX(0.35f);
+            s2.instances.push_back(q);
+        }
+
+        const auto count = [&](eng::rhi::TextureId tex, float& value) {
+            std::vector<std::uint8_t> raw(std::size_t(kD) * kD * 4);
+            if (!dev->ReadPixels(tex, kD, kD, raw)) return -1;
+            const auto* d = reinterpret_cast<const float*>(raw.data());
+            int n = 0;
+            value = 0.0f;
+            for (int i = 0; i < kD * kD; ++i)
+                if (d[i] > 0.0f) { ++n; value = std::max(value, d[i]); }
+            return n;
+        };
+
+        eng::rhi::PassDesc single;
+        single.depth = one;
+        single.keep_depth = true;
+        eng::rhi::PassDesc multi;
+        multi.depth = ms;
+        multi.depth_resolve = resolved;
+
+        dev->BeginFrame();
+        eng::rhi::Encoder e1 = dev->BeginPass(single);
+        renderer->DrawSceneDepth(e1, s2, kD, kD);
+        dev->EndPass();
+        eng::rhi::Encoder e4 = dev->BeginPass(multi);
+        renderer->DrawSceneDepth(e4, s2, kD, kD);
+        dev->EndPass();
+        if (!dev->CommitAndWait(error)) { std::fprintf(stderr, "FAIL: %s\n", error.c_str()); return 1; }
+
+        float near1 = 0.0f, near4 = 0.0f;
+        const int n1 = count(one, near1);
+        const int n4 = count(resolved, near4);
+        // The near cube's front face sits at world z = 4 + 0.5*sqrt(3) once the
+        // two 0.35 rad rotations have turned it, so pin the value loosely and
+        // let the DIFFERENCE between the two targets carry the precision.
+        std::printf("  depth resolve: 1x covers %d texels (nearest %.4f), "
+                    "4x+resolve covers %d (nearest %.4f)\n",
+                    n1, near1, n4, near4);
+        Check(n1 > 0 && n4 > 0, "both depth targets read back");
+        Check(near4 > 0.7f && near4 < 0.85f,
+              "the resolved depth is the NEAR cube's, not the far one's");
+        Check(std::fabs(near4 - near1) < 0.01f,
+              "and it agrees with the single-sampled render in the interior");
+        Check(n4 > n1,
+              "the resolve keeps partly-covered texels, so the filter is max");
     }
 
     // The throttle works: BeginFrame blocked once the ring was full.

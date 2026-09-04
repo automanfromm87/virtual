@@ -733,7 +733,7 @@ TextureId Device::CreateRenderTarget(int width, int height, Format format,
 }
 
 TextureId Device::CreateDepthTarget(int width, int height, bool sampleable,
-                                    int samples) {
+                                    int samples, bool cpu_readable) {
     if (width <= 0 || height <= 0) return {};
     MTLTextureDescriptor* td = [MTLTextureDescriptor
         texture2DDescriptorWithPixelFormat:ToMTL(Format::Depth32Float)
@@ -746,17 +746,20 @@ TextureId Device::CreateDepthTarget(int width, int height, bool sampleable,
         td.textureType = MTLTextureType2DMultisample;
         td.sampleCount = NSUInteger(samples);
     }
-    // Depth here is normally transient: the RHI exposes no way to sample or read
-    // back a depth target, and every pass uses storeAction DontCare. On a TBDR
-    // Apple GPU that means it can live entirely in tile memory and never touch
-    // DRAM. Falls back to Private on Intel, where memoryless does not exist.
+    // Depth here is normally transient: nothing samples it and every pass uses
+    // storeAction DontCare, so on a TBDR Apple GPU it can live entirely in tile
+    // memory and never touch DRAM. Falls back to Private on Intel, where
+    // memoryless does not exist -- and to Shared when the CPU has to read it,
+    // which is a test asking what a depth resolve produced.
     bool tbdr = false;
-    if (!sampleable) {
+    if (!sampleable && !cpu_readable) {
         if (@available(macOS 10.15, *)) {
             tbdr = [impl_->dev supportsFamily:MTLGPUFamilyApple1];
         }
     }
-    td.storageMode = tbdr ? MTLStorageModeMemoryless : MTLStorageModePrivate;
+    td.storageMode = cpu_readable ? MTLStorageModeShared
+                     : tbdr       ? MTLStorageModeMemoryless
+                                  : MTLStorageModePrivate;
     id<MTLTexture> t = [impl_->dev newTextureWithDescriptor:td];
     if (!t && tbdr) {
         // Memoryless refused for some reason — take the allocation rather than
@@ -1589,10 +1592,27 @@ Encoder Device::BeginPass(const PassDesc& desc) { @autoreleasepool {
     }
     if (Valid(desc.depth)) {
         rp.depthAttachment.texture = impl_->textures[desc.depth.v];
-        rp.depthAttachment.loadAction = MTLLoadActionClear;
+        rp.depthAttachment.loadAction =
+            desc.load_depth ? MTLLoadActionLoad : MTLLoadActionClear;
         rp.depthAttachment.storeAction =
             desc.keep_depth ? MTLStoreActionStore : MTLStoreActionDontCare;
         rp.depthAttachment.clearDepth = desc.clear_depth;
+        // RESOLVED like a colour attachment, and for the same reason: the
+        // samples only exist inside tile memory, so this is the only way to get
+        // the frame's depth out as something a later pass can sample.
+        //
+        // MAX, which under this engine's reversed-Z is the NEAREST sample. Not
+        // a preference -- Metal offers sample-zero, min and max, and of the
+        // three only max returns a depth that some real surface actually had at
+        // that pixel, on the near side of a silhouette where it matters.
+        if (Valid(desc.depth_resolve)) {
+            rp.depthAttachment.resolveTexture = impl_->textures[desc.depth_resolve.v];
+            rp.depthAttachment.depthResolveFilter =
+                MTLMultisampleDepthResolveFilterMax;
+            rp.depthAttachment.storeAction =
+                desc.keep_depth ? MTLStoreActionStoreAndMultisampleResolve
+                                : MTLStoreActionMultisampleResolve;
+        }
     }
     const int slot = impl_->BeginTiming(desc.timer);
     if (slot >= 0) {
@@ -1700,6 +1720,12 @@ bool Device::ReadPixels(TextureId tex, int width, int height,
             break;
         case MTLPixelFormatRGBA32Float:
             bpp = 16;
+            break;
+        // DEPTH, four bytes of float, so a test can assert what a depth resolve
+        // actually produced. Sampleable depth targets are Shared for exactly
+        // this reason and the check above already refuses the private ones.
+        case MTLPixelFormatDepth32Float:
+            bpp = 4;
             break;
         default:
             // Refused rather than guessed. A wrong stride does not fail, it

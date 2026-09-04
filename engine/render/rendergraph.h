@@ -46,6 +46,13 @@ class RenderGraph {
         // read any of them.
         std::vector<rhi::TextureId> extra_colors;
         rhi::TextureId depth;                 // written; null = no depth
+        // Where a multisample depth attachment is resolved to. Counts as
+        // WRITTEN by this pass, exactly as `resolve` does, so a later pass that
+        // samples the frame's depth depends on the pass that produced it.
+        rhi::TextureId depth_resolve;
+        // Keep the depth attachment's existing contents rather than clearing.
+        // The depth twin of `load`.
+        bool load_depth = false;
         std::vector<rhi::TextureId> reads;    // sampled inputs
         float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         // Keep the colour attachment's existing contents. Required for any pass
