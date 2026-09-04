@@ -8,7 +8,7 @@ package(default_visibility = ["//visibility:public"])
 # none of those is visible in a demo that has only one of the two.
 cc_binary(
     name = "world",
-    srcs = ["viewer.cpp"],
+    srcs = ["districts.h", "viewer.cpp"],
     deps = [
         "//engine/app",
         "//engine/asset:png",

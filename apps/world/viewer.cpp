@@ -26,6 +26,7 @@
 #include "engine/asset/png.h"
 #include "engine/geometry/mesh.h"
 #include "engine/geometry/simplify.h"
+#include "apps/world/districts.h"
 #include "engine/asset/texgen.h"
 #include "engine/render/gi.h"
 #include "engine/render/volumetric.h"
@@ -118,6 +119,7 @@ int main(int argc, char** argv) {
     // Looking into a low sun through trees IS hazy -- that is the effect -- but
     // the haze has to leave the trees in it.
     float shaft_ext = 0.004f;
+    int tour_start = 0;
     // 4096, MEASURED against an 8192 render of the same frame. The fraction of
     // pixels more than 20 of 255 away from that reference:
     //
@@ -165,6 +167,8 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--noshafts") == 0) shafts_start = false;
         else if (std::strcmp(argv[i], "--shaft") == 0 && i + 1 < argc)
             shaft_ext = float(std::atof(argv[++i]));
+        else if (std::strcmp(argv[i], "--look") == 0 && i + 1 < argc)
+            tour_start = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--size") == 0 && i + 2 < argc) {
             shot_w = std::atoi(argv[++i]);
             shot_h = std::atoi(argv[++i]);
@@ -379,6 +383,22 @@ int main(int argc, char** argv) {
             // inside the treeline -- which at 12 m it did, and the whole first
             // shot was one trunk filling the frame.
             if (x * x + z * z < 17.0f * 17.0f) { ++rejected_clearing; continue; }
+            // AND A CLEARING ROUND EVERY DISTRICT. Trees are planted anywhere
+            // the slope allows, which without this means through the middle of
+            // a colonnade and over the gallery. Two effects, both bad: the
+            // thing cannot be seen, and it sits in permanent canopy shade so
+            // the meter opens two stops for it and blows out every sunlit patch
+            // in the same frame.
+            {
+                bool in_district = false;
+                for (const auto& d : {world::kGallery, world::kLanternHall,
+                                      world::kGlassPavilion, world::kFirePit,
+                                      world::kFlag}) {
+                    const float dx = x - d.x, dz = z - d.z;
+                    if (dx * dx + dz * dz < 15.0f * 15.0f) in_district = true;
+                }
+                if (in_district) { ++rejected_clearing; continue; }
+            }
             // NOT ON A CLIFF. A tree planted on a steep face floats with its
             // roots in the air on the downhill side, which is the single most
             // obvious scattering artefact and the cheapest one to avoid.
@@ -769,6 +789,30 @@ int main(int argc, char** argv) {
                         std::chrono::steady_clock::now() - t0).count());
     }
 
+    // --- the districts ---------------------------------------------------------
+    //
+    // One valley with a place in it for each thing the engine does, instead of
+    // a demo apiece. See districts.h for why that is the arrangement rather
+    // than a convenience.
+    const eng::MeshHandle unit_sphere = app->Draw().UploadMesh(
+        eng::MakeUVSphere(0.5f, 24, 32, eng::Vec4{1, 1, 1, 1}, eng::Vec4{1, 1, 1, 1}));
+    world::BuildGallery(app->Draw(), scene, unit_sphere,
+                        terrain.HeightAt(world::kGallery.x, world::kGallery.z), error);
+    const world::LanternHall hall = world::BuildLanternHall(
+        app->Draw(), scene, unit_sphere,
+        terrain.HeightAt(world::kLanternHall.x, world::kLanternHall.z), error);
+    world::BuildGlassPavilion(
+        app->Draw(), scene,
+        terrain.HeightAt(world::kGlassPavilion.x, world::kGlassPavilion.z), error);
+    if (!error.empty()) return Fail(error);
+    // CLUSTERED LIGHTING ON, because 60 lanterns is well past the point where
+    // a forward pass can loop over every light for every fragment -- and
+    // because without it the lights are in the scene and contribute nothing at
+    // all. They were, for the first build of this: sixty lights, no light.
+    app->Draw().SetClusteredLighting(true);
+    std::printf("districts: %zu instances, %zu lights\n", scene.instances.size(),
+                scene.lights.size());
+
     // --- the character -------------------------------------------------------
     const eng::MeshHandle capsule_mesh = app->Draw().UploadMesh(
         eng::MakeUVSphere(0.45f, 16, 20, eng::Vec4{1, 1, 1, 1}, eng::Vec4{1, 1, 1, 1}));
@@ -858,6 +902,7 @@ int main(int argc, char** argv) {
     float baked_az = 1e9f, baked_el = 1e9f;
     bool ssao_on = ssao_start;
     bool shafts_on = shafts_start;
+    int tour_stop = tour_start;
     bool gi_stale = false;
     int gi_still_frames = 0;
 
@@ -869,6 +914,12 @@ int main(int argc, char** argv) {
     app->Actions().Bind("sun_fwd", ']');
     app->Actions().Bind("ssao", 'o');
     app->Actions().Bind("shafts", 'v');
+    app->Actions().Bind("stop0", '0');
+    app->Actions().Bind("stop1", '1');
+    app->Actions().Bind("stop2", '2');
+    app->Actions().Bind("stop3", '3');
+    app->Actions().Bind("stop4", '4');
+    app->Actions().Bind("stop5", '5');
     app->Actions().Bind("reset", 'r');
 
     eng::RenderGraph graph;
@@ -885,6 +936,12 @@ int main(int argc, char** argv) {
             camera_pitch = std::clamp(camera_pitch - f.mouse_dy * 0.004f, 0.15f, 1.35f);
         }
         camera_distance = std::clamp(camera_distance - f.scroll * 1.2f, 6.0f, 60.0f);
+        // 0 goes back to the character, 1-5 to the districts.
+        for (int k = 0; k < 6; ++k)
+            if (app->Actions().Pressed(k == 0 ? "stop0" : k == 1 ? "stop1"
+                                       : k == 2 ? "stop2" : k == 3 ? "stop3"
+                                       : k == 4 ? "stop4" : "stop5"))
+                tour_stop = k;
         if (app->Actions().Pressed("fog")) post->config.fog = !post->config.fog;
         if (app->Actions().Pressed("taa")) post->config.taa = !post->config.taa;
         if (app->Actions().Pressed("ssao")) ssao_on = !ssao_on;
@@ -922,7 +979,32 @@ int main(int argc, char** argv) {
             path.clear();
         }
 
-        const eng::Vec3 focus = player.Feet() + eng::Vec3{0.0f, 1.0f, 0.0f};
+        // WHERE THE CAMERA IS LOOKING. Stop 0 is the character; the rest are
+        // the districts. A world with things in five places needs a way to get
+        // to them that is not walking, or four fifths of it is never seen --
+        // and a screenshot of any one of them needs to be reproducible, which
+        // an orbit around a physics body is not.
+        struct Stop { const char* name; eng::Vec3 at; float height, distance, yaw; };
+        const Stop stops[] = {
+            {"the character", player.Feet(), 1.0f, camera_distance, camera_yaw},
+            {"material gallery", world::kGallery, 1.6f, 12.0f, 1.9f},
+            {"lantern hall", world::kLanternHall, 2.6f, 17.0f, 0.9f},
+            {"glass pavilion", world::kGlassPavilion, 1.8f, 11.0f, 4.0f},
+            {"fire pit", world::kFirePit, 1.4f, 9.0f, 5.4f},
+            {"the flag", world::kFlag, 2.4f, 10.0f, 2.6f},
+        };
+        constexpr int kStops = int(sizeof(stops) / sizeof(stops[0]));
+        tour_stop = std::clamp(tour_stop, 0, kStops - 1);
+        const Stop& stop = stops[tour_stop];
+        const eng::Vec3 ground_at =
+            tour_stop == 0 ? stop.at
+                           : eng::Vec3{stop.at.x, terrain.HeightAt(stop.at.x, stop.at.z),
+                                       stop.at.z};
+        const eng::Vec3 focus = ground_at + eng::Vec3{0.0f, stop.height, 0.0f};
+        if (tour_stop != 0) {
+            camera_distance = stop.distance;
+            camera_yaw = stop.yaw;
+        }
         const eng::Vec3 offset{std::cos(camera_yaw) * std::cos(camera_pitch),
                                std::sin(camera_pitch),
                                std::sin(camera_yaw) * std::cos(camera_pitch)};
@@ -1079,8 +1161,8 @@ int main(int argc, char** argv) {
 
         // --- HUD ----------------------------------------------------------------
         ui->Begin(f.width, f.height);
-        ui->Rect(12, 12, 470, 180, eng::Vec4{0.05f, 0.06f, 0.08f, 0.72f});
-        ui->Outline(12, 12, 470, 180, 1.0f, eng::Vec4{0.35f, 0.40f, 0.48f, 0.9f});
+        ui->Rect(12, 12, 500, 228, eng::Vec4{0.05f, 0.06f, 0.08f, 0.72f});
+        ui->Outline(12, 12, 500, 228, 1.0f, eng::Vec4{0.35f, 0.40f, 0.48f, 0.9f});
         char line[192];
         const eng::RenderStats& rs = app->Draw().LastStats();
         std::snprintf(line, sizeof(line),
@@ -1110,9 +1192,21 @@ int main(int argc, char** argv) {
                       std::log2(std::max(post->LastExposure(), 1e-6f)),
                       player.Grounded() ? "grounded" : "airborne");
         ui->Text(26, 98, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
-        ui->Text(26, 128, "click: walk there    right-drag: orbit    scroll: zoom",
+        ui->Text(26, 128, "click: walk there   right-drag: orbit   scroll: zoom",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
-        ui->Text(26, 152, "f: fog   t: taa   o: ao   v: shafts   [ ]: sun   r: reset",
+        const eng::Renderer::ClusterStats cs =
+            app->Draw().ClusteredLighting() ? app->Draw().ReadClusterStats()
+                                            : eng::Renderer::ClusterStats{};
+        std::snprintf(line, sizeof(line),
+                      "%zu lights, %d cells lit, %d max per cell%s",
+                      scene.lights.size(), cs.occupied_cells, cs.max_per_cell,
+                      cs.overflowed_cells ? "  OVERFLOW" : "");
+        ui->Text(26, 176, line,
+                 cs.overflowed_cells ? eng::Vec4{1.0f, 0.72f, 0.35f, 1.0f}
+                                     : eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
+        std::snprintf(line, sizeof(line), "looking at: %s   (0-5 to move)", stop.name);
+        ui->Text(26, 152, line, eng::Vec4{0.92f, 0.94f, 0.98f, 1.0f});
+        ui->Text(26, 200, "f: fog   t: taa   o: ao   v: shafts   [ ]: sun   r: reset",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
 
         // --- passes --------------------------------------------------------------
@@ -1293,6 +1387,15 @@ int main(int argc, char** argv) {
             graph.AddPass(p);
         }
         if (!graph.Compile(error)) return Fail(error);
+        // BINNING, outside the graph for the same reason the exposure meter is:
+        // it writes BUFFERS, and the graph orders passes by the textures they
+        // write. Before the scene pass, not after -- unlike the meter, this
+        // frame's shading needs this frame's bins.
+        if (app->Draw().ClusteredLighting() && !scene.lights.empty()) {
+            auto e = app->Gpu().BeginCompute("bin");
+            app->Draw().BinLights(e, scene, f.width, f.height, 90.0f);
+            app->Gpu().EndCompute();
+        }
         graph.Execute(app->Gpu());
 
         // METERING RUNS OUTSIDE THE GRAPH, and the graph is what insisted:
