@@ -155,6 +155,7 @@ int main(int argc, char** argv) {
     float focus_start = 1.0f;
     float dist_start = 0.0f;  // 0 = whatever the stop chooses
     float leaf_transmission = 0.55f;
+    float exposure_comp = -1.0f;
     bool decals_on = true;
     // 4096, MEASURED against an 8192 render of the same frame. The fraction of
     // pixels more than 20 of 255 away from that reference:
@@ -221,6 +222,8 @@ int main(int argc, char** argv) {
             dist_start = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--noleaf") == 0) leaf_transmission = 0.0f;
         else if (std::strcmp(argv[i], "--nodecal") == 0) decals_on = false;
+        else if (std::strcmp(argv[i], "--ec") == 0 && i + 1 < argc)
+            exposure_comp = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--size") == 0 && i + 2 < argc) {
             shot_w = std::atoi(argv[++i]);
             shot_h = std::atoi(argv[++i]);
@@ -656,6 +659,11 @@ int main(int argc, char** argv) {
 
     eng::MaterialDesc leaf_md;
     leaf_md.shading = eng::Shading::Lit;
+    // Tried 0.30 green against this 0.38 and reverted: the frontlit tops sit
+    // at the tone-map ceiling either way (canopy green p90 224 vs 221,
+    // measured on the clearing camera), so albedo is not the lever up there
+    // -- and the darker leaves pushed 30 more GI probes under the dark
+    // threshold (96 to 126 buried) for those three codes. A bad trade.
     leaf_md.base_color = eng::Vec4{0.19f, 0.38f, 0.15f, 1.0f};
     // Leaves are rougher than almost anything else outdoors and not at all
     // metallic; a smooth canopy picks up a sheen that reads as wet plastic.
@@ -721,6 +729,21 @@ int main(int argc, char** argv) {
                     c = mix3(c, eng::Vec3{2.05f, 1.55f, 0.95f}, earth);
                     c = mix3(c, eng::Vec3{2.60f, 2.45f, 2.25f}, rock);
                     c = mix3(c, eng::Vec3{1.15f, 1.05f, 0.80f}, high * 0.5f);
+                    // PATCHINESS, independent of shape. Slope and height vary
+                    // the ground with the land, but a flat clearing is neither
+                    // steep nor high and still read as one green -- a real
+                    // meadow is blotchy at every scale. Two slow octaves, 20 m
+                    // and 7 m, far above the 3 m texture tile so they add a
+                    // scale the texture cannot, and non-repeating so there is
+                    // no tiling to spot. Dry patches run yellow: red is kept
+                    // while blue falls, which is what dry grass does.
+                    const float blotch =
+                        (ValueNoise(v.position.x * 0.045f, v.position.z * 0.045f) - 0.5f) * 0.55f +
+                        (ValueNoise(v.position.x * 0.13f + 7.3f, v.position.z * 0.13f + 3.1f) - 0.5f) *
+                            0.30f;
+                    c.x *= 1.0f + blotch;
+                    c.y *= 1.0f + blotch * 0.55f;
+                    c.z *= 1.0f - blotch * 0.45f;
                     v.color = eng::Vec4{c.x, c.y, c.z, 1.0f};
                 }
                 // The terrain builder does not make tangents, and the ground
@@ -1404,13 +1427,19 @@ int main(int argc, char** argv) {
     // fifth at 0.18, which is what a light meter does and what makes the green
     // come back.
     post->config.auto_exposure = true;
-    // Half a stop under the meter. The meter puts the middle fifth of the
-    // histogram at middle grey, which is right, but this scene is bimodal --
-    // hard sun and deep shade, about three and a half stops apart -- so the
-    // middle fifth falls between the two modes and the sunlit ground sits at
-    // 214 of 255. Nothing clips, measured, but it is a high-key image and half
-    // a stop down puts the sun side where it reads as grass.
-    post->config.exposure_compensation = -0.5f;
+    // A stop under the meter. The meter puts the middle fifth of the histogram
+    // at middle grey, which is right, but this scene is bimodal -- hard sun
+    // and deep shade, about three and a half stops apart -- so the middle
+    // fifth falls between the two modes and the sunlit ground sits hot enough
+    // to wash out its own texture: at -0.5 the sunlit mask averages 240 of 255
+    // with a local deviation of 11.9, measured, and the blotches the texture
+    // paints are compressed to invisibility. At -1.0 the mask averages 233
+    // with a deviation of 14.0 -- the detail is back -- while the shade still
+    // averages 52 and stays readable. (These numbers date from the fix that
+    // made compensation do anything at all; before it the setting was written
+    // into the params and never read, so every earlier measurement of it was
+    // really a measurement of 0.)
+    post->config.exposure_compensation = exposure_comp;
     app->Draw().SetExposureBuffer(post->ExposureBuffer());
     // TEMPORAL ANTIALIASING. 4x MSAA resolves EDGES, and this forest is not
     // made of edges -- it is two hundred trees of branches thinner than a pixel

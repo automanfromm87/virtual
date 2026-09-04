@@ -119,7 +119,12 @@ kernel void cs_luminance_resolve(device atomic_uint* histogram [[buffer(0)]],
     // The exposure that maps that average to middle grey. 0.18 is the
     // photographic convention and it is not arbitrary: it is the reflectance of
     // the standard grey card, which is what light meters are calibrated to.
-    const float target = 0.18 / max(average, 1e-5);
+    //
+    // p.tune.x carries the manual compensation in linear units -- MeterExposure
+    // sets it to exp2(exposure_compensation) -- so a viewer asking for -0.5
+    // stops down half a stop from whatever the meter decides. This used to be
+    // written and never read, and the setting silently did nothing.
+    const float target = 0.18 * p.tune.x / max(average, 1e-5);
 
     // ADAPTATION, exponential, with different speeds each way. The eye adapts
     // to a brighter scene in seconds and to a darker one in minutes, so a

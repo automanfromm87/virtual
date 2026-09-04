@@ -589,6 +589,37 @@ int main() {
     }
 
     {
+        // EXPOSURE COMPENSATION is a manual multiplier on the meter, in stops.
+        // It used to be written into the params and never read: the resolve
+        // mapped the average to middle grey whatever it said, so a viewer
+        // asking for -0.5 got exactly the image it would have got at 0.
+        std::printf("\nexposure compensation moves the metered exposure\n");
+        post->config.auto_exposure = true;
+        post->config.adapt_brighter = 12.0f;
+        post->config.adapt_darker = 12.0f;
+        post->config.exposure_compensation = 0.0f;
+        r->SetExposureBuffer(post->ExposureBuffer());
+        scene.lightColor = eng::Vec4{14.0f, 14.0f, 14.0f, 1.0f};
+        scene.ambientSky = eng::Vec3{2.0f, 2.1f, 2.4f};
+        scene.ambientGround = eng::Vec3{0.5f, 0.5f, 0.5f};
+        for (int i = 0; i < 40; ++i)
+            if (!frame(0.05f, true, nullptr)) return 1;
+        const float uncompensated = post->LastExposure();
+        post->config.exposure_compensation = -1.0f;
+        for (int i = 0; i < 40; ++i)
+            if (!frame(0.05f, true, nullptr)) return 1;
+        const float stopped_down = post->LastExposure();
+        std::printf("    compensation 0: exposure %.3f, at -1 stop: %.3f\n",
+                    uncompensated, stopped_down);
+        Check(std::fabs(stopped_down * 2.0f - uncompensated) <
+                  uncompensated * 0.15f,
+              "minus one stop halves the metered exposure");
+        post->config.auto_exposure = false;
+        post->config.exposure_compensation = 0.0f;
+        r->SetExposureBuffer({});
+    }
+
+    {
         std::printf("\nthe TAA jitter is a proper low-discrepancy sequence\n");
         post->config.taa = true;
         std::vector<eng::Vec2> offsets;
