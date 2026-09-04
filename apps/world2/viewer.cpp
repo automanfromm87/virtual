@@ -28,6 +28,7 @@
 #include "engine/geometry/simplify.h"
 #include "engine/asset/texgen.h"
 #include "engine/render/gi.h"
+#include "engine/render/volumetric.h"
 #include "engine/geometry/terrain.h"
 #include "engine/geometry/tree.h"
 #include "engine/nav/navmesh.h"
@@ -109,6 +110,14 @@ int main(int argc, char** argv) {
     float lod_near = 45.0f;
     int shot_w = 1100, shot_h = 760;
     float shadow_dist = 90.0f;
+    float ssao_radius = 1.1f;
+    bool ssao_start = true;
+    bool shafts_start = true;
+    // 0.004. At 0.014 the far treeline vanished entirely and the meter dropped
+    // most of a stop trying to save the sun glow, which crushed the ground.
+    // Looking into a low sun through trees IS hazy -- that is the effect -- but
+    // the haze has to leave the trees in it.
+    float shaft_ext = 0.004f;
     // 4096, MEASURED against an 8192 render of the same frame. The fraction of
     // pixels more than 20 of 255 away from that reference:
     //
@@ -150,6 +159,12 @@ int main(int argc, char** argv) {
             shadow_px = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--cascades") == 0 && i + 1 < argc)
             shadow_cascades = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--ssao") == 0 && i + 1 < argc)
+            ssao_radius = float(std::atof(argv[++i]));
+        else if (std::strcmp(argv[i], "--nossao") == 0) ssao_start = false;
+        else if (std::strcmp(argv[i], "--noshafts") == 0) shafts_start = false;
+        else if (std::strcmp(argv[i], "--shaft") == 0 && i + 1 < argc)
+            shaft_ext = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--size") == 0 && i + 2 < argc) {
             shot_w = std::atoi(argv[++i]);
             shot_h = std::atoi(argv[++i]);
@@ -196,6 +211,11 @@ int main(int argc, char** argv) {
     if (!env) return Fail(error);
     auto post = eng::PostStack::Create(app->Gpu(), error);
     if (!post) return Fail(error);
+    // LIGHT SHAFTS. The one effect a forest is actually about: the canopy cuts
+    // the sunlight into beams and you see them in the air, not on a surface.
+    // Everything else here lights things; this lights the space between them.
+    auto vol = eng::Volumetrics::Create(app->Gpu(), error);
+    if (!vol) return Fail(error);
 
     // --- the terrain ---------------------------------------------------------
     std::printf("generating terrain...\n");
@@ -836,6 +856,8 @@ int main(int argc, char** argv) {
     float camera_yaw = 0.7f + yaw_offset, camera_pitch = 0.26f,
           camera_distance = 13.0f;
     float baked_az = 1e9f, baked_el = 1e9f;
+    bool ssao_on = ssao_start;
+    bool shafts_on = shafts_start;
     bool gi_stale = false;
     int gi_still_frames = 0;
 
@@ -845,6 +867,8 @@ int main(int argc, char** argv) {
     app->Actions().Bind("taa", 't');
     app->Actions().Bind("sun_back", '[');
     app->Actions().Bind("sun_fwd", ']');
+    app->Actions().Bind("ssao", 'o');
+    app->Actions().Bind("shafts", 'v');
     app->Actions().Bind("reset", 'r');
 
     eng::RenderGraph graph;
@@ -863,6 +887,8 @@ int main(int argc, char** argv) {
         camera_distance = std::clamp(camera_distance - f.scroll * 1.2f, 6.0f, 60.0f);
         if (app->Actions().Pressed("fog")) post->config.fog = !post->config.fog;
         if (app->Actions().Pressed("taa")) post->config.taa = !post->config.taa;
+        if (app->Actions().Pressed("ssao")) ssao_on = !ssao_on;
+        if (app->Actions().Pressed("shafts")) shafts_on = !shafts_on;
 
         // --- the sun, and the indirect light that has to follow it -------------
         //
@@ -1076,16 +1102,17 @@ int main(int argc, char** argv) {
                                                              player.Feet().z));
         ui->Text(26, 74, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
         std::snprintf(line, sizeof(line),
-                      "gpu %.2f ms   fog %s   taa %s   exposure %.2f (%+.1f EV)   %s",
+                      "gpu %.2f ms  fog %s  taa %s  ao %s  exposure %.2f (%+.1f EV)  %s",
                       app->Gpu().LastFrameGpuMilliseconds(),
                       post->config.fog ? "on" : "off",
-                      post->config.taa ? "on" : "off", post->LastExposure(),
+                      post->config.taa ? "on" : "off", ssao_on ? "on" : "off",
+                      post->LastExposure(),
                       std::log2(std::max(post->LastExposure(), 1e-6f)),
                       player.Grounded() ? "grounded" : "airborne");
         ui->Text(26, 98, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
         ui->Text(26, 128, "click: walk there    right-drag: orbit    scroll: zoom",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
-        ui->Text(26, 152, "f: fog    t: taa    [ ]: sun    r: reset",
+        ui->Text(26, 152, "f: fog   t: taa   o: ao   v: shafts   [ ]: sun   r: reset",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
 
         // --- passes --------------------------------------------------------------
@@ -1094,6 +1121,7 @@ int main(int argc, char** argv) {
                 f.width, f.height, eng::rhi::Format::RGBA8Unorm,
                 /*cpu_readable=*/true);
         const eng::rhi::TextureId color = app->Targets().Hdr("color");
+        const eng::rhi::TextureId ao = app->Targets().Color("ao");
         const eng::rhi::TextureId ms_color = app->Targets().Msaa("ms");
         const eng::rhi::TextureId ms_depth = app->Targets().MsaaDepth("ms_depth");
         const eng::rhi::TextureId depth = app->Targets().Depth("depth", true);
@@ -1141,7 +1169,85 @@ int main(int argc, char** argv) {
             };
             graph.AddPass(p);
         }
-        if (post->config.fog) {
+        if (shafts_on) {
+            eng::VolumetricConfig vc;
+            vc.far_distance = 110.0f;
+            // Thin. This is air with dust in it, not smoke -- the whole effect
+            // has to be something you notice without being able to point at.
+            vc.extinction = shaft_ext;
+            vc.base_density = 0.22f;
+            // Denser low down, because that is where the dust and the moisture
+            // are, and it is what makes a shaft visible near the ground and
+            // invisible against the sky.
+            vc.height_falloff = 0.055f;
+            vc.height_reference = terrain.HeightAt(0.0f, 0.0f);
+            // Strongly forward-scattering, which is why a shaft is bright when
+            // you look toward the sun and nearly gone when you look away. An
+            // isotropic phase gives uniform haze and no beams at all.
+            // 0.60, not 0.72. The peak is what makes a beam a beam, but too
+            // sharp a one turns the whole sky around the sun into a single
+            // blown highlight and there is no beam left to see inside it.
+            vc.anisotropy = 0.60f;
+            vol->SetConfig(vc);
+            graph.AddCompute("froxels", {vol->Volume()},
+                             [&](eng::rhi::ComputeEncoder& e) {
+                                 // The renderer's OWN cascade and light
+                                 // buffers. A shaft computed against a second
+                                 // copy of the shadow setup drifts away from
+                                 // the shadow it is supposed to be cast by,
+                                 // and the beam lands beside the gap.
+                                 vol->Build(e, scene, f.width, f.height, f.index,
+                                            shadow_map, app->Draw().CascadeBuffer(),
+                                            app->Draw().CascadeOffset(),
+                                            app->Draw().LightBuffer(),
+                                            app->Draw().LightOffset(),
+                                            int(scene.lights.size()));
+                             },
+                             "froxels");
+            eng::RenderGraph::Pass p;
+            p.name = "shafts";
+            p.modifies = color;
+            p.reads = {depth, vol->Volume()};
+            p.timer = "shafts";
+            p.execute = [&](eng::rhi::Encoder& e) {
+                vol->Apply(e, scene, f.width, f.height, depth);
+            };
+            graph.AddPass(p);
+        }
+        if (ssao_on) {
+            // CONTACT OCCLUSION, from the depth prepass the fog already needs.
+            //
+            // Nothing in this scene was darkened where it MEETS something else.
+            // Two hundred trunks stood on the ground with the same brightness
+            // at the root as at head height, which is the single clearest tell
+            // that an object is pasted onto a scene rather than standing in it
+            // -- the eye reads the missing contact darkening as "not touching".
+            //
+            // Cleared to WHITE, because this is a multiplier and an unwritten
+            // texel has to mean "not occluded". Cleared to black it would
+            // switch the lights off wherever the pass did not reach.
+            eng::RenderGraph::Pass p;
+            p.name = "ssao";
+            p.color = ao;
+            p.reads = {depth};
+            p.clear_color[0] = p.clear_color[1] = p.clear_color[2] = 1.0f;
+            p.timer = "ssao";
+            p.execute = [&](eng::rhi::Encoder& e) {
+                app->Draw().DrawSsao(e, scene.camera, f.width, f.height, depth,
+                                     ssao_radius);
+            };
+            graph.AddPass(p);
+        }
+        // NOT BOTH. DrawFog is an analytic height fog and the froxel volume is
+        // a marched one: they model the same air, and running both counts every
+        // scattering event twice. With both on, looking into a low sun blew the
+        // whole upper half of the frame to white and the meter dropped a stop
+        // trying to save it, which crushed the ground instead.
+        //
+        // The froxel version is strictly the better one where it applies -- it
+        // is shadowed, so it produces beams rather than a wash -- so it wins and
+        // the analytic one is the fallback for when shafts are off.
+        if (post->config.fog && !shafts_on) {
             eng::RenderGraph::Pass p;
             p.name = "fog";
             // MODIFIES, not writes. The scene pass already produced `color`,
@@ -1177,10 +1283,11 @@ int main(int argc, char** argv) {
             eng::RenderGraph::Pass p;
             p.name = "composite";
             p.color = shot_path.empty() ? f.drawable : shot_target;
-            p.reads = {composited};
+            p.reads = ssao_on ? std::vector<eng::rhi::TextureId>{composited, ao}
+                              : std::vector<eng::rhi::TextureId>{composited};
             p.timer = "composite";
             p.execute = [&](eng::rhi::Encoder& e) {
-                app->Draw().DrawComposite(e, composited);
+                app->Draw().DrawComposite(e, composited, ssao_on ? ao : eng::rhi::TextureId{});
                 ui->Draw(e);
             };
             graph.AddPass(p);
