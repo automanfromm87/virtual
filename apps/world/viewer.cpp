@@ -923,7 +923,8 @@ int main(int argc, char** argv) {
     bool ssao_on = ssao_start;
     bool shafts_on = shafts_start;
     bool sparks_on = true;
-    int tour_stop = tour_start;
+    int here = tour_start;      // which stop was last jumped to, for the HUD
+    int goto_stop = tour_start; // -1 when there is nothing to jump to
     bool gi_stale = false;
     int gi_still_frames = 0;
 
@@ -942,6 +943,11 @@ int main(int argc, char** argv) {
     app->Actions().Bind("stop4", '4');
     app->Actions().Bind("stop5", '5');
     app->Actions().Bind("reset", 'r');
+    app->Actions().Bind("forward", 'w');
+    app->Actions().Bind("back", 's');
+    app->Actions().Bind("left", 'a');
+    app->Actions().Bind("right", 'd');
+    app->Actions().Bind("run", ' ');
 
     eng::RenderGraph graph;
     // Allocated lazily on the first frame, when the framebuffer size is known.
@@ -958,11 +964,10 @@ int main(int argc, char** argv) {
         }
         camera_distance = std::clamp(camera_distance - f.scroll * 1.2f, 6.0f, 60.0f);
         // 0 goes back to the character, 1-5 to the districts.
+        static const char* kStopAction[6] = {"stop0", "stop1", "stop2",
+                                            "stop3", "stop4", "stop5"};
         for (int k = 0; k < 6; ++k)
-            if (app->Actions().Pressed(k == 0 ? "stop0" : k == 1 ? "stop1"
-                                       : k == 2 ? "stop2" : k == 3 ? "stop3"
-                                       : k == 4 ? "stop4" : "stop5"))
-                tour_stop = k;
+            if (app->Actions().Pressed(kStopAction[k])) goto_stop = k;
         if (app->Actions().Pressed("fog")) post->config.fog = !post->config.fog;
         if (app->Actions().Pressed("taa")) post->config.taa = !post->config.taa;
         if (app->Actions().Pressed("ssao")) ssao_on = !ssao_on;
@@ -1000,32 +1005,52 @@ int main(int argc, char** argv) {
             path.clear();
         }
 
-        // WHERE THE CAMERA IS LOOKING. Stop 0 is the character; the rest are
-        // the districts. A world with things in five places needs a way to get
-        // to them that is not walking, or four fifths of it is never seen --
-        // and a screenshot of any one of them needs to be reproducible, which
-        // an orbit around a physics body is not.
-        struct Stop { const char* name; eng::Vec3 at; float height, distance, yaw; };
-        const Stop stops[] = {
-            {"the character", player.Feet(), 1.0f, camera_distance, camera_yaw},
-            {"material gallery", world::kGallery, 1.6f, 12.0f, 1.9f},
-            {"lantern hall", world::kLanternHall, 2.6f, 17.0f, 0.9f},
-            {"glass pavilion", world::kGlassPavilion, 1.8f, 11.0f, 4.0f},
-            {"fire pit", world::kFirePit, 1.4f, 9.0f, 5.4f},
-            {"the flag", world::kFlag, 2.4f, 10.0f, 2.6f},
+        // WHERE TO GO. Fast travel, not a camera mode.
+        //
+        // These used to move the CAMERA and pin its yaw and distance every
+        // frame, which froze the orbit and the zoom the moment you arrived
+        // anywhere -- you could look at a district and not look around it. A
+        // stop teleports the CHARACTER instead, once, and then everything works
+        // the way it does everywhere else: the camera follows, WASD walks,
+        // right-drag orbits, scroll zooms.
+        struct Stop { const char* name; eng::Vec3 at; };
+        static const Stop kStopList[] = {
+            {"the clearing", eng::Vec3{0.0f, 0.0f, 0.0f}},
+            {"material gallery", world::kGallery},
+            {"lantern hall", world::kLanternHall},
+            {"glass pavilion", world::kGlassPavilion},
+            {"fire pit", world::kFirePit},
+            {"the banner", world::kFlag},
         };
-        constexpr int kStops = int(sizeof(stops) / sizeof(stops[0]));
-        tour_stop = std::clamp(tour_stop, 0, kStops - 1);
-        const Stop& stop = stops[tour_stop];
-        const eng::Vec3 ground_at =
-            tour_stop == 0 ? stop.at
-                           : eng::Vec3{stop.at.x, terrain.HeightAt(stop.at.x, stop.at.z),
-                                       stop.at.z};
-        const eng::Vec3 focus = ground_at + eng::Vec3{0.0f, stop.height, 0.0f};
-        if (tour_stop != 0) {
-            camera_distance = stop.distance;
-            camera_yaw = stop.yaw;
+        constexpr int kStops = int(sizeof(kStopList) / sizeof(kStopList[0]));
+        if (goto_stop >= 0 && goto_stop < kStops) {
+            const Stop& to = kStopList[goto_stop];
+            // ARRIVE FROM THE INSIDE. The districts sit near the rim of a bowl
+            // -- the lantern hall is 46 m out, which is exactly where the
+            // terrain starts climbing -- so stepping back from one along a
+            // hand-picked angle put the character up the slope at y = 3.3,
+            // looking down on the tops of the pillars. Backing toward the
+            // MIDDLE of the valley instead lands on the flat every time, and
+            // needs no angle chosen per district.
+            const float r = std::sqrt(to.at.x * to.at.x + to.at.z * to.at.z);
+            const eng::Vec3 inward =
+                r > 1e-3f ? eng::Vec3{-to.at.x / r, 0.0f, -to.at.z / r}
+                          : eng::Vec3{0.0f, 0.0f, 1.0f};
+            const float x = to.at.x + inward.x * 9.0f;
+            const float z = to.at.z + inward.z * 9.0f;
+            player.Teleport(eng::Vec3{x, terrain.HeightAt(x, z) + 0.5f, z});
+            // Looking back OUT at the district. The camera sits at focus +
+            // offset and looks along -offset, so the offset is the inward
+            // direction and the yaw is its angle.
+            camera_yaw = std::atan2(inward.z, inward.x);
+            camera_distance = 9.0f;
+            path.clear();
+            path_at = 0;
+            here = goto_stop;
+            goto_stop = -1;
         }
+        const eng::Vec3 focus = player.Feet() + eng::Vec3{0.0f, 1.0f, 0.0f};
+
         const eng::Vec3 offset{std::cos(camera_yaw) * std::cos(camera_pitch),
                                std::sin(camera_pitch),
                                std::sin(camera_yaw) * std::cos(camera_pitch)};
@@ -1047,11 +1072,29 @@ int main(int argc, char** argv) {
             const eng::Vec4 far_h = inv * eng::Vec4{ndc_x, ndc_y, 0.0f, 1.0f};
             const eng::Vec3 a{near_h.x / near_h.w, near_h.y / near_h.w,
                               near_h.z / near_h.w};
-            const eng::Vec3 b{far_h.x / far_h.w, far_h.y / far_h.w, far_h.z / far_h.w};
+
+            // CROSS-MULTIPLIED, not two perspective divides.
+            //
+            // The far plane is at INFINITY under this projection and depth 0 is
+            // where it lives, so far_h.w is EXACTLY zero for every pixel of
+            // every frame. Dividing by it gives an infinity, subtracting the
+            // near point gives an infinity, and normalising that gives NaN --
+            // so the raycast was handed a NaN direction, returned false, and
+            // click-to-walk quietly did nothing at all. It has never worked.
+            //
+            // The direction is (far/far.w - near/near.w) scaled by far.w *
+            // near.w, which is the same vector times a positive number and has
+            // no divide in it. This is the third place in the engine to hit
+            // this: the sky shader's ray reconstruction had it, and its fix is
+            // the same three lines.
+            const eng::Vec3 dir = eng::Normalize(eng::Vec3{
+                far_h.x * near_h.w - near_h.x * far_h.w,
+                far_h.y * near_h.w - near_h.y * far_h.w,
+                far_h.z * near_h.w - near_h.z * far_h.w});
 
             float t = 0.0f;
-            if (terrain.Raycast(a, eng::Normalize(b - a), 400.0f, &t, nullptr)) {
-                const eng::Vec3 hit = a + eng::Normalize(b - a) * t;
+            if (terrain.Raycast(a, dir, 400.0f, &t, nullptr)) {
+                const eng::Vec3 hit = a + dir * t;
                 std::vector<eng::Vec3> found;
                 if (navmesh.FindPath(player.Feet(), hit, &found) && found.size() > 1) {
                     path = found;
@@ -1061,8 +1104,41 @@ int main(int argc, char** argv) {
         }
 
         // --- movement ---------------------------------------------------------
+        //
+        // WASD FIRST, and it takes priority over the path. A world with five
+        // districts sixty metres apart had exactly one way to cross it: click a
+        // patch of ground and wait. That needs the ground you want to reach to
+        // be visible and on the navmesh, which rules out walking to anything
+        // you are currently looking at from above -- and there was no way at
+        // all to make a small adjustment.
+        //
+        // RELATIVE TO THE CAMERA, not to the world. Forward means "away from
+        // the camera" because that is what the key means to the person pressing
+        // it; world-relative movement in an orbiting camera sends you sideways
+        // the moment you turn.
         eng::Vec3 wish{0.0f, 0.0f, 0.0f};
-        if (path_at < path.size()) {
+        {
+            const float fx = std::cos(camera_yaw), fz = std::sin(camera_yaw);
+            // The camera sits at focus + offset, so it LOOKS along -offset.
+            eng::Vec3 walk{0.0f, 0.0f, 0.0f};
+            if (app->Actions().Down("forward")) walk = walk + eng::Vec3{-fx, 0.0f, -fz};
+            if (app->Actions().Down("back")) walk = walk + eng::Vec3{fx, 0.0f, fz};
+            // Right of the view direction: the view is (-fx, -fz), so its right
+            // in a y-up left-handed sense is (-fz, fx).
+            if (app->Actions().Down("left")) walk = walk + eng::Vec3{fz, 0.0f, -fx};
+            if (app->Actions().Down("right")) walk = walk + eng::Vec3{-fz, 0.0f, fx};
+            const float len = eng::Length(walk);
+            if (len > 1e-4f) {
+                // Any key cancels a path in progress, or the two fight and the
+                // character crabs sideways toward a waypoint it was told to
+                // forget about.
+                path.clear();
+                path_at = 0;
+                const float speed = app->Actions().Down("run") ? 11.0f : 4.5f;
+                wish = walk * (speed / len);
+            }
+        }
+        if (wish.x == 0.0f && wish.z == 0.0f && path_at < path.size()) {
             const eng::Vec3 target = path[path_at];
             eng::Vec3 to{target.x - player.Feet().x, 0.0f, target.z - player.Feet().z};
             const float distance = eng::Length(to);
@@ -1158,6 +1234,28 @@ int main(int argc, char** argv) {
             ++forest_lod_counts[lod];
         }
 
+        // A SYNTHETIC PICK, once, during a capture. Clicking cannot be tested
+        // without a window, and the bug this checks for produced no error and
+        // no visible effect -- the raycast simply returned false forever.
+        if (!shot_path.empty() && f.index == 20) {
+            const eng::Mat4 inv =
+                eng::Inverse(scene.camera.ViewProj(float(f.width) / float(f.height)));
+            const eng::Vec4 n4 = inv * eng::Vec4{0.0f, -0.4f, 1.0f, 1.0f};
+            const eng::Vec4 f4 = inv * eng::Vec4{0.0f, -0.4f, 0.0f, 1.0f};
+            const eng::Vec3 from{n4.x / n4.w, n4.y / n4.w, n4.z / n4.w};
+            const eng::Vec3 d = eng::Normalize(eng::Vec3{f4.x * n4.w - n4.x * f4.w,
+                                                         f4.y * n4.w - n4.y * f4.w,
+                                                         f4.z * n4.w - n4.z * f4.w});
+            float t = 0.0f;
+            const bool hit = terrain.Raycast(from, d, 400.0f, &t, nullptr);
+            std::vector<eng::Vec3> found;
+            const bool routed =
+                hit && navmesh.FindPath(player.Feet(), from + d * t, &found);
+            std::printf("  pick check: far.w %.6f, dir (%.3f %.3f %.3f), hit %d at "
+                        "%.1f m, path %d with %zu points\n",
+                        f4.w, d.x, d.y, d.z, int(hit), t, int(routed), found.size());
+        }
+
         world::PoseBanner(banner, scene, f.time);
 
         // --- sky ---------------------------------------------------------------
@@ -1227,9 +1325,10 @@ int main(int argc, char** argv) {
         ui->Text(26, 176, line,
                  cs.overflowed_cells ? eng::Vec4{1.0f, 0.72f, 0.35f, 1.0f}
                                      : eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
-        std::snprintf(line, sizeof(line), "looking at: %s   (0-5 to move)", stop.name);
+        std::snprintf(line, sizeof(line), "at: %s   (0-5 to travel)",
+                      kStopList[std::clamp(here, 0, kStops - 1)].name);
         ui->Text(26, 152, line, eng::Vec4{0.92f, 0.94f, 0.98f, 1.0f});
-        ui->Text(26, 200, "f: fog   t: taa   o: ao   v: shafts   [ ]: sun   r: reset",
+        ui->Text(26, 200, "wasd: walk   space: run   f t o v: effects   [ ]: sun   r: reset",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
 
         // --- passes --------------------------------------------------------------
