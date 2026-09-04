@@ -59,9 +59,19 @@ class ParticleSystem {
     // cannot grow: growing would mean reallocating a buffer the GPU may be
     // reading, and the frame that did it would be the one that dropped every
     // particle at once.
+    // `samples` and `depth_test` must match the PASS the sprites are drawn
+    // into, not the scene they belong to. Metal validates both and a mismatch
+    // is not a wrong picture, it is no picture: the pipeline is rejected at
+    // bind time and every draw after it in the pass is dropped, silently
+    // unless MTL_DEBUG_LAYER is on.
+    //
+    // depth_test off is for a pass drawn over a RESOLVED colour target, which
+    // has no depth attachment to test against. The soft fade still works
+    // there: particles.metal fades on the sampled scene depth, which is a
+    // better edge than the hardware test gives anyway.
     [[nodiscard]] static std::unique_ptr<ParticleSystem> Create(
         rhi::Device&, int capacity, rhi::Format color, std::string& error,
-        int samples = 1);
+        int samples = 1, bool depth_test = true);
     ~ParticleSystem();
 
     ParticleSystem(const ParticleSystem&) = delete;

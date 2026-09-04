@@ -61,6 +61,7 @@ struct Run {
     int slices = -1;
     double mean = -1.0;  // mean channel value of the capture, HUD excluded
     std::string log;
+    std::string shot;
 };
 
 // The demo's HUD is drawn into the top-left of the frame and prints the very
@@ -80,6 +81,26 @@ double MeanOutsideHud(const eng::Texture2D& img) {
             n += 3;
         }
     return n ? sum / double(n) : -1.0;
+}
+
+// How many pixels below the HUD band differ between two captures. The count,
+// not the magnitude: a subsystem can be faint and still be present, and a
+// subsystem that is absent changes exactly nothing.
+long DifferingPixelsBelowHud(const std::string& a, const std::string& b) {
+    std::string error;
+    const eng::Texture2D x = eng::png::DecodeFile(a, error);
+    const eng::Texture2D y = eng::png::DecodeFile(b, error);
+    if (x.Empty() || y.Empty() || x.width != y.width || x.height != y.height)
+        return -1;
+    long n = 0;
+    for (int row = kHudBandHeight; row < x.height; ++row)
+        for (int col = 0; col < x.width; ++col) {
+            const std::size_t o = (std::size_t(row) * x.width + col) * 4;
+            if (x.rgba[o] != y.rgba[o] || x.rgba[o + 1] != y.rgba[o + 1] ||
+                x.rgba[o + 2] != y.rgba[o + 2])
+                ++n;
+        }
+    return n;
 }
 
 const char* WorldBinary() {
@@ -107,10 +128,11 @@ Run RunWorld(const std::string& tag, std::vector<std::string> args,
         return r;
     }
     const std::string shot = "/tmp/valley_gate_" + tag + ".png";
+    r.shot = shot;
     const std::string out = "/tmp/valley_gate_" + tag + ".log";
     std::remove(shot.c_str());
 
-    std::vector<std::string> argv{bin, "--shot", shot, "--nosparks"};
+    std::vector<std::string> argv{bin, "--shot", shot};
     for (std::string& a : args) argv.push_back(std::move(a));
     std::vector<char*> raw;
     for (std::string& a : argv) raw.push_back(a.data());
@@ -176,7 +198,7 @@ int main() {
 
     // --- the valley renders at all ------------------------------------------
     std::printf("the default valley\n");
-    const Run base = RunWorld("base", {"--frames", "90"});
+    const Run base = RunWorld("base", {"--nosparks", "--frames", "90"});
     std::printf("    exit %d, %d instances, %d draws, shadow %d drawn / %d culled, "
                 "mean %.2f\n",
                 base.status, base.instances, base.draws, base.shadow_draws,
@@ -222,7 +244,7 @@ int main() {
 
     // --- the crowd, which is what exposed all of this -----------------------
     std::printf("--crowd 600, the GPU-driven showcase\n");
-    const Run c600 = RunWorld("c600", {"--frames", "90", "--crowd", "600"});
+    const Run c600 = RunWorld("c600", {"--nosparks", "--frames", "90", "--crowd", "600"});
     std::printf("    %d instances, %d draws, shadow %d drawn / %d culled, mean %.2f\n",
                 c600.instances, c600.draws, c600.shadow_draws, c600.shadow_culled,
                 c600.mean);
@@ -241,7 +263,7 @@ int main() {
     // black: mean 7.35 against 77.9, with no error anywhere. This is the
     // assertion that turns red if the cull is reverted.
     std::printf("--crowd 2000, which used to render black\n");
-    const Run c2000 = RunWorld("c2000", {"--frames", "90", "--crowd", "2000"});
+    const Run c2000 = RunWorld("c2000", {"--nosparks", "--frames", "90", "--crowd", "2000"});
     std::printf("    %d instances, %d draws, %d dropped, mean %.2f against base %.2f\n",
                 c2000.instances, c2000.draws, c2000.dropped, c2000.mean, base.mean);
     Check(c2000.exited && c2000.status == 0, "2000 boulders runs clean");
@@ -256,7 +278,7 @@ int main() {
     // ring slices against a ceiling of 8192 and the frame was black; it is 2703
     // now, because the depth-only passes stopped paying per caster.
     std::printf("--crowd 6000, which the ring could not hold at all\n");
-    const Run c6000 = RunWorld("c6000", {"--frames", "60", "--crowd", "6000"});
+    const Run c6000 = RunWorld("c6000", {"--nosparks", "--frames", "60", "--crowd", "6000"});
     std::printf("    %d instances, %d shadow draws, %d slices, %d dropped, mean %.2f\n",
                 c6000.instances, c6000.shadow_draws, c6000.slices, c6000.dropped,
                 c6000.mean);
@@ -266,7 +288,7 @@ int main() {
 
     // --- the GPU-driven path ------------------------------------------------
     std::printf("--indirect\n");
-    const Run ind = RunWorld("indirect", {"--frames", "90", "--crowd", "600",
+    const Run ind = RunWorld("indirect", {"--nosparks", "--frames", "90", "--crowd", "600",
                                           "--indirect"});
     std::printf("    %d instances, mean %.2f against forward %.2f\n", ind.instances,
                 ind.mean, c600.mean);
@@ -274,6 +296,31 @@ int main() {
     Check(ind.dropped == 0, "nothing dropped");
     Check(ind.mean > 0.0 && std::fabs(ind.mean - c600.mean) < c600.mean * 0.10,
           "and draws the same valley as the ordinary path, to a tenth");
+
+    // --- the sparks, which drew nothing at all for two commits --------------
+    //
+    // EVERY configuration above passes --nosparks, and that is why six of them
+    // never noticed that the particle system had stopped rendering. Moving the
+    // sparks out of the multisampled scene pass left their pipeline built for
+    // four samples and a depth attachment, bound into a pass that has one
+    // sample and no depth; Metal rejects the bind and drops the draw, silently
+    // unless MTL_DEBUG_LAYER is set. 1,576 live particles, 0 pixels.
+    //
+    // ON THE PIXEL COUNT, not the magnitude. The sparks are a faint additive
+    // haze -- the largest channel delta they produce is 1 of 255 -- so a frame
+    // mean cannot see them and neither could the check above. What a broken
+    // pipeline changes is the COUNT, from tens of thousands to exactly zero.
+    std::printf("the fire pit has embers in it\n");
+    const Run spark_on = RunWorld("sparkon", {"--frames", "90", "--look", "4",
+                                              "--size", "900", "600"});
+    const Run spark_off = RunWorld("sparkoff", {"--frames", "90", "--look", "4",
+                                                "--size", "900", "600", "--nosparks"});
+    const long differing = DifferingPixelsBelowHud(spark_on.shot, spark_off.shot);
+    std::printf("    %ld of %d pixels below the HUD differ with the sparks on\n",
+                differing, (600 - kHudBandHeight) * 900);
+    Check(spark_on.exited && spark_off.exited, "both spark captures ran");
+    Check(differing > 5000,
+          "the particle system reaches the frame at all");
 
     // --- the re-bake, which used to deadlock on the third one ---------------
     //
@@ -286,7 +333,7 @@ int main() {
     // A SHORTER LEASH than the others. A clean run of this takes about two
     // seconds; when the deadlock is present the process must be killed, and the
     // wait is dead time in every future run of the suite.
-    const Run bake = RunWorld("rebake", {"--frames", "100", "--rebake", "20"}, 60);
+    const Run bake = RunWorld("rebake", {"--nosparks", "--frames", "100", "--rebake", "20"}, 60);
     const int bakes = [&] {
         int n = 0;
         for (std::size_t i = bake.log.find("baking indirect light");

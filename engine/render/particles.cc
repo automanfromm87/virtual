@@ -54,7 +54,7 @@ std::unique_ptr<ParticleSystem> ParticleSystem::Create(rhi::Device& dev,
                                                        int capacity,
                                                        rhi::Format color,
                                                        std::string& error,
-                                                       int samples) {
+                                                       int samples, bool depth_test) {
     if (capacity <= 0) {
         error = "particle capacity must be positive";
         return nullptr;
@@ -92,7 +92,7 @@ std::unique_ptr<ParticleSystem> ParticleSystem::Create(rhi::Device& dev,
     pd.fragment_fn = "fs_particle";
     pd.color = color;
     pd.samples = samples;
-    pd.depth = true;
+    pd.depth = depth_test;
     // Depth TESTED but not WRITTEN. Tested so a particle behind a wall is
     // hidden; not written because a translucent sprite that writes depth
     // occludes every particle behind it, and a fountain becomes a single layer

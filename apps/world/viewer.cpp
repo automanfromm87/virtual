@@ -357,15 +357,23 @@ int main(int argc, char** argv) {
     // instead of cutting a hard edge into it.
     // IN THE SCENE PASS, so config.samples and not 1.
     //
-    // Particles DEPTH-TEST -- a spark behind a stone has to be behind it -- so
-    // they have to be drawn into a pass that has the depth buffer attached,
-    // which means the multisampled scene pass and not a later one over the
-    // resolved colour. A separate pass with no depth attachment draws nothing
-    // at all: the simulation ran, 555 particles were alive, and the screen was
-    // empty. Changing the sample count was the second wrong guess at it.
+    // ONE SAMPLE AND NO DEPTH, matching the pass they are actually drawn into.
+    //
+    // They used to be drawn inside the multisampled scene pass, and the comment
+    // here said so; when the depth resolve let that pass produce a sampleable
+    // depth, the sparks moved out to their own pass over the RESOLVED colour --
+    // which is single-sampled and has no depth attachment -- and this line was
+    // not moved with them. Metal rejects the bind and drops every draw after
+    // it, silently unless MTL_DEBUG_LAYER is set. Measured: 1,576 live
+    // particles and 0 differing pixels of 279,000 at the fire pit.
+    //
+    // Losing the hardware depth test costs nothing here. particles.metal
+    // already fades each sprite against the sampled scene depth -- that is what
+    // stops a spark cutting a hard edge into the ground -- and a soft fade is a
+    // better occlusion edge than a binary test.
     auto sparks = eng::ParticleSystem::Create(app->Gpu(), 6000,
                                               eng::Renderer::kSceneFormat, error,
-                                              config.samples);
+                                              /*samples=*/1, /*depth_test=*/false);
     if (!sparks) return Fail(error);
 
     // --- the terrain ---------------------------------------------------------
@@ -2389,10 +2397,18 @@ int main(int argc, char** argv) {
         }
 
         // --- passes --------------------------------------------------------------
+        // config.color, NOT a format of its own. The composite and the UI
+        // pipelines are built for config.color (BGRA8Unorm); a capture target
+        // in RGBA8Unorm is a pipeline/attachment mismatch that Metal rejects at
+        // bind time, so the whole composite pass is dropped. This hardware
+        // tolerated it -- the channel order came back right and every
+        // screenshot in every commit message so far was taken through it --
+        // which is exactly the kind of undefined behaviour that works here and
+        // faults somewhere else.
         if (!shot_path.empty() && !eng::rhi::Valid(shot_target))
-            shot_target = app->Gpu().CreateRenderTarget(
-                f.width, f.height, eng::rhi::Format::RGBA8Unorm,
-                /*cpu_readable=*/true);
+            shot_target = app->Gpu().CreateRenderTarget(f.width, f.height,
+                                                        config.color,
+                                                        /*cpu_readable=*/true);
         const eng::rhi::TextureId color = scene_targets.Hdr("color");
         const eng::rhi::TextureId ao = scene_targets.Color("ao");
         const eng::rhi::TextureId ms_color = scene_targets.Msaa("ms");
