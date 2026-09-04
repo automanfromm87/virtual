@@ -106,6 +106,9 @@ int main(int argc, char** argv) {
     // flips hard under a sub-pixel move is aliasing, and that is the only way
     // to separate shimmer from honest motion.
     float yaw_offset = 0.0f;
+    // Sun elevation in degrees. Exposed so a capture can be taken at a stated
+    // time of day rather than only at the one the demo starts with.
+    float sun_start = 31.5f;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc)
             shot_path = argv[++i];
@@ -114,6 +117,8 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--nofog") == 0) start_fog = false;
         else if (std::strcmp(argv[i], "--yaw") == 0 && i + 1 < argc)
             yaw_offset = float(std::atof(argv[++i]));
+        else if (std::strcmp(argv[i], "--sun") == 0 && i + 1 < argc)
+            sun_start = float(std::atof(argv[++i]));
     }
 
     // LINE BUFFERED. Redirected to a file, stdout is fully buffered, and a
@@ -425,7 +430,8 @@ int main(int argc, char** argv) {
     // against a different sun than the frame uses lights the scene as though
     // it were two times of day at once.
     eng::SkyConfig sky;
-    float sun_azimuth = 1.1f, sun_elevation = 0.55f;
+    float sun_azimuth = 1.1f;
+    float sun_elevation = sun_start / 57.2958f;
 
     // --- baked indirect light --------------------------------------------------
     //
@@ -443,7 +449,14 @@ int main(int argc, char** argv) {
     // real forest is 2.5M triangles and the bake traces hundreds of thousands
     // of rays; the sphere says "sky blocked here, and green" which is the whole
     // of a tree's contribution to indirect light.
-    {
+    // A LAMBDA, not a block that runs once, because the volume goes STALE the
+    // moment the sun moves: it holds where the light was, shadowed by geometry
+    // that has not moved, and nothing about it decays or warns. Baking once at
+    // startup is only correct for a scene whose sun is nailed down, which this
+    // one was until it got a key to move it.
+    double last_bake_seconds = 0.0;
+    int last_bake_dark = 0;
+    const auto bake_indirect = [&]() -> bool {
         // The sun and sky the bake assumes have to be the ones the frame uses,
         // or the indirect light disagrees with the direct light and the scene
         // looks lit by two different times of day.
@@ -481,7 +494,7 @@ int main(int argc, char** argv) {
                 env->ReadCube(e, eng::Environment::Probe::Irradiance, kFace, 0.0f);
                 app->Gpu().EndCompute();
             }
-            if (!app->Gpu().CommitAndWait(error)) return Fail(error);
+            if (!app->Gpu().CommitAndWait(error)) return false;
             const std::vector<eng::Vec4> cube = env->TakeCube();
             const auto face_mean = [&](int face) {
                 eng::Vec3 sum{0.0f, 0.0f, 0.0f};
@@ -559,7 +572,9 @@ int main(int argc, char** argv) {
         const int filled = volume.FillDark();
         const double secs =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        if (!app->Draw().SetIrradianceVolume(volume, error)) return Fail(error);
+        if (!app->Draw().SetIrradianceVolume(volume, error)) return false;
+        last_bake_seconds = secs;
+        last_bake_dark = dark;
         std::printf("  %.2f s, %d of %d probes were buried, %d filled from neighbours\n",
                     secs, dark, gi.nx * gi.ny * gi.nz, filled);
         {
@@ -576,7 +591,9 @@ int main(int argc, char** argv) {
                         "under canopy (%.3f %.3f %.3f)\n",
                         open.x, open.y, open.z, under.x, under.y, under.z);
         }
-    }
+        return true;
+    };
+    if (!bake_indirect()) return Fail(error);
 
     // Two instances, at the origin: the trees were baked into world space by
     // AppendTransformed, so the model matrix is identity and the only reason
@@ -678,11 +695,15 @@ int main(int argc, char** argv) {
     float camera_yaw = 0.7f + yaw_offset, camera_pitch = 0.26f,
           camera_distance = 13.0f;
     float baked_az = 1e9f, baked_el = 1e9f;
+    bool gi_stale = false;
+    int gi_still_frames = 0;
 
     app->Actions().BindMouse("click", eng::app::MouseButton::Left);
     app->Actions().BindMouse("orbit", eng::app::MouseButton::Right);
     app->Actions().Bind("fog", 'f');
     app->Actions().Bind("taa", 't');
+    app->Actions().Bind("sun_back", '[');
+    app->Actions().Bind("sun_fwd", ']');
     app->Actions().Bind("reset", 'r');
 
     eng::RenderGraph graph;
@@ -701,6 +722,34 @@ int main(int argc, char** argv) {
         camera_distance = std::clamp(camera_distance - f.scroll * 1.2f, 6.0f, 60.0f);
         if (app->Actions().Pressed("fog")) post->config.fog = !post->config.fog;
         if (app->Actions().Pressed("taa")) post->config.taa = !post->config.taa;
+
+        // --- the sun, and the indirect light that has to follow it -------------
+        //
+        // The volume holds where the light WAS. Move the sun and it keeps
+        // reporting the old bounce, shadowed by the old geometry, and nothing
+        // about it decays or complains -- the scene just quietly disagrees with
+        // itself. That was invisible here only because there was no way to move
+        // the sun.
+        //
+        // REBAKED ON A DEBOUNCE, not per frame. It costs 0.09 s, which is six
+        // frames dropped, so doing it while a key is held would make the sun
+        // unusable. Waiting until it has been still for a fifth of a second
+        // means one hitch at the end of a movement instead of a hitch per
+        // frame, and the stale volume in between is a far better wrong answer
+        // than a constant ambient.
+        float sun_input = 0.0f;
+        if (app->Actions().Down("sun_back")) sun_input -= 1.0f;
+        if (app->Actions().Down("sun_fwd")) sun_input += 1.0f;
+        if (sun_input != 0.0f) {
+            sun_elevation = std::clamp(sun_elevation + sun_input * f.dt * 0.30f,
+                                       0.08f, 1.45f);
+            sun_azimuth += sun_input * f.dt * 0.45f;
+            gi_stale = true;
+            gi_still_frames = 0;
+        } else if (gi_stale && ++gi_still_frames > 12) {
+            if (!bake_indirect()) return Fail(error);
+            gi_stale = false;
+        }
         if (app->Actions().Pressed("reset")) {
             player.Teleport(eng::Vec3{0.0f, terrain.HeightAt(0.0f, 0.0f) + 0.5f, 0.0f});
             path.clear();
@@ -845,17 +894,25 @@ int main(int argc, char** argv) {
 
         // --- HUD ----------------------------------------------------------------
         ui->Begin(f.width, f.height);
-        ui->Rect(12, 12, 470, 156, eng::Vec4{0.05f, 0.06f, 0.08f, 0.72f});
-        ui->Outline(12, 12, 470, 156, 1.0f, eng::Vec4{0.35f, 0.40f, 0.48f, 0.9f});
+        ui->Rect(12, 12, 470, 180, eng::Vec4{0.05f, 0.06f, 0.08f, 0.72f});
+        ui->Outline(12, 12, 470, 180, 1.0f, eng::Vec4{0.35f, 0.40f, 0.48f, 0.9f});
         char line[192];
         std::snprintf(line, sizeof(line), "%zu chunks   lod %d/%d/%d   %d nav polys",
                       chunks.size(), lod_counts[0], lod_counts[1], lod_counts[2],
                       navmesh.PolyCount());
         ui->Text(26, 26, line, eng::Vec4{0.92f, 0.94f, 0.98f, 1.0f});
+        std::snprintf(line, sizeof(line),
+                      "sun %.0f deg   gi %s (%.0f ms, %d buried)",
+                      sun_elevation * 57.2958f,
+                      gi_stale ? "STALE" : "baked", last_bake_seconds * 1000.0,
+                      last_bake_dark);
+        ui->Text(26, 50, line,
+                 gi_stale ? eng::Vec4{1.0f, 0.72f, 0.35f, 1.0f}
+                          : eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
         std::snprintf(line, sizeof(line), "path: %zu points, at %zu   ground %.2f m",
                       path.size(), path_at, terrain.HeightAt(player.Feet().x,
                                                              player.Feet().z));
-        ui->Text(26, 50, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
+        ui->Text(26, 74, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
         std::snprintf(line, sizeof(line),
                       "gpu %.2f ms   fog %s   taa %s   exposure %.2f (%+.1f EV)   %s",
                       app->Gpu().LastFrameGpuMilliseconds(),
@@ -863,10 +920,10 @@ int main(int argc, char** argv) {
                       post->config.taa ? "on" : "off", post->LastExposure(),
                       std::log2(std::max(post->LastExposure(), 1e-6f)),
                       player.Grounded() ? "grounded" : "airborne");
-        ui->Text(26, 74, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
-        ui->Text(26, 104, "click: walk there    right-drag: orbit    scroll: zoom",
+        ui->Text(26, 98, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
+        ui->Text(26, 128, "click: walk there    right-drag: orbit    scroll: zoom",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
-        ui->Text(26, 128, "f: fog    t: taa    r: reset",
+        ui->Text(26, 152, "f: fog    t: taa    [ ]: sun    r: reset",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
 
         // --- passes --------------------------------------------------------------
