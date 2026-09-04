@@ -22,6 +22,14 @@
 // distinct box shape is its own mesh, which is a handful of meshes and no
 // special case anywhere else.
 //
+// AND EACH ONE ADDS ITS COLLIDERS. This was missed entirely on the first pass:
+// the physics world had exactly one body in it, the terrain, so the character
+// walked through every pillar, stone, pane and tree in the valley. Nothing
+// reported it because nothing was wrong -- there was simply nothing there to
+// hit. A district that draws something solid and does not collide it is half
+// built, so the world goes in beside the scene rather than being somebody
+// else's job to remember.
+//
 // EACH DISTRICT APPENDS to a scene it does not own. They return the handles the
 // frame loop needs to animate them and nothing else; placement, materials and
 // geometry are decided here so the loop stays a loop.
@@ -35,6 +43,7 @@
 #include <vector>
 
 #include "engine/geometry/mesh.h"
+#include "engine/physics/physics.h"
 #include "engine/render/renderer.h"
 #include "engine/scene/scene.h"
 
@@ -78,7 +87,8 @@ struct Gallery {
     static constexpr int kRows = 4;  // metallic, dielectric to metal
 };
 
-inline void BuildGallery(eng::Renderer& r, eng::Scene& scene, eng::MeshHandle sphere,
+inline void BuildGallery(eng::Renderer& r, eng::Scene& scene,
+                         eng::physics::World& world, eng::MeshHandle sphere,
                          float ground_y, std::string& error) {
     // The plinth first, so the spheres have something to sit on that is
     // obviously man-made -- a sphere floating over grass reads as a bug.
@@ -96,9 +106,16 @@ inline void BuildGallery(eng::Renderer& r, eng::Scene& scene, eng::MeshHandle sp
     plinth.mesh = r.UploadMesh(
         eng::MakeBox(eng::Vec3{w, kTop * 0.5f, d}, eng::Vec4{1, 1, 1, 1}));
     plinth.material = stone_mat;
-    plinth.model = eng::Mat4::Translation(
-        eng::Vec3{kGallery.x, ground_y + kTop * 0.5f, kGallery.z});
+    const eng::Vec3 plinth_at{kGallery.x, ground_y + kTop * 0.5f, kGallery.z};
+    plinth.model = eng::Mat4::Translation(plinth_at);
     scene.instances.push_back(plinth);
+    {
+        eng::physics::Body b;
+        b.shape = eng::physics::Shape::MakeBox(eng::Vec3{w, kTop * 0.5f, d});
+        b.position = plinth_at;
+        b.SetMass(0.0f);
+        world.Add(b);
+    }
 
     for (int row = 0; row < Gallery::kRows; ++row)
         for (int col = 0; col < Gallery::kCols; ++col) {
@@ -144,6 +161,7 @@ struct LanternHall {
 };
 
 inline LanternHall BuildLanternHall(eng::Renderer& r, eng::Scene& scene,
+                                    eng::physics::World& world,
                                     eng::MeshHandle sphere, float ground_y,
                                     std::string& error) {
     LanternHall hall;
@@ -182,6 +200,12 @@ inline LanternHall BuildLanternHall(eng::Renderer& r, eng::Scene& scene,
             p.material = pillar_mat;
             p.model = eng::Mat4::Translation(base + eng::Vec3{0, kHeight * 0.5f, 0});
             scene.instances.push_back(p);
+            eng::physics::Body solid;
+            solid.shape = eng::physics::Shape::MakeBox(
+                eng::Vec3{0.22f, kHeight * 0.5f, 0.22f});
+            solid.position = base + eng::Vec3{0, kHeight * 0.5f, 0};
+            solid.SetMass(0.0f);
+            world.Add(solid);
 
             // Two lanterns per pillar at different heights, which is what takes
             // this past a hundred lights and into the range where clustering is
@@ -223,7 +247,8 @@ inline LanternHall BuildLanternHall(eng::Renderer& r, eng::Scene& scene,
 // treeline through, and overlapping panes have to accumulate rather than pick a
 // winner -- which is the whole difference between weighted-blended OIT and a
 // back-to-front sort that gets the order wrong when depths tie.
-inline void BuildGlassPavilion(eng::Renderer& r, eng::Scene& scene, float ground_y,
+inline void BuildGlassPavilion(eng::Renderer& r, eng::Scene& scene,
+                               eng::physics::World& world, float ground_y,
                                std::string& error) {
     eng::MaterialDesc frame_md;
     frame_md.shading = eng::Shading::Lit;
@@ -301,6 +326,16 @@ inline void BuildGlassPavilion(eng::Renderer& r, eng::Scene& scene, float ground
         pane.tint = eng::Vec4{1.0f, 1.0f, 1.0f, tints[std::size_t(i % 3)].w};
         pane.model = eng::Mat4::Translation(at) * eng::Mat4::RotationY(-angle);
         scene.instances.push_back(pane);
+        // Glass is SOLID. Being able to see through a thing is not the same as
+        // being able to walk through it, and a transparent material is exactly
+        // where that gets forgotten.
+        eng::physics::Body col;
+        col.shape = eng::physics::Shape::MakeBox(eng::Vec3{kW * 0.5f, kH * 0.5f, 0.06f});
+        col.position = at;
+        col.orientation = eng::Quat{0.0f, std::sin(-angle * 0.5f), 0.0f,
+                                    std::cos(-angle * 0.5f)};
+        col.SetMass(0.0f);
+        world.Add(col);
     }
 }
 
@@ -319,7 +354,8 @@ inline void BuildGlassPavilion(eng::Renderer& r, eng::Scene& scene, float ground
 // what MakeGroundDecal is. It has to know what it lands on and be rebuilt if
 // that changes; in exchange it works here, sorts like anything else, and is lit
 // by the same sun as the ground under it.
-inline void BuildFirePit(eng::Renderer& r, eng::Scene& scene, eng::MeshHandle sphere,
+inline void BuildFirePit(eng::Renderer& r, eng::Scene& scene,
+                         eng::physics::World& world, eng::MeshHandle sphere,
                          eng::rhi::TextureId soot, float ground_y,
                          const std::function<float(float, float)>& height,
                          std::string& error) {
@@ -355,6 +391,13 @@ inline void BuildFirePit(eng::Renderer& r, eng::Scene& scene, eng::MeshHandle sp
                                  kFirePit.z + std::sin(a) * radius}) *
                    eng::Mat4::Scale(size * 2.0f);
         scene.instances.push_back(in);
+        eng::physics::Body col;
+        col.shape = eng::physics::Shape::MakeSphere(size);
+        col.position = eng::Vec3{kFirePit.x + std::cos(a) * radius,
+                                 ground_y + size * 0.35f,
+                                 kFirePit.z + std::sin(a) * radius};
+        col.SetMass(0.0f);
+        world.Add(col);
     }
     // Embers in the middle, so the fire has a source when the particles are off.
     for (int i = 0; i < 5; ++i) {
@@ -430,7 +473,8 @@ struct Banner {
     eng::Vec3 root{0.0f, 0.0f, 0.0f};
 };
 
-inline Banner BuildBanner(eng::Renderer& r, eng::Scene& scene, float ground_y,
+inline Banner BuildBanner(eng::Renderer& r, eng::Scene& scene,
+                          eng::physics::World& world, float ground_y,
                           std::string& error) {
     Banner b;
     b.root = eng::Vec3{kFlag.x, ground_y, kFlag.z};
@@ -446,6 +490,14 @@ inline Banner BuildBanner(eng::Renderer& r, eng::Scene& scene, float ground_y,
     pole.material = pole_mat;
     pole.model = eng::Mat4::Translation(b.root + eng::Vec3{0, (b.kTop + 0.4f) * 0.5f, 0});
     scene.instances.push_back(pole);
+    {
+        eng::physics::Body col;
+        col.shape = eng::physics::Shape::MakeBox(
+            eng::Vec3{0.07f, (b.kTop + 0.4f) * 0.5f, 0.07f});
+        col.position = b.root + eng::Vec3{0, (b.kTop + 0.4f) * 0.5f, 0};
+        col.SetMass(0.0f);
+        world.Add(col);
+    }
 
     // The cloth: a grid, finer along the wave than across it, because that is
     // the axis it bends on and a coarse grid there shows the wave as facets.

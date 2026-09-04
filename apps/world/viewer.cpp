@@ -370,6 +370,12 @@ int main(int argc, char** argv) {
     // a hundredth of the geometry.
     struct CanopyProxy { eng::Vec3 centre; float radius; };
     std::vector<CanopyProxy> canopies;
+    // A CAPSULE PER TRUNK. Two hundred trees and not one of them was solid --
+    // the physics world held the terrain and nothing else, so the forest was a
+    // painting you walked through. Recorded here and added once the world
+    // exists, because planting happens first.
+    struct TrunkCollider { eng::Vec3 base; float radius, height; };
+    std::vector<TrunkCollider> trunks;
     {
         // sides and segments take no random draws, and the leaf stream is
         // separate from the skeleton's, so all four of these can move without
@@ -487,6 +493,10 @@ int main(int argc, char** argv) {
             // wrong.
             canopies.push_back(
                 {eng::Vec3{c.x, c.y, c.z}, t.foliage.bounds.radius * scale * 0.45f});
+            // Only the trunk, and only the part a person can walk into. The
+            // branches above head height are not worth a collider each, and the
+            // canopy is not something you bump into on the ground.
+            trunks.push_back({at, 0.17f * scale * 1.25f, 4.4f * scale});
             ++planted;
         }
         std::size_t per_lod[kForestLods] = {0, 0, 0}, used = 0;
@@ -556,6 +566,39 @@ int main(int argc, char** argv) {
             // produces one that lines up with its neighbours.
             for (int lod = 0; lod < 3; ++lod) {
                 eng::Mesh m = terrain.BuildChunk(cx, cz, lod);
+                // THE GROUND IS NOT ONE THING. It was: a single albedo across
+                // 128 metres, so every slope, every hollow and every ridge was
+                // the same green. That is the clearest tell that a landscape
+                // was generated -- real ground changes with the shape it is on,
+                // because what grows and what washes away depend on the slope.
+                //
+                // Done in the VERTEX COLOUR because the shader already
+                // multiplies it into the albedo, so it costs nothing and needs
+                // no engine change. The cost is that the blend is only as sharp
+                // as the mesh, which for a 0.5 m grid is finer than the
+                // transition wants to be anyway.
+                for (VertexIn& v : m.vertices) {
+                    // Steepness, 0 flat to 1 vertical.
+                    const float steep = std::clamp(1.0f - v.normal.y, 0.0f, 1.0f);
+                    // Grass gives way to bare earth on anything that sheds
+                    // water, and to pale rock where it is steep enough that
+                    // nothing holds at all.
+                    const float earth = std::clamp((steep - 0.06f) / 0.16f, 0.0f, 1.0f);
+                    const float rock = std::clamp((steep - 0.26f) / 0.22f, 0.0f, 1.0f);
+                    // And a slow drift with height, so the valley floor is
+                    // lusher than the rim: cold and thin soil up top.
+                    const float high = std::clamp((v.position.y + 2.0f) / 18.0f,
+                                                  0.0f, 1.0f);
+                    const auto mix3 = [](eng::Vec3 a, eng::Vec3 b, float t) {
+                        return eng::Vec3{a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t,
+                                         a.z + (b.z - a.z) * t};
+                    };
+                    eng::Vec3 c{1.0f, 1.0f, 1.0f};
+                    c = mix3(c, eng::Vec3{2.05f, 1.55f, 0.95f}, earth);
+                    c = mix3(c, eng::Vec3{2.60f, 2.45f, 2.25f}, rock);
+                    c = mix3(c, eng::Vec3{1.15f, 1.05f, 0.80f}, high * 0.5f);
+                    v.color = eng::Vec4{c.x, c.y, c.z, 1.0f};
+                }
                 // The terrain builder does not make tangents, and the ground
                 // now has a normal map. Without a frame the shader falls back
                 // to the geometric normal and the map does nothing at all --
@@ -588,6 +631,18 @@ int main(int argc, char** argv) {
     ground_body.shape = eng::physics::Shape::MakeHeightfield(field);
     ground_body.inverse_mass = 0.0f;
     world.Add(ground_body);
+
+    // The trunks, now that there is a world to put them in.
+    for (const TrunkCollider& t : trunks) {
+        eng::physics::Body b;
+        // A capsule and not a box: a character brushing a round trunk should
+        // slide round it, and a box catches on its corners.
+        b.shape = eng::physics::Shape::MakeCapsule(t.radius, t.height * 0.5f);
+        b.position = t.base + eng::Vec3{0.0f, t.height * 0.5f, 0.0f};
+        b.SetMass(0.0f);
+        world.Add(b);
+    }
+    std::printf("  %zu trunk colliders\n", trunks.size());
 
     // --- the navmesh ---------------------------------------------------------
     //
@@ -853,20 +908,20 @@ int main(int argc, char** argv) {
     // than a convenience.
     const eng::MeshHandle unit_sphere = app->Draw().UploadMesh(
         eng::MakeUVSphere(0.5f, 24, 32, eng::Vec4{1, 1, 1, 1}, eng::Vec4{1, 1, 1, 1}));
-    world::BuildGallery(app->Draw(), scene, unit_sphere,
+    world::BuildGallery(app->Draw(), scene, world, unit_sphere,
                         terrain.HeightAt(world::kGallery.x, world::kGallery.z), error);
     const world::LanternHall hall = world::BuildLanternHall(
-        app->Draw(), scene, unit_sphere,
+        app->Draw(), scene, world, unit_sphere,
         terrain.HeightAt(world::kLanternHall.x, world::kLanternHall.z), error);
     world::BuildGlassPavilion(
-        app->Draw(), scene,
+        app->Draw(), scene, world,
         terrain.HeightAt(world::kGlassPavilion.x, world::kGlassPavilion.z), error);
-    world::BuildFirePit(app->Draw(), scene, unit_sphere,
+    world::BuildFirePit(app->Draw(), scene, world, unit_sphere,
                         decals_on ? soot_tex : eng::rhi::TextureId{},
                         terrain.HeightAt(world::kFirePit.x, world::kFirePit.z),
                         [&](float x, float z) { return terrain.HeightAt(x, z); }, error);
     const world::Banner banner = world::BuildBanner(
-        app->Draw(), scene, terrain.HeightAt(world::kFlag.x, world::kFlag.z), error);
+        app->Draw(), scene, world, terrain.HeightAt(world::kFlag.x, world::kFlag.z), error);
     if (!error.empty()) return Fail(error);
     // CLUSTERED LIGHTING ON, because 60 lanterns is well past the point where
     // a forward pass can loop over every light for every fragment -- and
@@ -910,6 +965,33 @@ int main(int argc, char** argv) {
     cc.step_height = 0.4f;
     eng::physics::CharacterController player(cc);
     player.Teleport(eng::Vec3{0.0f, terrain.HeightAt(0.0f, 0.0f) + 0.5f, 0.0f});
+
+    // A COLLISION SELF-CHECK, on a scratch controller so nothing real moves.
+    //
+    // The forest and every district were render-only for their whole existence
+    // and the symptom was silence: the physics world had one body in it, so
+    // there was nothing to hit and nothing to report. A count of colliders does
+    // not prove they stop anything -- a capsule at the wrong height or a box
+    // with zero extent adds to the count and blocks nothing -- so this walks
+    // into one and looks at where it ends up.
+    {
+        eng::physics::CharacterController probe(cc);
+        const float px = world::kFlag.x + 3.0f, pz = world::kFlag.z;
+        probe.Teleport(eng::Vec3{px, terrain.HeightAt(px, pz) + 0.5f, pz});
+        for (int i = 0; i < 240; ++i)
+            probe.Move(world, eng::Vec3{-0.025f, -cc.skin * (2.0f / 3.0f), 0.0f});
+        // SIGNED, and that is the whole check. The first version took the
+        // unsigned distance and reported "blocked, 3.00 m" for a character that
+        // had walked from three metres in front of the pole clean through to
+        // three metres behind it -- both are three metres away. A test that
+        // cannot tell "stopped short" from "went straight through" is not
+        // testing collision at all.
+        const float dx = probe.Feet().x - world::kFlag.x;
+        std::printf("  walked 6 m at the banner pole from x+3: ended at x%+.2f (%s)\n",
+                    dx, dx > cc.radius * 0.8f ? "blocked" : "WALKED THROUGH");
+    }
+
+
 
     const eng::rhi::TextureId shadow_map = app->Gpu().CreateShadowMap(shadow_px);
     app->Draw().SetShadowMapSize(shadow_px);
