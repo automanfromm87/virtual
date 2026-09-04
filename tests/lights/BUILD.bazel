@@ -1,0 +1,17 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Clustered lighting: the same picture, and a cheaper one. Both are checked --
+# an optimisation that changes the image is not one.
+cc_test(
+    name = "lights_test",
+    srcs = ["main.cpp"],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/rhi",
+        "//engine/scene",
+        "//engine/shaders",
+    ],
+)

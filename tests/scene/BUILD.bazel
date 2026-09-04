@@ -1,0 +1,13 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_test(
+    name = "occlusion_test",
+    srcs = ["main.cpp"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        "//engine/render",
+        "//engine/scene",
+    ],
+)

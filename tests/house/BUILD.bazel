@@ -1,0 +1,29 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# The apartment itself: plan data plus the mesh/material upload. Shared so the
+# windowed viewer and the offscreen gate look at exactly the same building.
+cc_library(
+    name = "house_scene",
+    hdrs = [
+        "plan.h",
+        "scene_build.h",
+    ],
+    deps = [
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/scene",
+    ],
+)
+
+cc_test(
+    name = "house_test",
+    srcs = ["offscreen.cpp"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":house_scene",
+        "//engine/render",
+        "//engine/rhi",
+    ],
+)

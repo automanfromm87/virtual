@@ -1,0 +1,16 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_test(
+    name = "skinned_test",
+    srcs = ["offscreen.cpp"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        "//tests/common:skinned_scene",
+        "//engine/asset",
+        "//engine/asset:testdata",
+        "//engine/render",
+        "//engine/rhi",
+    ],
+)

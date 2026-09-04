@@ -1,0 +1,18 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# A procedurally generated skinned tentacle, shared by the skinning and gallery
+# tests. Generated rather than imported so every vertex's weight comes from a
+# formula the test can evaluate for itself -- an imported mesh would only prove
+# the importer and the skinner agree, not that either is right.
+cc_library(
+    name = "skinned_scene",
+    hdrs = ["skinned_scene.h"],
+    deps = [
+        "//engine/anim",
+        "//engine/geometry",
+        "//engine/render",
+        "//engine/scene",
+    ],
+)
