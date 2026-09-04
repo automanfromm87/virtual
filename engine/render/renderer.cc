@@ -455,6 +455,12 @@ struct Renderer::Impl {
 
     RenderStats stats;
     int shadow_draws = 0;
+    // Casters the per-cascade frustum test rejected, summed over the cascades,
+    // and casters lost because the shared uniform ring ran dry mid-pass. The
+    // second one is not a statistic, it is a failure: everything after this
+    // pass is drawing from the same ring.
+    int shadow_culled = 0;
+    int shadow_overflowed = 0;
     int shadow_map_size = Renderer::kDirectionalShadowSize;
     // Reused across frames so a steady-state frame allocates nothing.
     std::vector<DrawItem> visible;
@@ -705,6 +711,8 @@ const RenderStats& Renderer::LastStats() const { return impl_->stats; }
 const std::vector<int>& Renderer::LastDrawOrder() const { return impl_->draw_order; }
 int Renderer::PipelineCount() const { return int(impl_->pipeline_cache.size()); }
 int Renderer::ShadowDrawCount() const { return impl_->shadow_draws; }
+int Renderer::ShadowCulledCount() const { return impl_->shadow_culled; }
+int Renderer::ShadowOverflowCount() const { return impl_->shadow_overflowed; }
 
 std::uint32_t Renderer::PipelineOf(MaterialHandle m) const {
     if (!Valid(m) || m.v >= impl_->materials.size()) return 0;
@@ -1443,6 +1451,8 @@ int Renderer::ShadowMapSize() const { return impl_->shadow_map_size; }
 
 void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
     impl_->shadow_draws = 0;
+    impl_->shadow_culled = 0;
+    impl_->shadow_overflowed = 0;
     if (scene.shadowExtent <= 0.0f) return;
     // Cascades tile the map. One cascade uses the whole thing, which is the
     // behaviour this had before they existed.
@@ -1461,16 +1471,34 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
     // mesh in this engine is closed.
     enc.SetCull(rhi::Cull::Front, rhi::Winding::CounterClockwise);
 
-    for (int cascade = 0; cascade < cascades; ++cascade) {
+    // Once the shared ring is dry it stays dry for the rest of the frame, so
+    // the remaining cascades have nothing to do but re-discover that. The old
+    // `break` left the instance loop only, and the cascades after it rendered
+    // empty tiles at full price.
+    bool ring_dry = false;
+    for (int cascade = 0; cascade < cascades && !ring_dry; ++cascade) {
     const Mat4 lightViewProj =
         cascades > 1 ? scene.CascadeViewProj(cascade, aspect) : scene.LightViewProj();
+    // CULLED PER CASCADE, and the reason is that this loop is per cascade:
+    // without a test here every caster in the scene is submitted once for EVERY
+    // cascade, so a scene of a thousand objects costs three thousand shadow
+    // draws whose only effect, for most of them, is to be clipped away by the
+    // ortho box they are nowhere near.
+    //
+    // Culling against that box is exactly what the rasteriser already does, so
+    // the shadow map comes out identical -- CascadeViewProj deliberately pulls
+    // the box back four radii toward the light so that casters BEHIND the slice
+    // are inside it, and anything still outside cannot write a texel. Which
+    // makes this free work removed, not shadows removed.
+    const Frustum light_frustum = Frustum::FromViewProj(lightViewProj);
     if (cascades > 1) {
         enc.SetViewport((cascade % per_side) * tile_px, (cascade / per_side) * tile_px,
                         tile_px, tile_px);
         enc.SetScissor((cascade % per_side) * tile_px, (cascade / per_side) * tile_px,
                        tile_px, tile_px);
     }
-    for (const Instance& inst : scene.instances) {
+    for (std::size_t n = 0; n < scene.instances.size(); ++n) {
+        const Instance& inst = scene.instances[n];
         if (!Valid(inst.mesh) || inst.mesh.v >= impl_->meshes.size()) continue;
         // TRANSPARENT SURFACES DO NOT CAST. A window pane written into the
         // shadow map is opaque there, so it blocks the very sunlight it is
@@ -1484,10 +1512,42 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
             continue;
 
         const GpuMesh& gm = impl_->meshes[inst.mesh.v];
-        const std::size_t offset = impl_->AllocUniform();
-        if (offset == Impl::kNoSpace) break;
-
         const bool skinned = IsSkinned(gm, inst, scene);
+        // Object-space bounds into world space, the same way the camera cull
+        // does it: the bounds are a sphere precisely so that a transform is a
+        // moved centre and a scaled radius, with no re-fitting.
+        //
+        // NOT FOR A SKINNED CASTER. gm.bounds is the BIND pose, and a pose is
+        // free to leave it -- an arm raised over the head is outside the bounds
+        // of an arm at rest. Culling on it drops shadows that are genuinely in
+        // the cascade, and the symptom is a shadow that blinks out at one point
+        // in an animation. Skinned instances are a handful next to the statics
+        // this test exists to reject, so exempting them costs nothing.
+        if (!skinned) {
+            const Vec4 bc = inst.model * Vec4{gm.bounds.center.x, gm.bounds.center.y,
+                                              gm.bounds.center.z, 1.0f};
+            if (!light_frustum.IntersectsSphere(
+                    Vec3{bc.x, bc.y, bc.z},
+                    gm.bounds.radius * MaxScale(inst.model))) {
+                ++impl_->shadow_culled;
+                continue;
+            }
+        }
+
+        const std::size_t offset = impl_->AllocUniform();
+        if (offset == Impl::kNoSpace) {
+            // THE RING IS SHARED WITH EVERY PASS THAT FOLLOWS. Breaking out
+            // quietly is how the scene pass gets no slices at all and the frame
+            // comes out black with nothing to point at, so count what was lost
+            // and let the caller see it: the rest of this cascade, and all of
+            // every cascade after it.
+            impl_->shadow_overflowed +=
+                int(scene.instances.size() - n) +
+                int(scene.instances.size()) * (cascades - 1 - cascade);
+            ring_dry = true;
+            break;
+        }
+
         std::size_t palette_offset = Impl::kNoSpace;
         if (skinned) {
             palette_offset = impl_->AllocPalette();
@@ -1529,8 +1589,12 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
     }
     }
     if (cascades > 1) {
+        // BOTH from shadow_map_size. The scissor used the kDirectionalShadowSize
+        // DEFAULT, which is not the size when SetShadowMapSize has been called --
+        // the world app asks for 4096 -- so the restore left a scissor smaller
+        // than the viewport it was restoring alongside.
         enc.SetViewport(0, 0, impl_->shadow_map_size, impl_->shadow_map_size);
-        enc.SetScissor(0, 0, kDirectionalShadowSize, kDirectionalShadowSize);
+        enc.SetScissor(0, 0, impl_->shadow_map_size, impl_->shadow_map_size);
     }
 }
 
@@ -1641,6 +1705,13 @@ void Renderer::DrawSceneDepth(rhi::Encoder& enc, const Scene& scene, int width,
     // pipeline is single-sampled, which is what makes this readable by SSAO
     // when the colour pass is running multisampled.
     const Mat4 viewProj = scene.camera.ViewProj(float(width) / float(height));
+    // The SAME camera frustum the colour pass culls against, for the same
+    // reason: this prepass runs over the whole scene, and without the test it
+    // submits every object behind the camera to write a depth value that is
+    // clipped on arrival. The colour pass that follows draws only what it can
+    // see, so an uncultured prepass is strictly more draws than the pass it
+    // exists to accelerate.
+    const Frustum frustum = Frustum::FromViewProj(viewProj);
 
     rhi::PipelineId bound;
     enc.SetCull(rhi::Cull::Back, rhi::Winding::CounterClockwise);
@@ -1650,10 +1721,20 @@ void Renderer::DrawSceneDepth(rhi::Encoder& enc, const Scene& scene, int width,
             impl_->materials[inst.material.v].transparent)
             continue;
         const GpuMesh& gm = impl_->meshes[inst.mesh.v];
+        const bool skinned = IsSkinned(gm, inst, scene);
+        // Exempt for the same reason as the shadow pass: gm.bounds is the bind
+        // pose and a posed mesh may leave it, and a prepass that drops a
+        // surface the colour pass then draws is worse than no prepass.
+        if (!skinned) {
+            const Vec4 bc = inst.model * Vec4{gm.bounds.center.x, gm.bounds.center.y,
+                                              gm.bounds.center.z, 1.0f};
+            if (!frustum.IntersectsSphere(Vec3{bc.x, bc.y, bc.z},
+                                          gm.bounds.radius * MaxScale(inst.model)))
+                continue;
+        }
         const std::size_t offset = impl_->AllocUniform();
         if (offset == Impl::kNoSpace) break;
 
-        const bool skinned = IsSkinned(gm, inst, scene);
         std::size_t palette_offset = Impl::kNoSpace;
         if (skinned) {
             palette_offset = impl_->AllocPalette();
@@ -2425,6 +2506,18 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
     // scene, because the caller needs to know who was taken. WasBatched answers
     // that from `batched_mask` below, so the remainder -- skinned, transparent
     // -- can still be drawn the ordinary way.
+    //
+    // BAILING OUT HAS TO UNSAY THE MASK. Once the grouping loop below has
+    // marked an instance as batched, a bare `return 0` from a failed
+    // allocation leaves the caller believing the indirect path took it -- so
+    // it is left out of the remainder scene too, and it is drawn by nobody.
+    // The symptom is an empty frame on a path that reported no error.
+    const auto Abandon = [&]() {
+        impl_->batched_mask.assign(scene.instances.size(), 0);
+        impl_->live_batches = 0;
+        impl_->batched_instances = 0;
+        return 0;
+    };
     std::vector<std::vector<std::pair<const Instance*, int>>> groups;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> keys;
     for (std::size_t n = 0; n < scene.instances.size(); ++n) {
@@ -2504,11 +2597,11 @@ int Renderer::CullScene(rhi::ComputeEncoder& enc, const Scene& scene, int width,
             b.capacity = cap;
             if (!Valid(b.instances) || !Valid(b.visible) || !Valid(b.counter) ||
                 !Valid(b.args))
-                return 0;
+                return Abandon();
         }
 
         auto* dst = static_cast<GpuInstance*>(impl_->dev->MapBuffer(b.instances));
-        if (!dst) return 0;
+        if (!dst) return Abandon();
         const GpuMesh& gm = impl_->meshes[keys[g].first];
         for (std::size_t i = 0; i < need; ++i) {
             const Instance& inst = *groups[g][i].first;

@@ -97,6 +97,7 @@ int main() {
     std::vector<std::uint8_t> pixels;
     eng::RenderStats stats;
     int shadow_draws = 0;
+    int shadow_culled = 0;
 
     auto draw = [&](const eng::Scene& scene) {
         eng::RenderGraph graph;
@@ -140,6 +141,7 @@ int main() {
         if (!dev->CommitAndWait(w)) std::fprintf(stderr, "FAIL: %s\n", w.c_str());
         stats = renderer->LastStats();
         shadow_draws = renderer->ShadowDrawCount();
+        shadow_culled = renderer->ShadowCulledCount();
         pixels.assign(std::size_t(kW) * kH * 4, 0);
         (void)dev->ReadPixels(out, kW, kH, pixels);
     };
@@ -282,11 +284,20 @@ int main() {
         // casters into its own tile of the map. Spelling out the product rather
         // than freezing the total is the difference between a test that
         // survives turning cascades on and one that just has to be renumbered.
+        //
+        // DRAWN PLUS CULLED, not drawn alone. DrawShadow frustum-tests each
+        // caster against each cascade's ortho box, so a caster outside one
+        // cascade is a cull rather than a draw -- the finial above the pole is
+        // outside the nearest slice, and submitting it there wrote no texel
+        // (verified: disabling the cull changes this count and not one
+        // measured pixel). The sum is the invariant the product was reaching
+        // for: every caster is CONSIDERED once per cascade, and the skinned
+        // flag is drawn rather than dropped on its bind bounds.
         const int cascades = rest.shadowCascades;
         const int expect = 4 * cascades;
-        std::printf("    %d shadow draws = 4 casters x %d cascades\n",
-                    shadow_draws, cascades);
-        Check(shadow_draws == expect,
+        std::printf("    %d shadow draws + %d culled = 4 casters x %d cascades\n",
+                    shadow_draws, shadow_culled, cascades);
+        Check(shadow_draws + shadow_culled == expect && shadow_draws >= cascades,
               "the skinned mesh was also drawn into every cascade");
     }
 

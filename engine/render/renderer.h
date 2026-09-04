@@ -744,6 +744,17 @@ class Renderer {
     // Casters written by the most recent DrawShadow. Separate from RenderStats
     // because DrawScene resets that, and the shadow pass runs first.
     [[nodiscard]] int ShadowDrawCount() const;
+    // Casters the same pass rejected against a cascade's ortho box, summed over
+    // the cascades. The pair is the point: an uncultured shadow pass submits
+    // every caster once per cascade, and this says how much of that was clipped
+    // work rather than shadow.
+    [[nodiscard]] int ShadowCulledCount() const;
+    // Casters DROPPED because the shared per-frame uniform ring ran out during
+    // the shadow pass. Non-zero means the frame is wrong, and not only in the
+    // shadow map: every pass after this one allocates from the same ring, so a
+    // shadow pass that exhausts it leaves the scene pass with nothing and the
+    // frame comes out black. Watch it, do not just log it.
+    [[nodiscard]] int ShadowOverflowCount() const;
     // Which pipeline a material resolved to. Exposed so a test can assert the
     // cache's actual INVARIANT — that two materials differing only in encoder
     // state share one pipeline — instead of a total count, which goes stale

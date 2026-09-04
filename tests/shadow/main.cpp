@@ -114,10 +114,11 @@ int main() {
     std::vector<std::uint8_t> without(with.size());
     std::vector<std::string> order;
 
-    for (int pass_shadows = 1; pass_shadows >= 0; --pass_shadows) {
-        const eng::Scene scene =
-            BuildScene(ground_mesh, mat, pass_shadows ? 6.0f : 0.0f);
-
+    // One frame, into `out`. A lambda rather than the loop it replaced because
+    // the cull check below renders a THIRD scene through exactly this path, and
+    // "exactly" is the whole point of that check.
+    const auto Render = [&](const eng::Scene& scene, bool pass_shadows,
+                            std::vector<std::uint8_t>& out) -> bool {
         eng::RenderGraph graph;
         // Declared SECOND, must run FIRST — the graph works that out from the
         // fact that the scene pass reads what this one writes.
@@ -161,7 +162,7 @@ int main() {
 
         if (!graph.Compile(error)) {
             std::fprintf(stderr, "FAIL: %s\n", error.c_str());
-            return 1;
+            return false;
         }
         if (pass_shadows) order = graph.Order();
 
@@ -169,13 +170,18 @@ int main() {
         graph.Execute(*dev);
         if (!dev->CommitAndWait(error)) {
             std::fprintf(stderr, "FAIL: %s\n", error.c_str());
-            return 1;
+            return false;
         }
-        if (!dev->ReadPixels(readable, kW, kH, pass_shadows ? with : without)) {
+        if (!dev->ReadPixels(readable, kW, kH, out)) {
             std::fprintf(stderr, "FAIL: readback\n");
-            return 1;
+            return false;
         }
-    }
+        return true;
+    };
+
+    if (!Render(BuildScene(ground_mesh, mat, 6.0f), true, with)) return 1;
+    const int lit_draws = renderer->ShadowDrawCount();
+    if (!Render(BuildScene(ground_mesh, mat, 0.0f), false, without)) return 1;
 
     if (std::FILE* fp = std::fopen("shadow.ppm", "wb")) {
         std::fprintf(fp, "P6\n%d %d\n255\n", kW, kH);
@@ -218,6 +224,48 @@ int main() {
     // THE invariant: occlusion can only subtract light. Anything brighter means
     // the shadow term is being applied with the wrong sign somewhere.
     Check(brighter < (kW * kH) / 500, "shadows only ever darken, never brighten");
+
+    // --- the shadow pass culls, and culling is free -------------------------
+    //
+    // DrawShadow used to submit every caster to every cascade with no test at
+    // all, which is one draw per caster per cascade for casters the light's
+    // ortho box clips on arrival. The cull it grew has to satisfy BOTH halves
+    // of that sentence, and only the pair is worth testing:
+    //
+    //   * it removes the work -- a caster far outside the box is not submitted;
+    //   * it removes NOTHING ELSE -- the frame is byte-identical.
+    //
+    // A cull that quietly ate a real shadow would pass the first check on its
+    // own, which is exactly the failure this is here to catch.
+    {
+        eng::Scene near_only = BuildScene(ground_mesh, mat, 6.0f);
+        eng::Scene with_far = near_only;
+        // Two hundred units away: outside the ortho box by a hundred times its
+        // own radius, so no projection of it lands inside the map.
+        eng::Instance far_away;
+        far_away.mesh = ground_mesh;
+        far_away.material = mat;
+        far_away.model = eng::Mat4::Translation({200.0f, 0.0f, 200.0f});
+        with_far.instances.push_back(far_away);
+
+        std::vector<std::uint8_t> far_pixels(with.size());
+        if (!Render(with_far, true, far_pixels)) return 1;
+        const int far_draws = renderer->ShadowDrawCount();
+        const int far_culled = renderer->ShadowCulledCount();
+
+        std::size_t differing = 0;
+        for (std::size_t i = 0; i + 3 < with.size(); i += 4)
+            if (with[i] != far_pixels[i] || with[i + 1] != far_pixels[i + 1] ||
+                with[i + 2] != far_pixels[i + 2])
+                ++differing;
+
+        std::printf("  shadow draws %d without the distant caster, %d with it "
+                    "(%d culled); %zu px differ\n",
+                    lit_draws, far_draws, far_culled, differing);
+        Check(far_culled >= 1 && far_draws == lit_draws,
+              "a caster outside the light's box is culled, not submitted");
+        Check(differing == 0, "and culling it changed no pixel");
+    }
 
     std::printf("%s\n", g_failures == 0 ? "PASS" : "FAIL");
     return g_failures == 0 ? 0 : 1;

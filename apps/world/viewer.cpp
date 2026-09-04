@@ -913,6 +913,18 @@ int main(int argc, char** argv) {
         // environment. At that gain the disc puts about 0.05 units into this
         // face against the sky's 1.7, and subtracting the directional light
         // instead, which is what this did first, takes off 8.3 and leaves zero.
+        //
+        // THIS OPENS A DEVICE FRAME OF ITS OWN, so it must not be called from
+        // inside one. BeginFrame takes one of the kFramesInFlight permits and
+        // starts a command buffer; CommitAndWait hands the permit back through
+        // the completion handler and clears the buffer. Called from inside the
+        // app's frame, the second BeginFrame takes a SECOND permit and replaces
+        // the app's command buffer, which is then never committed -- so that
+        // permit is never returned, and the rest of that frame records into a
+        // nil buffer and is thrown away. Three sun moves leak three permits and
+        // the next BeginFrame blocks forever: the app freezes with no error.
+        // The caller in the frame loop defers to the top of the next iteration
+        // for exactly this reason.
         eng::Vec3 sky_up{0.0f, 0.0f, 0.0f}, sky_down{0.0f, 0.0f, 0.0f};
         {
             constexpr int kFace = 4;
@@ -1587,7 +1599,17 @@ int main(int argc, char** argv) {
     // LastStats it used to read. Declared here, assigned in the scene pass.
     eng::Scene rem_scene;
     int indirect_batches = 0, indirect_draws = 0, rem_draws = 0;
+    // The debounce below decides to re-bake in the middle of a frame; the bake
+    // itself has to happen BETWEEN frames. See bake_indirect: it opens a device
+    // frame of its own and waits on it, which from inside App::BeginFrame's
+    // frame leaks a frames-in-flight permit and discards the frame in progress.
+    bool gi_rebake_pending = false;
     while (app->Running()) {
+        if (gi_rebake_pending) {
+            gi_rebake_pending = false;
+            if (!bake_indirect()) return Fail(error);
+            gi_stale = false;
+        }
         if (!app->BeginFrame()) continue;
         const eng::app::Frame& f = app->Current();
 
@@ -1640,8 +1662,9 @@ int main(int argc, char** argv) {
             gi_stale = true;
             gi_still_frames = 0;
         } else if (gi_stale && ++gi_still_frames > 12) {
-            if (!bake_indirect()) return Fail(error);
-            gi_stale = false;
+            // QUEUED, not run. bake_indirect opens a device frame and blocks on
+            // it, and this is the middle of one -- see the top of the loop.
+            gi_rebake_pending = true;
         }
         if (app->Actions().Pressed("reset")) {
             player.Teleport(eng::Vec3{0.0f, terrain.HeightAt(0.0f, 0.0f) + 0.5f, 0.0f});
@@ -2121,8 +2144,8 @@ int main(int argc, char** argv) {
 
         // --- HUD ----------------------------------------------------------------
         ui->Begin(f.width, f.height);
-        ui->Rect(12, 12, 500, 228, eng::Vec4{0.05f, 0.06f, 0.08f, 0.72f});
-        ui->Outline(12, 12, 500, 228, 1.0f, eng::Vec4{0.35f, 0.40f, 0.48f, 0.9f});
+        ui->Rect(12, 12, 500, 252, eng::Vec4{0.05f, 0.06f, 0.08f, 0.72f});
+        ui->Outline(12, 12, 500, 252, 1.0f, eng::Vec4{0.35f, 0.40f, 0.48f, 0.9f});
         char line[192];
         const eng::RenderStats& rs = app->Draw().LastStats();
         // In indirect mode LastStats is the REMAINDER's (the forward pass runs
@@ -2143,12 +2166,27 @@ int main(int argc, char** argv) {
                           forest_lod_counts[0], forest_lod_counts[1],
                           forest_lod_counts[2], rs.draws, rs.culled);
         ui->Text(26, 26, line, eng::Vec4{0.92f, 0.94f, 0.98f, 1.0f});
+        // THE SCENE PASS IS NOT THE FRAME. The line above counts one of the
+        // three passes that walk the whole scene, so with --crowd 600 it read
+        // 403 while the frame submitted three thousand, and the shadow pass --
+        // the biggest of the three -- was invisible in the one place anyone
+        // looks. DROPPED is the number that was shown nowhere at all: the
+        // uniform ring is shared by every pass, and when it runs dry the passes
+        // AFTER the one that drained it draw nothing. A black frame, no error.
+        const int dropped = rs.overflowed + app->Draw().ShadowOverflowCount();
+        std::snprintf(line, sizeof(line), "shadow %d draws, %d culled%s",
+                      app->Draw().ShadowDrawCount(),
+                      app->Draw().ShadowCulledCount(),
+                      dropped ? "   DRAWS DROPPED: RING FULL" : "");
+        ui->Text(26, 50, line,
+                 dropped ? eng::Vec4{1.0f, 0.45f, 0.35f, 1.0f}
+                         : eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
         std::snprintf(line, sizeof(line),
                       "sun %.0f deg   gi %s (%.0f ms, %d buried)",
                       sun_elevation * 57.2958f,
                       gi_stale ? "STALE" : "baked", last_bake_seconds * 1000.0,
                       last_bake_dark);
-        ui->Text(26, 50, line,
+        ui->Text(26, 74, line,
                  gi_stale ? eng::Vec4{1.0f, 0.72f, 0.35f, 1.0f}
                           : eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
         // FEET ABOVE GROUND, because a character floating a hand's width over
@@ -2159,7 +2197,7 @@ int main(int argc, char** argv) {
                       path.size(), path_at,
                       terrain.HeightAt(player.Feet().x, player.Feet().z),
                       player.Feet().y - terrain.HeightAt(player.Feet().x, player.Feet().z));
-        ui->Text(26, 74, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
+        ui->Text(26, 98, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
         std::snprintf(line, sizeof(line),
                       "gpu %.2f ms  fog %s  taa %s  ao %s  exposure %.2f (%+.1f EV)  %s",
                       app->Gpu().LastFrameGpuMilliseconds(),
@@ -2168,8 +2206,8 @@ int main(int argc, char** argv) {
                       post->LastExposure(),
                       std::log2(std::max(post->LastExposure(), 1e-6f)),
                       player.Grounded() ? "grounded" : "airborne");
-        ui->Text(26, 98, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
-        ui->Text(26, 128, "click: walk there   right-drag: orbit   scroll: zoom",
+        ui->Text(26, 122, line, eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
+        ui->Text(26, 152, "click: walk there   right-drag: orbit   scroll: zoom",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
         const eng::Renderer::ClusterStats cs =
             app->Draw().ClusteredLighting() ? app->Draw().ReadClusterStats()
@@ -2188,13 +2226,13 @@ int main(int argc, char** argv) {
                       audio_peak,
                       audio && audio->StarvedVoices() ? "  STARVED" : "",
                       audio_peak > 1.0f ? "  CLIPPING" : "");
-        ui->Text(26, 176, line,
+        ui->Text(26, 200, line,
                  cs.overflowed_cells ? eng::Vec4{1.0f, 0.72f, 0.35f, 1.0f}
                                      : eng::Vec4{0.80f, 0.86f, 0.94f, 1.0f});
         std::snprintf(line, sizeof(line), "at: %s   (0-5 to travel)",
                       kStopList[std::clamp(here, 0, kStops - 1)].name);
-        ui->Text(26, 152, line, eng::Vec4{0.92f, 0.94f, 0.98f, 1.0f});
-        ui->Text(26, 200, "wasd: walk  space: run  qe: look down/up  f t o v: effects  [ ]: sun  r: reset",
+        ui->Text(26, 176, line, eng::Vec4{0.92f, 0.94f, 0.98f, 1.0f});
+        ui->Text(26, 224, "wasd: walk  space: run  qe: look down/up  f t o v: effects  [ ]: sun  r: reset",
                  eng::Vec4{0.62f, 0.68f, 0.78f, 1.0f});
 
         // --- passes --------------------------------------------------------------
@@ -2490,9 +2528,12 @@ int main(int argc, char** argv) {
                             indirect_draws, indirect_batches, rem_draws,
                             sparks->LiveCountSlow());
             else
-                std::printf("  frame %3d  gpu %.3f ms  %d draws (%d transparent), %d culled, %d sparks\n",
+                std::printf("  frame %3d  gpu %.3f ms  %d draws (%d transparent), %d culled, "
+                            "shadow %d/%d culled, %d dropped, %d sparks\n",
                             int(f.index), app->Gpu().LastFrameGpuMilliseconds(),
                             app->Draw().LastStats().draws, app->Draw().LastStats().transparent_draws, app->Draw().LastStats().culled,
+                            app->Draw().ShadowDrawCount(), app->Draw().ShadowCulledCount(),
+                            app->Draw().LastStats().overflowed + app->Draw().ShadowOverflowCount(),
                             sparks->LiveCountSlow());
         }
 
