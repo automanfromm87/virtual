@@ -191,6 +191,24 @@ int main(int argc, char** argv) {
     // the HUD: the frame counter, the exposure reading, the pass timings. The
     // scene under it is bit-identical.
     bool hud_on = true;
+    // The screen-space surface's two shape knobs, on the command line because
+    // they are the pair that has to be re-tuned for every particle scale and
+    // the only way to settle them is to look.
+    //
+    // BOTH WELL PAST apps/fluid's, and past what fluid.h's own guidance
+    // suggests: the tank uses 0.06 and 0.5, and the header warns that a sphere
+    // radius over 0.7 floats the surface a visible radius above the particles.
+    // It does, and it is still the right trade here. That tank is a quarter of
+    // this basin's volume at half the particle spacing, so its spheres already
+    // overlap in the depth buffer; these do not, and the bilateral filter
+    // refuses to merge across the gaps between them -- it reads the several
+    // centimetres of empty space behind each sphere as a different surface and
+    // stops. Swept it and looked: at 0.11/0.58 the water is a heap of discrete
+    // beads with bright rims, at 0.25/0.85 the outlines are still there, and at
+    // 0.45/1.10 it is a sheet with a clean waterline against the stone. The
+    // cost is 0.15 m of float on a 0.45 m basin, which is invisible next to
+    // beads.
+    float water_edge_stop = 0.45f, water_sphere = 1.10f;
     int rebake_every = 0;
     // BLOOM, in LINEAR radiance before the tone map. The threshold has to sit
     // above the brightest thing that is merely lit and below the things that
@@ -292,6 +310,10 @@ int main(int argc, char** argv) {
             render_scale = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--localshadows") == 0)
             local_shadows_start = true;
+        else if (std::strcmp(argv[i], "--water") == 0 && i + 2 < argc) {
+            water_edge_stop = float(std::atof(argv[++i]));
+            water_sphere = float(std::atof(argv[++i]));
+        }
         else if (std::strcmp(argv[i], "--nohud") == 0) hud_on = false;
         else if (std::strcmp(argv[i], "--nobloom") == 0) bloom_start = false;
         else if (std::strcmp(argv[i], "--bloom") == 0 && i + 2 < argc) {
@@ -949,6 +971,9 @@ int main(int argc, char** argv) {
     // one was until it got a key to move it.
     double last_bake_seconds = 0.0;
     int last_bake_dark = 0;
+    // Mean radiance of the sky's four horizontal faces, refreshed by every
+    // bake, so the water's reflection follows the sun. See the read below.
+    eng::Vec3 sky_horizon{0.55f, 0.62f, 0.72f};
     const auto bake_indirect = [&]() -> bool {
         // The sun and sky the bake assumes have to be the ones the frame uses,
         // or the indirect light disagrees with the direct light and the scene
@@ -1013,6 +1038,20 @@ int main(int argc, char** argv) {
             if (cube.size() >= std::size_t(6 * kFace * kFace)) {
                 sky_up = face_mean(2);    // +Y
                 sky_down = face_mean(3);  // -Y
+                // THE HORIZON, for the water to reflect. The four side faces,
+                // averaged, because a basin reflects whichever way it is looked
+                // at from. Read here rather than invented as a constant: the
+                // spring's water has to reflect the sky the atmosphere model is
+                // actually producing, or it goes on looking like noon at dusk.
+                //
+                // The first attempt used scene.ambientSky, which is the wrong
+                // quantity entirely -- ApplyTo's own comment calls it a
+                // hand-fitted FALLBACK for paths without image-based lighting.
+                // At (0.215, 0.266, 0.367) against this face's value it is
+                // about a third as bright, and water reflecting something
+                // nearly black is a dark jelly rather than water.
+                sky_horizon = (face_mean(0) + face_mean(1) + face_mean(4) +
+                               face_mean(5)) * 0.25f;
             }
         }
         // TIMES PI for the printed sky figure. The cube holds cosine-weighted
@@ -1676,8 +1715,8 @@ int main(int argc, char** argv) {
     // sheet falls back apart into the individual spheres, which is exactly what
     // the default did here. Above the spacing, and the basin's own stone starts
     // bleeding into the water.
-    water_look.edge_stop = 0.11f;
-    water_look.sphere_radius = 0.58f;
+    water_look.edge_stop = water_edge_stop;
+    water_look.sphere_radius = water_sphere;
     const bool local_shadows_on = local_shadows_start;
     int lamp_draws = 0, lamp_culled = 0;
     bool sparks_on = sparks_start;
@@ -2730,8 +2769,7 @@ int main(int argc, char** argv) {
         }
         water_look.sun_dir = eng::Vec3{sky.sun_direction.x, sky.sun_direction.y,
                                        sky.sun_direction.z};
-        water_look.sky_horizon = eng::Vec3{scene.ambientSky.x, scene.ambientSky.y,
-                                           scene.ambientSky.z};
+        water_look.sky_horizon = sky_horizon;
 
         // --- the water -------------------------------------------------------
         //
@@ -2884,6 +2922,31 @@ int main(int argc, char** argv) {
         // it writes particle BUFFERS and the graph orders passes by textures.
         {
             auto e = app->Gpu().BeginCompute("water");
+            // A SPOUT AT ONE END AND A DRAIN AT THE OTHER, so the basin never
+            // settles. Without it this is a bowl of water that finished moving
+            // two seconds after the app started and cannot be disturbed again
+            // -- the solver has no forces, no moving walls and no coupling to
+            // anything, so the only motion it will ever produce is whatever the
+            // seeding gave it. Measured: kinetic energy 63.5 at frame 30 and
+            // 0.19 at frame 210.
+            //
+            // The jet points along +x and slightly up, so the water crosses the
+            // basin, and the drain is the far bottom corner. What comes out is
+            // a standing current rather than a fountain: at this scale a plume
+            // that clears the rim just throws water on the grass, where the
+            // solver's box wall stops it dead in mid-air.
+            eng::FluidSim::Recirculation flow;
+            flow.spout = eng::Vec3{spring.bounds_min.x + 0.18f,
+                                   spring.bounds_min.y + 0.30f,
+                                   (spring.bounds_min.z + spring.bounds_max.z) * 0.5f};
+            flow.velocity = eng::Vec3{1.5f, 0.9f, 0.0f};
+            flow.spread = 0.07f;
+            flow.drain = eng::Vec3{spring.bounds_max.x - 0.25f, 0.0f,
+                                   (spring.bounds_min.z + spring.bounds_max.z) * 0.5f};
+            flow.drain_radius = 0.45f;
+            flow.drain_y = spring.bounds_min.y + 0.12f;
+            flow.per_step = 70;
+            water->Recirculate(e, flow);
             (void)water->Step(e, dt);
             app->Gpu().EndCompute();
         }

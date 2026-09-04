@@ -344,6 +344,29 @@ struct GpuFluidParticle {
     ENG_VEC4 velocity;  // xyz, w = pressure
 };
 
+// A SOURCE AND A SINK, which is the only way this solver can be made to keep
+// moving. Everything else about it is a closed box under gravity: it has no
+// forces the caller can apply, no moving boundary and no coupling to anything
+// outside itself, so a body of water in it settles and then stays settled --
+// measured at a kinetic energy of 63.5 falling to 0.19 over 210 frames.
+//
+// Recirculation closes a loop instead. Particles that reach the drain are put
+// back at the spout with a velocity, so the same water falls through the basin
+// forever. The particle count never changes, so mass is conserved exactly and
+// the solver never learns that anything unusual happened.
+struct GpuFluidRecycle {
+    ENG_VEC4 spout;     // xyz where a returned particle reappears, w = spread
+    ENG_VEC4 velocity;  // xyz m/s it leaves with, w unused
+    // xyz the drain's centre, w its radius in the horizontal plane.
+    ENG_VEC4 drain;
+    // x drain height (below this and inside the radius is a catch), y particle
+    // count, z stride, w phase. STRIDE AND PHASE are the rate limit: each step
+    // only considers particles whose index is congruent to the phase, so the
+    // return is a steady jet instead of a slab of the basin floor teleporting
+    // at once -- which spikes the local density and detonates the solver.
+    ENG_VEC4 catchment;
+};
+
 struct GpuFluidParams {
     ENG_VEC4 bounds_min;  // xyz, w = smoothing radius h
     ENG_VEC4 bounds_max;  // xyz, w = particle mass

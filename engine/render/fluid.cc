@@ -38,7 +38,11 @@ struct FluidSim::Impl {
     rhi::BufferId counts;     // uint per cell
     rhi::BufferId buckets;    // uint[cells * bucket_capacity]
 
-    rhi::ComputePipelineId clear, bin, density, forces, integrate;
+    rhi::ComputePipelineId clear, bin, density, forces, integrate, recycle;
+    // Which index class the recirculation considers next. Advancing it every
+    // call is what turns a rate limit into a steady jet rather than the same
+    // ninety particles being offered the drain forever.
+    int recycle_phase = 0;
     rhi::PipelineId draw;
     rhi::BufferId quad_ib;
 
@@ -161,8 +165,9 @@ std::unique_ptr<FluidSim> FluidSim::Create(rhi::Device& dev,
     im.density = dev.CreateComputePipeline(src, "cs_fluid_density", error);
     im.forces = dev.CreateComputePipeline(src, "cs_fluid_forces", error);
     im.integrate = dev.CreateComputePipeline(src, "cs_fluid_integrate", error);
+    im.recycle = dev.CreateComputePipeline(src, "cs_fluid_recycle", error);
     if (!Valid(im.clear) || !Valid(im.bin) || !Valid(im.density) ||
-        !Valid(im.forces) || !Valid(im.integrate))
+        !Valid(im.forces) || !Valid(im.integrate) || !Valid(im.recycle))
         return nullptr;
 
     rhi::PipelineDesc pd;
@@ -258,6 +263,29 @@ int FluidSim::Step(rhi::ComputeEncoder& enc, float dt) {
         enc.Dispatch(im.count);
     }
     return substeps;
+}
+
+void FluidSim::Recirculate(rhi::ComputeEncoder& enc, const Recirculation& r) {
+    Impl& im = *impl_;
+    if (!Valid(im.recycle) || im.count <= 0 || r.per_step <= 0) return;
+
+    GpuFluidRecycle g{};
+    g.spout = Vec4{r.spout.x, r.spout.y, r.spout.z, r.spread};
+    g.velocity = Vec4{r.velocity.x, r.velocity.y, r.velocity.z, 0.0f};
+    g.drain = Vec4{r.drain.x, r.drain.y, r.drain.z, r.drain_radius};
+    // THE STRIDE IS DERIVED FROM THE RATE, not asked for. A caller thinking
+    // about a fountain thinks in particles per step; the kernel needs the index
+    // class that yields it, and getting the relationship backwards is how a
+    // rate limit silently stops limiting when the particle count changes.
+    const int stride = std::max(1, im.count / std::max(r.per_step, 1));
+    g.catchment = Vec4{r.drain_y, float(im.count), float(stride),
+                       float(im.recycle_phase % stride)};
+    im.recycle_phase = (im.recycle_phase + 1) % stride;
+
+    enc.SetPipeline(im.recycle);
+    enc.SetBuffer(im.particles, 0, 0);
+    enc.SetBytes(&g, sizeof(g), 1);
+    enc.Dispatch(im.count);
 }
 
 void FluidSim::Draw(rhi::Encoder& enc, const Camera& camera, int width,

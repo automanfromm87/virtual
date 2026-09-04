@@ -100,6 +100,33 @@ class FluidSim {
     // requires. Returns how many it took.
     int Step(rhi::ComputeEncoder&, float dt);
 
+    // A SOURCE AND A SINK, and the only way to make this solver keep moving.
+    //
+    // Everything else here is a closed box under gravity. There are no forces
+    // a caller can apply, no way to move a boundary and no coupling to anything
+    // outside -- so water in it settles and then stays settled. Measured on the
+    // valley's basin: kinetic energy 63.5 at frame 30, 0.19 at frame 210, a
+    // factor of 340 in under two seconds. apps/fluid never noticed because a
+    // dam break is a collapse, and a collapse is the only motion it has.
+    //
+    // Call it once per Step, before it. Particles that reach the drain are put
+    // back at the spout with `velocity`, so the same water falls through the
+    // basin forever; the count never changes, so mass is conserved exactly.
+    struct Recirculation {
+        Vec3 spout{0.0f, 0.0f, 0.0f};     // where a returned particle reappears
+        float spread = 0.06f;             // scattered over a disc this wide
+        Vec3 velocity{0.0f, 0.0f, 0.0f};  // and leaves at this, in m/s
+        Vec3 drain{0.0f, 0.0f, 0.0f};     // the sink's centre
+        float drain_radius = 0.35f;       // and its radius in the horizontal
+        float drain_y = 0.0f;             // below this and inside it, caught
+        // AT MOST this many particles return per call. The rate limit is not a
+        // performance knob: returning a whole slab of the basin floor at once
+        // stacks it inside one smoothing radius, and the pressure term answers
+        // a density several times rest with thousands of m/s^2.
+        int per_step = 90;
+    };
+    void Recirculate(rhi::ComputeEncoder&, const Recirculation&);
+
     void Draw(rhi::Encoder&, const Camera&, int width, int height);
 
     [[nodiscard]] int Count() const;

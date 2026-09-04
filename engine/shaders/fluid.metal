@@ -247,6 +247,53 @@ kernel void cs_fluid_integrate(uint id [[thread_position_in_grid]],
     particles[id].velocity.xyz = v;
 }
 
+// --- recirculation -----------------------------------------------------------
+//
+// The drain feeds the spout. See GpuFluidRecycle for why the solver needs this
+// at all: without it a basin of water settles in two seconds and there is no
+// way to disturb it again.
+//
+// SCATTERED ON RETURN. Putting every recycled particle at exactly the spout
+// would stack a dozen of them inside one smoothing radius, and the density
+// estimate there goes to several times rest -- which the pressure term answers
+// with an acceleration of thousands of m/s^2 and the fluid explodes. A cheap
+// hash of the index spreads them over a small disc instead, which is also what
+// makes the jet look like water leaving a pipe rather than a point source.
+static float3 RecycleScatter(uint id, float spread) {
+    const uint h = id * 747796405u + 2891336453u;
+    const uint a = (h >> 13) ^ h;
+    const uint b = a * 1274126177u;
+    const float u = float((b >> 8) & 0xffffu) / 65535.0f;
+    const float v = float((b >> 20) & 0xfffu) / 4095.0f;
+    const float ang = u * 6.2831853f;
+    const float rad = sqrt(v) * spread;
+    return float3(cos(ang) * rad, (v - 0.5f) * spread, sin(ang) * rad);
+}
+
+kernel void cs_fluid_recycle(uint id [[thread_position_in_grid]],
+                             device GpuFluidParticle* particles [[buffer(0)]],
+                             constant GpuFluidRecycle& r [[buffer(1)]])
+{
+    if (id >= uint(r.catchment.y)) return;
+    // The rate limit. Only one index class per step is eligible, so at a
+    // stride of s the drain can return at most count/s particles a step.
+    if ((id % uint(max(r.catchment.z, 1.0f))) != uint(r.catchment.w)) return;
+
+    const float3 p = particles[id].position.xyz;
+    if (p.y > r.catchment.x) return;
+    const float2 d = p.xz - r.drain.xz;
+    if (dot(d, d) > r.drain.w * r.drain.w) return;
+
+    particles[id].position.xyz = r.spout.xyz + RecycleScatter(id, r.spout.w);
+    particles[id].velocity.xyz = r.velocity.xyz;
+    // The density and pressure carried in .w are this step's estimates for a
+    // place the particle no longer is. Zeroing them is not cosmetic: the next
+    // dispatch is the binning pass, which rebuilds both from scratch, but the
+    // draw between now and then would read them.
+    particles[id].position.w = 0.0f;
+    particles[id].velocity.w = 0.0f;
+}
+
 // --- drawing -----------------------------------------------------------------
 
 struct FluidOut {
