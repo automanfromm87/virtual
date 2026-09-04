@@ -29,6 +29,7 @@
 #include "apps/world/districts.h"
 #include "engine/asset/texgen.h"
 #include "engine/render/gi.h"
+#include "engine/render/particles.h"
 #include "engine/render/volumetric.h"
 #include "engine/geometry/terrain.h"
 #include "engine/geometry/tree.h"
@@ -220,6 +221,21 @@ int main(int argc, char** argv) {
     // Everything else here lights things; this lights the space between them.
     auto vol = eng::Volumetrics::Create(app->Gpu(), error);
     if (!vol) return Fail(error);
+    // The fire. Drawn into the scene target with the scene's depth, so a spark
+    // behind a stone is behind it and one in front fades softly into the ground
+    // instead of cutting a hard edge into it.
+    // IN THE SCENE PASS, so config.samples and not 1.
+    //
+    // Particles DEPTH-TEST -- a spark behind a stone has to be behind it -- so
+    // they have to be drawn into a pass that has the depth buffer attached,
+    // which means the multisampled scene pass and not a later one over the
+    // resolved colour. A separate pass with no depth attachment draws nothing
+    // at all: the simulation ran, 555 particles were alive, and the screen was
+    // empty. Changing the sample count was the second wrong guess at it.
+    auto sparks = eng::ParticleSystem::Create(app->Gpu(), 6000,
+                                              eng::Renderer::kSceneFormat, error,
+                                              config.samples);
+    if (!sparks) return Fail(error);
 
     // --- the terrain ---------------------------------------------------------
     std::printf("generating terrain...\n");
@@ -804,6 +820,10 @@ int main(int argc, char** argv) {
     world::BuildGlassPavilion(
         app->Draw(), scene,
         terrain.HeightAt(world::kGlassPavilion.x, world::kGlassPavilion.z), error);
+    world::BuildFirePit(app->Draw(), scene, unit_sphere,
+                        terrain.HeightAt(world::kFirePit.x, world::kFirePit.z), error);
+    const world::Banner banner = world::BuildBanner(
+        app->Draw(), scene, terrain.HeightAt(world::kFlag.x, world::kFlag.z), error);
     if (!error.empty()) return Fail(error);
     // CLUSTERED LIGHTING ON, because 60 lanterns is well past the point where
     // a forward pass can loop over every light for every fragment -- and
@@ -902,6 +922,7 @@ int main(int argc, char** argv) {
     float baked_az = 1e9f, baked_el = 1e9f;
     bool ssao_on = ssao_start;
     bool shafts_on = shafts_start;
+    bool sparks_on = true;
     int tour_stop = tour_start;
     bool gi_stale = false;
     int gi_still_frames = 0;
@@ -1137,6 +1158,8 @@ int main(int argc, char** argv) {
             ++forest_lod_counts[lod];
         }
 
+        world::PoseBanner(banner, scene, f.time);
+
         // --- sky ---------------------------------------------------------------
         sky.sun_direction =
             eng::Vec3{std::cos(sun_azimuth) * std::cos(sun_elevation),
@@ -1260,6 +1283,11 @@ int main(int argc, char** argv) {
             p.execute = [&](eng::rhi::Encoder& e) {
                 app->Draw().DrawScene(e, scene, f.width, f.height, shadow_map);
                 env->DrawSky(e, scene.camera, f.width, f.height);
+                // After the opaque geometry and the sky, so they test against
+                // both. `depth` is the prepass copy -- the pass's own depth is
+                // multisampled and cannot be sampled, and without it the sparks
+                // cut a hard edge into the ground instead of fading into it.
+                if (sparks_on) sparks->Draw(e, scene.camera, f.width, f.height, depth);
             };
             graph.AddPass(p);
         }
@@ -1373,6 +1401,42 @@ int main(int argc, char** argv) {
             graph.AddPass(p);
             composited = post->Output();
         }
+        if (sparks_on) {
+            eng::VolumetricConfig unused;  // keeps the emitter block self-contained
+            (void)unused;
+            eng::ParticleEmitter em;
+            em.position = eng::Vec3{world::kFirePit.x,
+                                    terrain.HeightAt(world::kFirePit.x, world::kFirePit.z) + 0.25f,
+                                    world::kFirePit.z};
+            em.direction = eng::Vec3{0.0f, 1.0f, 0.0f};
+            em.spread = 0.30f;
+            em.speed = 2.6f;
+            em.speed_variance = 1.1f;
+            em.lifetime = 1.9f;
+            em.lifetime_variance = 0.7f;
+            em.size = 0.055f;
+            em.size_variance = 0.03f;
+            em.rate = 900.0f;
+            // Hot at the source. The colour is a radiance, not a tint, so this
+            // is what puts the sparks above the tone curve's knee and makes
+            // them read as embers rather than as orange dots.
+            em.color = eng::Vec4{14.0f, 4.2f, 0.9f, 1.0f};
+            // Buoyant, not falling: hot air goes up, and gravity pointing down
+            // here gives a fountain of sand.
+            em.gravity = eng::Vec3{0.0f, 1.7f, 0.0f};
+            em.drag = 1.4f;
+            // STEPPED OUTSIDE THE GRAPH, for the third time and the same
+            // reason: the simulation writes particle BUFFERS and the graph
+            // orders passes by the textures they write. The skinning and the
+            // light binning are out here for the same reason. Three separate
+            // systems have now hit this, which is the graph's boundary showing
+            // rather than three oversights.
+            {
+                auto e = app->Gpu().BeginCompute("sparks");
+                sparks->Step(e, em, dt);
+                app->Gpu().EndCompute();
+            }
+        }
         {
             eng::RenderGraph::Pass p;
             p.name = "composite";
@@ -1387,6 +1451,14 @@ int main(int argc, char** argv) {
             graph.AddPass(p);
         }
         if (!graph.Compile(error)) return Fail(error);
+        // SKINNING, before anything draws the mesh it produces. Outside the
+        // graph because it writes vertex BUFFERS, which the graph does not
+        // track -- the same reason the light binning below is out here.
+        {
+            auto e = app->Gpu().BeginCompute("skin");
+            (void)app->Draw().SkinToBuffers(e, scene);
+            app->Gpu().EndCompute();
+        }
         // BINNING, outside the graph for the same reason the exposure meter is:
         // it writes BUFFERS, and the graph orders passes by the textures they
         // write. Before the scene pass, not after -- unlike the meter, this
@@ -1420,9 +1492,10 @@ int main(int argc, char** argv) {
         // be wrong in a screenshot are an exposure that has not settled and a
         // camera that is not where it was asked to be.
         if (!shot_path.empty())
-            std::printf("  frame %3d  gpu %.3f ms  draws %d  culled %d\n",
+            std::printf("  frame %3d  gpu %.3f ms  %d draws, %d culled, %d sparks\n",
                         int(f.index), app->Gpu().LastFrameGpuMilliseconds(),
-                        app->Draw().LastStats().draws, app->Draw().LastStats().culled);
+                        app->Draw().LastStats().draws, app->Draw().LastStats().culled,
+                        sparks->LiveCountSlow());
 
         if (!shot_path.empty() && int(f.index) >= shot_frames) {
             std::vector<std::uint8_t> px(std::size_t(f.width) * f.height * 4);

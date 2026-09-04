@@ -302,4 +302,203 @@ inline void BuildGlassPavilion(eng::Renderer& r, eng::Scene& scene, float ground
     }
 }
 
+// --- the fire pit -----------------------------------------------------------
+//
+// A ring of stones and a fire: the particle system, over terrain, with the
+// scene's own depth so the sparks fade against the ground instead of cutting
+// into it.
+//
+// NO DECALS HERE, and that is not an omission. decals.h says why in its first
+// paragraph: a projected decal writes into the G-buffer's albedo, and a
+// forward renderer shades each surface once as it draws it, so there is no
+// moment between "the surface exists" and "the surface is lit" at which to
+// intervene. This world is forward. The decal system works and has a test; it
+// belongs to the other path, and pretending otherwise by painting a dark quad
+// on the ground would be a picture of a decal rather than a decal.
+inline void BuildFirePit(eng::Renderer& r, eng::Scene& scene, eng::MeshHandle sphere,
+                         float ground_y, std::string& error) {
+    eng::MaterialDesc stone_md;
+    stone_md.shading = eng::Shading::Lit;
+    stone_md.base_color = eng::Vec4{0.16f, 0.15f, 0.145f, 1.0f};
+    stone_md.roughness = 0.85f;
+    const eng::MaterialHandle stone_mat = r.CreateMaterial(stone_md, error);
+
+    eng::MaterialDesc ember_md;
+    ember_md.shading = eng::Shading::Lit;
+    ember_md.base_color = eng::Vec4{0.25f, 0.10f, 0.05f, 1.0f};
+    ember_md.roughness = 0.9f;
+    ember_md.emissive = eng::Vec3{5.0f, 1.4f, 0.25f};
+    const eng::MaterialHandle ember_mat = r.CreateMaterial(ember_md, error);
+    if (!eng::Valid(stone_mat) || !eng::Valid(ember_mat)) return;
+
+    // A ring of boulders, each a squashed sphere at its own angle -- uniform
+    // scale only, so the variation has to come from the radius and the
+    // placement rather than from flattening them.
+    Rng rng(1301);
+    constexpr int kStones = 11;
+    for (int i = 0; i < kStones; ++i) {
+        const float a = float(i) / float(kStones) * 6.2831853f + rng.Signed() * 0.12f;
+        const float radius = 1.35f + rng.Signed() * 0.12f;
+        const float size = 0.30f + rng.Unit() * 0.22f;
+        eng::Instance in;
+        in.mesh = sphere;
+        in.material = stone_mat;
+        in.model = eng::Mat4::Translation(
+                       eng::Vec3{kFirePit.x + std::cos(a) * radius,
+                                 ground_y + size * 0.35f,
+                                 kFirePit.z + std::sin(a) * radius}) *
+                   eng::Mat4::Scale(size * 2.0f);
+        scene.instances.push_back(in);
+    }
+    // Embers in the middle, so the fire has a source when the particles are off.
+    for (int i = 0; i < 5; ++i) {
+        const float a = rng.Unit() * 6.2831853f, d = rng.Unit() * 0.55f;
+        eng::Instance in;
+        in.mesh = sphere;
+        in.material = ember_mat;
+        in.model = eng::Mat4::Translation(
+                       eng::Vec3{kFirePit.x + std::cos(a) * d, ground_y + 0.10f,
+                                 kFirePit.z + std::sin(a) * d}) *
+                   eng::Mat4::Scale(0.20f + rng.Unit() * 0.12f);
+        scene.instances.push_back(in);
+    }
+
+    // A light in the fire. Without one the pit glows and lights nothing, which
+    // is the same failure the lanterns had -- and here it is worse, because a
+    // fire that does not light the stones around it reads as a decal.
+    eng::Light fire;
+    fire.type = eng::LightType::Point;
+    fire.position = eng::Vec3{kFirePit.x, ground_y + 0.6f, kFirePit.z};
+    fire.color = eng::Vec3{11.0f, 4.4f, 1.3f};
+    fire.range = 8.0f;
+    scene.lights.push_back(fire);
+}
+
+// --- the banner -------------------------------------------------------------
+//
+// A cloth on a pole, skinned to a row of joints and driven by a travelling
+// wave. Generated rather than imported for the same reason the test's version
+// is: every weight comes from a formula, so what it is supposed to look like is
+// known rather than asserted.
+struct Banner {
+    eng::MeshHandle mesh;
+    std::size_t instance = 0;
+    int joint_offset = 0;
+    static constexpr int kJoints = 9;
+    static constexpr float kWidth = 3.2f;
+    static constexpr float kHeight = 1.9f;
+    static constexpr float kTop = 4.3f;
+    eng::Vec3 root{0.0f, 0.0f, 0.0f};
+};
+
+inline Banner BuildBanner(eng::Renderer& r, eng::Scene& scene, float ground_y,
+                          std::string& error) {
+    Banner b;
+    b.root = eng::Vec3{kFlag.x, ground_y, kFlag.z};
+
+    eng::MaterialDesc pole_md;
+    pole_md.shading = eng::Shading::Lit;
+    pole_md.base_color = eng::Vec4{0.30f, 0.28f, 0.26f, 1.0f};
+    pole_md.roughness = 0.55f;
+    const eng::MaterialHandle pole_mat = r.CreateMaterial(pole_md, error);
+    eng::Instance pole;
+    pole.mesh = r.UploadMesh(eng::MakeBox(eng::Vec3{0.07f, (b.kTop + 0.4f) * 0.5f, 0.07f},
+                                          eng::Vec4{1, 1, 1, 1}));
+    pole.material = pole_mat;
+    pole.model = eng::Mat4::Translation(b.root + eng::Vec3{0, (b.kTop + 0.4f) * 0.5f, 0});
+    scene.instances.push_back(pole);
+
+    // The cloth: a grid, finer along the wave than across it, because that is
+    // the axis it bends on and a coarse grid there shows the wave as facets.
+    constexpr int kCols = 40, kRows = 12;
+    eng::Mesh cloth;
+    std::vector<eng::anim::SkinVertex> skin;
+    for (int row = 0; row <= kRows; ++row)
+        for (int col = 0; col <= kCols; ++col) {
+            const float u = float(col) / float(kCols), v = float(row) / float(kRows);
+            VertexIn vtx{};
+            // Built in the POLE's space with x running out along the cloth, so
+            // the joints below are a straight row and the palette is readable.
+            vtx.position = eng::Vec4{u * Banner::kWidth,
+                                     b.kTop - v * Banner::kHeight, 0.0f, 0.0f};
+            vtx.normal = eng::Vec4{0.0f, 0.0f, 1.0f, 0.0f};
+            vtx.color = eng::Vec4{0.72f, 0.20f, 0.16f, 1.0f};
+            vtx.uv = eng::Vec4{u, v, 0.0f, 0.0f};
+            cloth.vertices.push_back(vtx);
+
+            // TWO INFLUENCES, linearly blended between the joints either side.
+            // One influence per vertex makes the cloth a row of rigid strips
+            // that scissor at every joint, which is the classic look of a mesh
+            // that was skinned by rounding.
+            const float j = u * float(Banner::kJoints - 1);
+            const int j0 = std::min(int(j), Banner::kJoints - 2);
+            const float t = j - float(j0);
+            eng::anim::SkinVertex sv{};
+            sv.joints[0] = std::uint16_t(j0);
+            sv.joints[1] = std::uint16_t(j0 + 1);
+            sv.weights[0] = 1.0f - t;
+            sv.weights[1] = t;
+            skin.push_back(sv);
+        }
+    for (int row = 0; row < kRows; ++row)
+        for (int col = 0; col < kCols; ++col) {
+            const std::uint32_t a = std::uint32_t(row * (kCols + 1) + col);
+            const std::uint32_t bq = a + 1, c = a + std::uint32_t(kCols + 1), d = c + 1;
+            cloth.indices.insert(cloth.indices.end(), {a, c, bq, bq, c, d});
+        }
+    // A cloth is seen from both sides, and back-face culling is on for
+    // everything -- so it is two-sided by having two sets of triangles rather
+    // than by a material flag the renderer does not have.
+    const std::size_t half = cloth.indices.size();
+    for (std::size_t i = 0; i < half; i += 3)
+        cloth.indices.insert(cloth.indices.end(),
+                             {cloth.indices[i], cloth.indices[i + 2], cloth.indices[i + 1]});
+    eng::GenerateTangents(cloth);
+
+    eng::MaterialDesc cloth_md;
+    cloth_md.shading = eng::Shading::Lit;
+    cloth_md.base_color = eng::Vec4{1.0f, 1.0f, 1.0f, 1.0f};
+    cloth_md.roughness = 0.88f;
+    const eng::MaterialHandle cloth_mat = r.CreateMaterial(cloth_md, error);
+    if (!eng::Valid(pole_mat) || !eng::Valid(cloth_mat)) return b;
+
+    b.mesh = r.UploadSkinnedMesh(cloth, skin, Banner::kJoints);
+    eng::Instance in;
+    in.mesh = b.mesh;
+    in.material = cloth_mat;
+    in.model = eng::Mat4::Translation(b.root);
+    b.joint_offset = int(scene.joint_matrices.size());
+    in.palette = b.joint_offset;
+    b.instance = scene.instances.size();
+    scene.instances.push_back(in);
+    scene.joint_matrices.resize(scene.joint_matrices.size() + Banner::kJoints,
+                                eng::Mat4::Identity());
+    return b;
+}
+
+// The pose at `time`: a wave running out from the pole, growing as it goes.
+//
+// The palette is joint-world times inverse-bind. The bind pose here is the
+// identity translation of each joint along x, so the inverse bind is a
+// translation back -- written out rather than stored, because for a straight
+// row of joints it is one subtraction and a stored array would be a second
+// thing to keep in step with the first.
+inline void PoseBanner(const Banner& b, eng::Scene& scene, float time) {
+    if (!eng::Valid(b.mesh)) return;
+    const float spacing = Banner::kWidth / float(Banner::kJoints - 1);
+    for (int j = 0; j < Banner::kJoints; ++j) {
+        const float along = float(j) * spacing;
+        // Amplitude grows with distance from the pole: the fixed end cannot
+        // move and the free end moves most, which is most of what makes cloth
+        // read as attached to something.
+        const float grip = float(j) / float(Banner::kJoints - 1);
+        const float phase = time * 3.1f - along * 1.9f;
+        const eng::Vec3 offset{0.0f,
+                               std::sin(phase * 0.7f) * 0.30f * grip * grip,
+                               std::sin(phase) * 0.85f * grip * grip};
+        scene.joint_matrices[std::size_t(b.joint_offset + j)] =
+            eng::Mat4::Translation(offset);
+    }
+}
+
 }  // namespace world
