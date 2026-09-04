@@ -7,29 +7,27 @@ repository, and the only outside code is Apple's own frameworks — Metal for th
 GPU, CoreText for glyph outlines, AudioToolbox for the speaker and for decoding
 compressed audio.
 
-Around 63,000 lines, 65 test targets, everything built with Bazel.
+Around 68,000 lines, 70 test targets, everything built with Bazel.
 
 ## Running it
 
 ```
-bazel run -c opt //apps/world2     # terrain + navmesh pathing + sky + fog
-bazel run -c opt //apps/sky        # image-based lighting, drag the sun
-bazel run -c opt //apps/iso        # isometric game: click to walk, collect coins
-bazel run -c opt //apps/walk       # first person, raycast crosshair
-bazel run -c opt //apps/gallery:viewer   # the rendering showcase
-bazel run -c opt //apps/particles:viewer # 60k GPU particles
-bazel run -c opt //apps/fluid:viewer     # SPH fluid, dam break
-bazel run -c opt //apps/skinned:viewer   # skeletal animation
-bazel run -c opt //apps/world:viewer     # physics + ECS + glTF
-bazel run -c opt //apps/lights:viewer    # 256 point lights, clustering on a key
-bazel run -c opt //apps/shot -- --studio /tmp/a.png  # one frame, straight to a PNG
-
+bazel run -c opt //apps/world:world                 # the demo: terrain + navmesh + character + sky + fog + post
+bazel run -c opt //apps/world:world -- --shot /tmp/a.png   # headless capture, opens no window
 bazel test //...
 ```
 
-`-c opt` is not optional for the fluid; it is an order of magnitude slower
-without it. Drag to look, `wasd` to move, `esc` to quit. Set `VIRTUAL_MUSIC` to
-an audio file to give the isometric demo a soundtrack.
+`-c opt` is not optional; the demo is an order of magnitude slower without it.
+Left-click to walk, `wasd` to move (`space` to run), right-drag to orbit,
+scroll to zoom, `0`–`5` to fast-travel between districts, `[`/`]` to move the
+sun, `f` fog, `t` TAA, `o` SSAO, `v` light shafts, `e`/`q` focus height,
+`r` reset, `esc` to quit. `--shot` renders a fixed number of frames offscreen
+to a PNG; `viewer.cpp` parses further capture flags (`--frames`, `--sun`,
+`--nossao`, `--noshafts`, `--shadowpx`, …).
+
+The per-system showcases that used to be separate demos now live as offscreen
+tests under `tests/` (`gallery`, `ibl`, `lights`, `particles`, `fluid`,
+`skinned`, …) — same scenes, asserted by measurement rather than by looking.
 
 ## What is in it
 
