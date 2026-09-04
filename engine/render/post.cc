@@ -93,7 +93,10 @@ struct PostStack::Impl {
     Vec2 jitter{0.0f, 0.0f};
     float dt = 0.0f;
 
-    void Resize(int w, int h);
+    int render_w = 0, render_h = 0;
+    void Resize(int w, int h, float scale);
+    [[nodiscard]] int RenderW() const { return render_w; }
+    [[nodiscard]] int RenderH() const { return render_h; }
 };
 
 PostStack::PostStack() : impl_(std::make_unique<Impl>()) {}
@@ -155,12 +158,20 @@ std::unique_ptr<PostStack> PostStack::Create(rhi::Device& dev, std::string& erro
     return p;
 }
 
-void PostStack::Impl::Resize(int w, int h) {
-    if (w == width && h == height) return;
+void PostStack::Impl::Resize(int w, int h, float scale) {
+    // The scene runs at render_scale of display; the history lives at
+    // display. The caller clamps scale to (0, 1]: upsampling past native is
+    // a cost with no information behind it, and zero or negative is not a
+    // size.
+    const int rw = std::max(1, int(std::lround(float(w) * scale)));
+    const int rh = std::max(1, int(std::lround(float(h) * scale)));
+    if (w == width && h == height && rw == render_w && rh == render_h) return;
     for (rhi::TextureId t : {velocity, scratch, output, history[0], history[1]})
         if (Valid(t)) dev->DestroyTexture(t);
     width = w;
     height = h;
+    render_w = rw;
+    render_h = rh;
     if (w <= 0 || h <= 0) {
         velocity = scratch = output = history[0] = history[1] = rhi::TextureId{};
         return;
@@ -169,8 +180,13 @@ void PostStack::Impl::Resize(int w, int h) {
     // and sub-pixel precision. Eight-bit would quantise a one-pixel motion to
     // nothing at 1080p, and RGBA16 would waste half the bandwidth of a texture
     // that is read three times a frame.
-    velocity = dev->CreateStorageTexture2D(w, h, rhi::Format::RG16Float, 1);
-    scratch = dev->CreateRenderTarget(w, h, hdr_format);
+    //
+    // Sized at RENDER size: velocity is derived from the scene depth, which
+    // runs small, and it is stored in uv units precisely so consumers do not
+    // care. Scratch likewise serves the scene chain, while output and history
+    // below stay at display -- they are what the resolve writes and reads.
+    velocity = dev->CreateStorageTexture2D(rw, rh, rhi::Format::RG16Float, 1);
+    scratch = dev->CreateRenderTarget(rw, rh, hdr_format);
     output = dev->CreateRenderTarget(w, h, hdr_format);
     history[0] = dev->CreateRenderTarget(w, h, hdr_format);
     history[1] = dev->CreateRenderTarget(w, h, hdr_format);
@@ -192,7 +208,7 @@ void PostStack::Impl::Resize(int w, int h) {
 
 void PostStack::BeginFrame(const Camera& camera, int width, int height, float dt) {
     Impl& im = *impl_;
-    im.Resize(width, height);
+    im.Resize(width, height, std::clamp(config.render_scale, 0.0f, 1.0f));
     im.dt = dt;
     ++im.frame;
 
@@ -217,22 +233,32 @@ void PostStack::BeginFrame(const Camera& camera, int width, int height, float dt
                          config.max_blur_radius, 0.0f};
     im.params.tune = Vec4{config.fixed_exposure, dt, config.shutter,
                           config.taa_feedback};
-    im.params.screen = Vec4{float(width), float(height),
-                            width > 0 ? 1.0f / float(width) : 0.0f,
-                            height > 0 ? 1.0f / float(height) : 0.0f};
+    // RENDER size: every pass that reads the scene (fog, depth of field,
+    // motion blur, SSR, velocity, the meter) runs at render_scale, and the
+    // TAA resolve's 3x3 neighbourhood is in the current frame's texels too.
+    // The history it resolves against lives at display size regardless, and
+    // UV sampling does not care that the two differ -- that indifference is
+    // what makes the resolve an upsampler rather than just a filter.
+    const int rw = std::max(im.render_w, 1), rh = std::max(im.render_h, 1);
+    im.params.screen = Vec4{float(rw), float(rh), 1.0f / float(rw),
+                            1.0f / float(rh)};
     im.params.bins.x = std::uint32_t(kBins);
     im.params.lum = Vec4{config.min_log_luminance,
                          config.max_log_luminance - config.min_log_luminance,
                          config.adapt_brighter, config.adapt_darker};
 
-    if (config.taa && width > 0 && height > 0) {
+    if (config.taa && rw > 0 && rh > 0) {
         // 8 is enough to converge and short enough that a slowly moving edge
         // does not take a second to settle. The offsets are centred on zero --
         // Halton runs 0..1 -- and scaled to one pixel in NDC, where the whole
         // screen is 2 units across.
+        //
+        // A RENDER pixel, not a display one: below native resolution the
+        // jitter steps sub-display texels, which is exactly the extra
+        // information the upsampling resolve reconstructs from.
         const int index = int(im.frame % 8) + 1;
-        im.jitter = Vec2{(Halton(index, 2) - 0.5f) * 2.0f / float(std::max(width, 1)),
-                         (Halton(index, 3) - 0.5f) * 2.0f / float(std::max(height, 1))};
+        im.jitter = Vec2{(Halton(index, 2) - 0.5f) * 2.0f / float(rw),
+                         (Halton(index, 3) - 0.5f) * 2.0f / float(rh)};
     } else {
         im.jitter = Vec2{0.0f, 0.0f};
     }
@@ -240,6 +266,10 @@ void PostStack::BeginFrame(const Camera& camera, int width, int height, float dt
 
 Vec2 PostStack::Jitter() const { return impl_->jitter; }
 rhi::TextureId PostStack::Velocity() const { return impl_->velocity; }
+
+int PostStack::RenderWidth() const { return impl_->RenderW(); }
+
+int PostStack::RenderHeight() const { return impl_->RenderH(); }
 rhi::TextureId PostStack::Scratch() const { return impl_->scratch; }
 rhi::TextureId PostStack::Output() const {
     return impl_->history[impl_->history_index];
@@ -264,7 +294,7 @@ void PostStack::ComputeVelocity(rhi::ComputeEncoder& enc, rhi::TextureId depth) 
     enc.SetTexture(im.velocity, 0);
     enc.SetTexture(depth, 1);
     enc.SetBytes(&im.params, sizeof(im.params), 0);
-    enc.Dispatch2D(im.width, im.height);
+    enc.Dispatch2D(std::max(im.render_w, 1), std::max(im.render_h, 1));
 }
 
 void PostStack::DrawFog(rhi::Encoder& enc, rhi::TextureId depth) {

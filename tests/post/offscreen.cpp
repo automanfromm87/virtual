@@ -696,6 +696,107 @@ int main() {
     }
 
     {
+        // RENDER SCALE: the scene at half resolution, the history at full,
+        // and the resolve rebuilds the display image out of jittered history
+        // -- temporal upsampling rather than mere antialiasing. On a still
+        // camera it must settle, and settle NEAR the native image: same
+        // scene, same light, only fewer pixels per frame with eight
+        // sub-pixel offsets doing the rest.
+        std::printf("\nhalf-resolution scene resolves to the full image\n");
+        post->config.taa = true;
+        post->config.taa_feedback = 0.9f;
+        post->config.render_scale = 1.0f;
+        scene.lightColor = eng::Vec4{3.0f, 3.0f, 3.0f, 1.0f};
+        scene.ambientSky = eng::Vec3{0.25f, 0.28f, 0.34f};
+        scene.ambientGround = eng::Vec3{0.06f, 0.06f, 0.06f};
+        for (int i = 0; i < 24; ++i)
+            if (!frame(0.016f, true, [&]() -> eng::rhi::TextureId {
+                    eng::rhi::PassDesc pd;
+                    pd.color = post->Output();
+                    auto e = dev->BeginPass(pd);
+                    post->DrawTaa(e, hdr);
+                    dev->EndPass();
+                    return post->Output();
+                })) return 1;
+        double ref_sum = 0.0;
+        for (std::size_t k = 0; k < px.size(); k += 4)
+            ref_sum += px[k] + px[k + 1] + px[k + 2];
+        const double ref_mean = ref_sum / double(px.size() / 4 * 3);
+
+        // Now the same frames at half scene resolution. Switching scale
+        // reallocates the velocity (render-sized) and restarts the history,
+        // so this converges fresh like the block above.
+        post->config.render_scale = 0.5f;
+        const int hw = kW / 2, hh = kH / 2;
+        const eng::rhi::TextureId hdr_half =
+            dev->CreateRenderTarget(hw, hh, eng::Renderer::kSceneFormat);
+        const eng::rhi::TextureId depth_half =
+            dev->CreateDepthTarget(hw, hh, /*sampleable=*/true);
+        std::vector<std::uint8_t> previous;
+        float last_change = 1e9f;
+        for (int i = 0; i < 24; ++i) {
+            scene.camera.jitter = post->Jitter();
+            post->BeginFrame(scene.camera, kW, kH, 0.016f);
+            scene.camera.jitter = post->Jitter();
+            dev->BeginFrame();
+            {
+                eng::rhi::PassDesc pd;
+                pd.color = hdr_half;
+                pd.depth = depth_half;
+                pd.keep_depth = true;
+                auto e = dev->BeginPass(pd);
+                r->DrawScene(e, scene, hw, hh, {});
+                dev->EndPass();
+            }
+            {
+                auto e = dev->BeginCompute();
+                post->ComputeVelocity(e, depth_half);
+                post->MeterExposure(e, hdr_half);
+                dev->EndCompute();
+            }
+            {
+                eng::rhi::PassDesc pd;
+                pd.color = post->Output();
+                auto e = dev->BeginPass(pd);
+                post->DrawTaa(e, hdr_half);
+                dev->EndPass();
+            }
+            {
+                eng::rhi::PassDesc pd;
+                pd.color = out;
+                auto e = dev->BeginPass(pd);
+                r->DrawComposite(e, post->Output());
+                dev->EndPass();
+            }
+            if (!dev->CommitAndWait(error)) {
+                std::fprintf(stderr, "FAIL submit: %s\n", error.c_str());
+                return 1;
+            }
+            post->EndFrame();
+            if (!dev->ReadPixels(out, kW, kH, px)) return 1;
+            if (!previous.empty()) {
+                double sum = 0.0;
+                for (std::size_t k = 0; k < px.size(); k += 4)
+                    sum += std::abs(int(px[k]) - int(previous[k]));
+                last_change = float(sum / double(px.size() / 4));
+            }
+            previous = px;
+        }
+        double half_sum = 0.0;
+        for (std::size_t k = 0; k < px.size(); k += 4)
+            half_sum += px[k] + px[k + 1] + px[k + 2];
+        const double half_mean = half_sum / double(px.size() / 4 * 3);
+        std::printf("    upsampled change after 24 frames: %.3f of 255, mean %.1f vs native %.1f\n",
+                    last_change, half_mean, ref_mean);
+        Check(last_change < 1.5f, "the upsampled image settles too");
+        Check(std::fabs(half_mean - ref_mean) / ref_mean < 0.05,
+              "and it settles near the native image");
+        post->config.taa = false;
+        post->config.render_scale = 1.0f;
+        scene.camera.jitter = eng::Vec2{0.0f, 0.0f};
+    }
+
+    {
         // SCREEN-SPACE REFLECTIONS, checked by putting something in the scene
         // that a probe could not possibly reflect.
         //

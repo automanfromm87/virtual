@@ -23,6 +23,7 @@
 #include <cstring>
 
 #include "engine/app/app.h"
+#include "engine/app/targets.h"
 #include "engine/asset/png.h"
 #include "engine/geometry/mesh.h"
 #include "engine/geometry/simplify.h"
@@ -156,6 +157,10 @@ int main(int argc, char** argv) {
     float dist_start = 0.0f;  // 0 = whatever the stop chooses
     float leaf_transmission = 0.55f;
     float exposure_comp = -1.0f;
+    // RENDER SCALE: the scene renders at this fraction of the display, and
+    // the TAA resolve rebuilds full resolution out of history. 1.0 is
+    // native; 0.5 quarters the scene's pixels. The UI stays at display.
+    float render_scale = 1.0f;
     bool decals_on = true;
     // 4096, MEASURED against an 8192 render of the same frame. The fraction of
     // pixels more than 20 of 255 away from that reference:
@@ -224,6 +229,8 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--nodecal") == 0) decals_on = false;
         else if (std::strcmp(argv[i], "--ec") == 0 && i + 1 < argc)
             exposure_comp = float(std::atof(argv[++i]));
+        else if (std::strcmp(argv[i], "--scale") == 0 && i + 1 < argc)
+            render_scale = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--size") == 0 && i + 2 < argc) {
             shot_w = std::atoi(argv[++i]);
             shot_h = std::atoi(argv[++i]);
@@ -270,6 +277,17 @@ int main(int argc, char** argv) {
     if (!env) return Fail(error);
     auto post = eng::PostStack::Create(app->Gpu(), error);
     if (!post) return Fail(error);
+    post->config.render_scale = render_scale;
+    // The scene's own targets, at render size: everything up to the TAA
+    // resolve runs small, and the history/output the post stack owns stay at
+    // display. A second FrameTargets rather than resized app ones -- the app
+    // sizes its own to the window every frame, and nothing display-sized
+    // needs app targets anyway (history/output are post-owned, the composite
+    // writes the drawable, the UI draws into the composite pass).
+    //
+    // Same format and samples as the app's: BGRA8 colour, 4x MSAA, which are
+    // the Config defaults this viewer never overrides.
+    eng::app::FrameTargets scene_targets(app->Gpu(), eng::rhi::Format::BGRA8Unorm, 4);
     // LIGHT SHAFTS. The one effect a forest is actually about: the canopy cuts
     // the sunlight into beams and you see them in the air, not on a surface.
     // Everything else here lights things; this lights the space between them.
@@ -2023,6 +2041,12 @@ int main(int argc, char** argv) {
         scene.camera.jitter = post->Jitter();
         post->BeginFrame(scene.camera, f.width, f.height, dt);
         scene.camera.jitter = post->Jitter();
+        // RENDER SIZE, from the post stack's render_scale: every pass below
+        // up to the TAA resolve runs at rw/rh, and the resolve rebuilds the
+        // display image. At the default scale of 1.0 these are f.width and
+        // f.height, and nothing below differs from before.
+        const int rw = post->RenderWidth(), rh = post->RenderHeight();
+        scene_targets.Resize(rw, rh);
 
         // --- HUD ----------------------------------------------------------------
         ui->Begin(f.width, f.height);
@@ -2095,11 +2119,11 @@ int main(int argc, char** argv) {
             shot_target = app->Gpu().CreateRenderTarget(
                 f.width, f.height, eng::rhi::Format::RGBA8Unorm,
                 /*cpu_readable=*/true);
-        const eng::rhi::TextureId color = app->Targets().Hdr("color");
-        const eng::rhi::TextureId ao = app->Targets().Color("ao");
-        const eng::rhi::TextureId ms_color = app->Targets().Msaa("ms");
-        const eng::rhi::TextureId ms_depth = app->Targets().MsaaDepth("ms_depth");
-        const eng::rhi::TextureId depth = app->Targets().Depth("depth", true);
+        const eng::rhi::TextureId color = scene_targets.Hdr("color");
+        const eng::rhi::TextureId ao = scene_targets.Color("ao");
+        const eng::rhi::TextureId ms_color = scene_targets.Msaa("ms");
+        const eng::rhi::TextureId ms_depth = scene_targets.MsaaDepth("ms_depth");
+        const eng::rhi::TextureId depth = scene_targets.Depth("depth", true);
         graph.Clear();
 
         if (needs_bake)
@@ -2126,7 +2150,7 @@ int main(int argc, char** argv) {
             p.keep_depth = true;
             p.timer = "depth";
             p.execute = [&](eng::rhi::Encoder& e) {
-                app->Draw().DrawSceneDepth(e, scene, f.width, f.height);
+                app->Draw().DrawSceneDepth(e, scene, rw, rh);
             };
             graph.AddPass(p);
         }
@@ -2139,13 +2163,13 @@ int main(int argc, char** argv) {
             p.reads = {shadow_map};
             p.timer = "scene";
             p.execute = [&](eng::rhi::Encoder& e) {
-                app->Draw().DrawScene(e, scene, f.width, f.height, shadow_map);
-                env->DrawSky(e, scene.camera, f.width, f.height);
+                app->Draw().DrawScene(e, scene, rw, rh, shadow_map);
+                env->DrawSky(e, scene.camera, rw, rh);
                 // After the opaque geometry and the sky, so they test against
                 // both. `depth` is the prepass copy -- the pass's own depth is
                 // multisampled and cannot be sampled, and without it the sparks
                 // cut a hard edge into the ground instead of fading into it.
-                if (sparks_on) sparks->Draw(e, scene.camera, f.width, f.height, depth);
+                if (sparks_on) sparks->Draw(e, scene.camera, rw, rh, depth);
             };
             graph.AddPass(p);
         }
@@ -2176,7 +2200,7 @@ int main(int argc, char** argv) {
                                  // copy of the shadow setup drifts away from
                                  // the shadow it is supposed to be cast by,
                                  // and the beam lands beside the gap.
-                                 vol->Build(e, scene, f.width, f.height, f.index,
+                                 vol->Build(e, scene, rw, rh, f.index,
                                             shadow_map, app->Draw().CascadeBuffer(),
                                             app->Draw().CascadeOffset(),
                                             app->Draw().LightBuffer(),
@@ -2190,7 +2214,7 @@ int main(int argc, char** argv) {
             p.reads = {depth, vol->Volume()};
             p.timer = "shafts";
             p.execute = [&](eng::rhi::Encoder& e) {
-                vol->Apply(e, scene, f.width, f.height, depth);
+                vol->Apply(e, scene, rw, rh, depth);
             };
             graph.AddPass(p);
         }
@@ -2213,7 +2237,7 @@ int main(int argc, char** argv) {
             p.clear_color[0] = p.clear_color[1] = p.clear_color[2] = 1.0f;
             p.timer = "ssao";
             p.execute = [&](eng::rhi::Encoder& e) {
-                app->Draw().DrawSsao(e, scene.camera, f.width, f.height, depth,
+                app->Draw().DrawSsao(e, scene.camera, rw, rh, depth,
                                      ssao_radius);
             };
             graph.AddPass(p);
@@ -2323,7 +2347,7 @@ int main(int argc, char** argv) {
         // frame's shading needs this frame's bins.
         if (app->Draw().ClusteredLighting() && !scene.lights.empty()) {
             auto e = app->Gpu().BeginCompute("bin");
-            app->Draw().BinLights(e, scene, f.width, f.height, 90.0f);
+            app->Draw().BinLights(e, scene, rw, rh, 90.0f);
             app->Gpu().EndCompute();
         }
         graph.Execute(app->Gpu());

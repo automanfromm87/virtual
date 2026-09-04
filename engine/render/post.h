@@ -131,6 +131,14 @@ struct PostConfig {
     // How much history survives each frame. 0.9 means a tenth of the image is
     // new, which converges in about twenty frames and trails visibly above 0.95.
     float taa_feedback = 0.9f;
+    // Renders the scene below display resolution; the TAA resolve rebuilds
+    // the display image out of sub-pixel-jittered history, which is temporal
+    // upsampling rather than mere antialiasing. 1.0 is native. The history
+    // and output stay at display size -- only the scene chain (and the
+    // velocity, which is derived from its depth) runs small -- so at 1.0
+    // every size below is what it always was, and this setting changes
+    // nothing.
+    float render_scale = 1.0f;
 };
 
 class PostStack {
@@ -157,6 +165,11 @@ class PostStack {
     // them and does not have to know which ones were enabled.
     void ComputeVelocity(rhi::ComputeEncoder&, rhi::TextureId depth);
     [[nodiscard]] rhi::TextureId Velocity() const;
+    // The scene size BeginFrame derived from render_scale: the width and
+    // height every scene-chain pass (and every Draw* width/height argument)
+    // must use. At the default scale of 1.0 these are the BeginFrame size.
+    [[nodiscard]] int RenderWidth() const;
+    [[nodiscard]] int RenderHeight() const;
 
     // Blended over `target` in place. Needs a pass whose colour attachment is
     // the HDR image and which reads `depth`.
