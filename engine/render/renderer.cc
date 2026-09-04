@@ -448,6 +448,7 @@ struct Renderer::Impl {
 
     RenderStats stats;
     int shadow_draws = 0;
+    int shadow_map_size = Renderer::kDirectionalShadowSize;
     // Reused across frames so a steady-state frame allocates nothing.
     std::vector<DrawItem> visible;
     std::vector<int> draw_order;
@@ -1423,6 +1424,14 @@ std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
     return r;
 }
 
+void Renderer::SetShadowMapSize(int size) {
+    // Clamped to something a cascade can be cut out of. A size that is not a
+    // multiple of the tiling leaves a seam of unwritten depth down the middle
+    // of the atlas, which reads as a stripe of "nothing casts here".
+    impl_->shadow_map_size = std::clamp(size, 256, 16384) & ~1;
+}
+int Renderer::ShadowMapSize() const { return impl_->shadow_map_size; }
+
 void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
     impl_->shadow_draws = 0;
     if (scene.shadowExtent <= 0.0f) return;
@@ -1430,7 +1439,7 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
     // behaviour this had before they existed.
     const int cascades = std::clamp(scene.shadowCascades, 1, 4);
     const int per_side = cascades > 1 ? 2 : 1;
-    const int tile_px = kDirectionalShadowSize / per_side;
+    const int tile_px = impl_->shadow_map_size / per_side;
     const float aspect = impl_->last_aspect > 0.0f ? impl_->last_aspect : 1.7778f;
 
     // The pipeline is set PER DRAW now rather than once, because a skinned
@@ -1511,7 +1520,7 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
     }
     }
     if (cascades > 1) {
-        enc.SetViewport(0, 0, kDirectionalShadowSize, kDirectionalShadowSize);
+        enc.SetViewport(0, 0, impl_->shadow_map_size, impl_->shadow_map_size);
         enc.SetScissor(0, 0, kDirectionalShadowSize, kDirectionalShadowSize);
     }
 }

@@ -107,6 +107,26 @@ int main(int argc, char** argv) {
     // to separate shimmer from honest motion.
     float yaw_offset = 0.0f;
     float lod_near = 45.0f;
+    int shot_w = 1100, shot_h = 760;
+    float shadow_dist = 90.0f;
+    // 4096, MEASURED against an 8192 render of the same frame. The fraction of
+    // pixels more than 20 of 255 away from that reference:
+    //
+    //     2048, 3 cascades   6.01%   2.06 ms   16 MB
+    //     2048, 4 cascades   5.24%   2.35 ms   16 MB
+    //     4096, 3 cascades   2.01%   2.16 ms   64 MB
+    //     4096, 4 cascades   1.62%   2.53 ms   64 MB
+    //
+    // Three times closer for four percent more time. A FOURTH CASCADE is the
+    // cheaper-looking option -- the 2x2 tile layout already has an empty tile
+    // waiting -- and it is not worth it: it buys 6.01 to 5.24 and costs a whole
+    // extra pass over every caster, 14% of the frame.
+    //
+    // Cutting shadowDistance was tried and makes it WORSE, 6.01 to 10.23. It
+    // does not just tighten the cascades, it stops anything past it casting at
+    // all, and the far half of the scene loses its shadows.
+    int shadow_px = 4096;
+    int shadow_cascades = 3;
     // Sun elevation in degrees. Exposed so a capture can be taken at a stated
     // time of day rather than only at the one the demo starts with.
     float sun_start = 31.5f;
@@ -122,6 +142,18 @@ int main(int argc, char** argv) {
             sun_start = float(std::atof(argv[++i]));
         else if (std::strcmp(argv[i], "--lodnear") == 0 && i + 1 < argc)
             lod_near = float(std::atof(argv[++i]));
+        // Headless renders at exactly this size -- there is no window and so no
+        // backing-scale factor to double it.
+        else if (std::strcmp(argv[i], "--shadowdist") == 0 && i + 1 < argc)
+            shadow_dist = float(std::atof(argv[++i]));
+        else if (std::strcmp(argv[i], "--shadowpx") == 0 && i + 1 < argc)
+            shadow_px = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--cascades") == 0 && i + 1 < argc)
+            shadow_cascades = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--size") == 0 && i + 2 < argc) {
+            shot_w = std::atoi(argv[++i]);
+            shot_h = std::atoi(argv[++i]);
+        }
     }
 
     // LINE BUFFERED. Redirected to a file, stdout is fully buffered, and a
@@ -138,6 +170,10 @@ int main(int argc, char** argv) {
     // same frame byte-identical; with a wall-clock dt the exposure meter and the
     // character both integrate a different number each run.
     config.headless = !shot_path.empty();
+    if (config.headless) {
+        config.width = shot_w;
+        config.height = shot_h;
+    }
     auto app = eng::app::App::Create(config, error);
     if (!app) return Fail(error);
 
@@ -748,10 +784,11 @@ int main(int argc, char** argv) {
     eng::physics::CharacterController player(cc);
     player.Teleport(eng::Vec3{0.0f, terrain.HeightAt(0.0f, 0.0f) + 0.5f, 0.0f});
 
-    const eng::rhi::TextureId shadow_map = app->Gpu().CreateShadowMap(2048);
+    const eng::rhi::TextureId shadow_map = app->Gpu().CreateShadowMap(shadow_px);
+    app->Draw().SetShadowMapSize(shadow_px);
     scene.shadowExtent = 30.0f;
-    scene.shadowCascades = 3;
-    scene.shadowDistance = 90.0f;
+    scene.shadowCascades = shadow_cascades;
+    scene.shadowDistance = shadow_dist;
 
     // AUTO EXPOSURE. Without it the composite applies a fixed exposure of 1,
     // and this scene is far too bright for that: the ground's albedo is

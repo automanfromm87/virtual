@@ -312,9 +312,22 @@ class Renderer {
 
     // 4x4 tiles of 1024. Sixteen because a POINT light needs six of them —
     // one per cube face — so a 2x2 atlas could not hold a single one.
-    // What a directional shadow map should be created at. Cascades tile it, so
-    // four of them get 1024 each.
+    // The DEFAULT size for a directional shadow map. Cascades tile it, so four
+    // of them get half this each.
     static constexpr int kDirectionalShadowSize = 2048;
+
+    // Tells the renderer how big the map it was handed actually is.
+    //
+    // IT USED TO BE A CONSTANT ON BOTH SIDES: the app called
+    // CreateShadowMap(2048) and DrawShadow set its viewports from
+    // kDirectionalShadowSize, two independent numbers that had to agree. Hand
+    // CreateShadowMap a 4096 and the cascades would still be written into
+    // 2048 worth of it -- a quarter of the texture used, three quarters black,
+    // and the only symptom is that the shadows do not get any sharper. The
+    // shader reads the real width from the texture, so it would not even be
+    // inconsistent, just quietly wasteful.
+    void SetShadowMapSize(int size);
+    [[nodiscard]] int ShadowMapSize() const;
 
     static constexpr int kShadowAtlasSize = 4096;
     static constexpr int kShadowTilesPerSide = 4;
