@@ -95,6 +95,7 @@ cc_test(
         "testdata_glb.inc",
         "testdata_skinned_gltf.inc",
         "testdata_morph_gltf.inc",
+        "testdata_fox.inc",
     ],
     deps = [":asset"],
 )

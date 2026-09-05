@@ -41,6 +41,7 @@ const char* const kTexturedGltf =
     ;
 
 #include "engine/asset/testdata_glb.inc"
+#include "engine/asset/testdata_fox.inc"
 
 bool Near(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) < eps; }
 
@@ -290,6 +291,31 @@ int main() {
         // replaced rather than just the component that changed.
         CHECK(Near(m.vertices[1].position.x, 1.0f));
         CHECK(Near(m.vertices[3].position.x, 3.0f));
+    }
+
+    // --- a real exporter asset: the Fox sample ---------------------------------
+    // None of the fixtures above combines node transforms, an embedded PNG,
+    // a skin and multi-channel clips; third-party exporters do all four at
+    // once, and the demo loads these exact bytes behind --fox.
+    {
+        const std::span<const std::uint8_t> bytes(
+            reinterpret_cast<const std::uint8_t*>(kFoxGlb), sizeof(kFoxGlb));
+        CHECK(gltf::IsGlb(bytes));
+        std::string error;
+        const gltf::Document fox = gltf::ParseGlb(bytes, error);
+        CHECK(error.empty());
+        if (!error.empty()) std::fprintf(stderr, "  fox: %s\n", error.c_str());
+        CHECK(fox.primitives.size() == 1);
+        if (fox.primitives.empty()) return 1;
+        CHECK(fox.primitives[0].Skinned());
+        CHECK(fox.images.size() == 1);
+        CHECK(!fox.images[0].Empty());
+        CHECK(fox.images[0].width == 1024 && fox.images[0].height == 1024);
+        CHECK(fox.skins.size() == 1);
+        CHECK(fox.animations.size() == 3);
+        // Walk is animation 1; retargeted onto the skin it must keep
+        // channels, or the demo plays a fox that never moves.
+        CHECK(!fox.MakeClip(1, 0).channels.empty());
     }
 
     // --- a corrupt container is refused ----------------------------------------
