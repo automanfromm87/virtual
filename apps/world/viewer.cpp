@@ -22,9 +22,13 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
 
 #include "engine/app/app.h"
 #include "engine/app/targets.h"
+#include "engine/asset/gltf.h"
 #include "engine/asset/png.h"
 #include "engine/geometry/mesh.h"
 #include "engine/geometry/simplify.h"
@@ -134,6 +138,12 @@ int main(int argc, char** argv) {
     // washed out without anyone noticing.
     std::string shot_path;
     int shot_frames = 12;
+    // The player's look: a real glTF asset when it resolves (a .gltf with
+    // sibling .bin/.png, or a .glb), the generated humanoid otherwise --
+    // notably under `bazel test`, where no assets ship. Missing file is a
+    // fallback, not a failure: the valley gate runs the same binary with no
+    // assets beside it and must see exactly the old figure.
+    std::string fox_path = "assets/fox/Fox.gltf";
     bool start_fog = true;
     // For measuring temporal aliasing. Two captures a fraction of a pixel apart
     // should differ by a fraction of a pixel's worth of colour; anything that
@@ -262,6 +272,8 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc)
             shot_path = argv[++i];
+        else if (std::strcmp(argv[i], "--fox") == 0 && i + 1 < argc)
+            fox_path = argv[++i];
         else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
             shot_frames = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--nofog") == 0) start_fog = false;
@@ -1323,15 +1335,101 @@ int main(int argc, char** argv) {
     // sphere has no feet, so nothing in this demo had ever had to agree with
     // the ground at a point rather than on average, and it has no gait, so the
     // character's speed had never had to be a speed a body could move at.
-    const eng::anim::Skeleton skeleton = world::BuildHumanSkeleton();
-    const world::HumanBody figure = world::BuildHumanBody(skeleton);
-    const eng::anim::Clip clip_idle = world::MakeIdle();
-    const eng::anim::Clip clip_walk = world::MakeGait("walk", world::kWalkGait);
-    const eng::anim::Clip clip_run = world::MakeGait("run", world::kRunGait);
+    // The player is a fox when the asset resolves, the generated humanoid
+    // otherwise. Either way the frame below only sees one skeleton, one
+    // skinned mesh and three clips -- idle, walk, run.
+    eng::anim::Skeleton skeleton = world::BuildHumanSkeleton();
+    world::HumanBody figure = world::BuildHumanBody(skeleton);
+    eng::anim::Clip clip_idle = world::MakeIdle();
+    eng::anim::Clip clip_walk = world::MakeGait("walk", world::kWalkGait);
+    eng::anim::Clip clip_run = world::MakeGait("run", world::kRunGait);
+    // Humanoid values; the fox overrides both. Its file is in centimetres
+    // against an engine in metres, and which way it faces is settled below.
+    float figure_scale = 1.0f;
+    float figure_yaw = 0.0f;
+    bool figure_fox = false;
+    float body_roughness = 0.72f;
+    float body_metallic = 0.0f;
+    eng::rhi::TextureId figure_tex{};
+    {
+        // The asset lives in the source tree, but neither `bazel run` nor a
+        // test harness starts with the workspace root as the working
+        // directory. Walk up from the cwd and from the binary itself; the
+        // first tree containing the asset wins. A harness with no assets
+        // (notably the valley gate) finds nothing and keeps the humanoid.
+        std::string resolved;
+        {
+            const std::string argv0 = argc > 0 ? argv[0] : "";
+            const std::string bases[2] = {
+                std::filesystem::current_path().string(),
+                std::filesystem::path(argv0).parent_path().string()};
+            for (const std::string& base : bases) {
+                std::error_code ec;
+                std::filesystem::path dir = std::filesystem::canonical(base, ec);
+                if (ec) dir = std::filesystem::path(base);
+                for (int up = 0; up < 8 && resolved.empty(); ++up) {
+                    const std::string cand = (dir / fox_path).string();
+                    std::ifstream probe(cand, std::ios::binary);
+                    if (probe.good()) resolved = cand;
+                    dir = dir.parent_path();
+                }
+                if (!resolved.empty()) break;
+            }
+            if (resolved.empty()) resolved = fox_path;
+        }
+        std::string fox_error;
+        std::ifstream fox_file(resolved, std::ios::binary);
+        std::vector<std::uint8_t> fox_bytes{
+            std::istreambuf_iterator<char>(fox_file),
+            std::istreambuf_iterator<char>()};
+        eng::gltf::Document fox_doc;
+        if (!fox_file)
+            fox_error = "gltf: cannot open " + resolved;
+        else if (eng::gltf::IsGlb(fox_bytes))
+            fox_doc = eng::gltf::ParseGlb(fox_bytes, fox_error);
+        else
+            fox_doc = eng::gltf::LoadGltfFile(resolved, fox_error);
+        const bool fox_usable =
+            fox_error.empty() && !fox_doc.Empty() && !fox_doc.skins.empty() &&
+            fox_doc.animations.size() >= 3 && !fox_doc.images.empty() &&
+            !fox_doc.images[0].Empty() &&
+            int(fox_doc.skins[0].skeleton.joints.size()) <=
+                eng::Renderer::kMaxJoints;
+        if (!fox_usable) {
+            std::printf("figure: generated humanoid (%s)\n",
+                        fox_error.empty() ? "fox unusable" : fox_error.c_str());
+        } else {
+            skeleton = fox_doc.skins[0].skeleton;
+            figure.mesh = fox_doc.primitives[0].mesh;
+            figure.skin = fox_doc.primitives[0].skin;
+            // Survey, Walk, Run in the sample's order.
+            clip_idle = fox_doc.MakeClip(0, 0);
+            clip_walk = fox_doc.MakeClip(1, 0);
+            clip_run = fox_doc.MakeClip(2, 0);
+            figure_fox = !clip_walk.channels.empty();
+            if (figure_fox) {
+                figure_scale = 0.012f;
+                // sRGB: a painted albedo is a COLOUR, like soot, not a linear
+                // ratio like the terrain modulators.
+                const eng::Texture2D& img = fox_doc.images[0];
+                figure_tex = app->Gpu().CreateTexture2D(
+                    img.width, img.height, img.rgba.data(), true, true);
+                figure_fox = eng::rhi::Valid(figure_tex);
+                if (!fox_doc.materials.empty()) {
+                    // Applied to body_md below; kept here so the fallback
+                    // path reads exactly as it did before the fox existed.
+                    body_roughness = fox_doc.materials[0].roughness;
+                    body_metallic = fox_doc.materials[0].metallic;
+                }
+            }
+            std::printf("figure: %s (%s)\n", figure_fox ? "loaded fox" : "generated humanoid",
+                        fox_path.c_str());
+        }
+    }
     const eng::MeshHandle capsule_mesh = app->Draw().UploadMesh(
         eng::MakeUVSphere(0.45f, 16, 20, eng::Vec4{1, 1, 1, 1}, eng::Vec4{1, 1, 1, 1}));
     const eng::MeshHandle figure_mesh = app->Draw().UploadSkinnedMesh(
-        figure.mesh, figure.skin, world::kHumanJoints);
+        figure.mesh, figure.skin, int(skeleton.joints.size()));
     if (!eng::Valid(figure_mesh)) return Fail("skinned upload");
     eng::MaterialDesc body_md;
     body_md.shading = eng::Shading::Lit;
@@ -1339,7 +1437,12 @@ int main(int argc, char** argv) {
     // skin. A base colour here would multiply into both and turn the face the
     // colour of the coat.
     body_md.base_color = eng::Vec4{1.0f, 1.0f, 1.0f, 1.0f};
-    body_md.roughness = 0.72f;
+    body_md.roughness = body_roughness;
+    body_md.metallic = body_metallic;
+    if (figure_fox) {
+        // No vertex colours on the fox; its painted texture is the albedo.
+        body_md.albedo = figure_tex;
+    }
     const eng::MaterialHandle body_mat = app->Draw().CreateMaterial(body_md, error);
     eng::Instance body;
     body.mesh = figure_mesh;
@@ -1444,7 +1547,9 @@ int main(int argc, char** argv) {
     // knee bends; without it the solver has a whole circle of solutions and the
     // usual fallback -- keep the current bend -- flips every time the leg
     // passes through straight, snapping the knee backwards once per step.
-    const bool foot_ik = !no_foot_ik;
+    // The fox keeps its authored cycle: its joints are not the humanoid's,
+    // so the humanoid's IK chains would pose something that is not a leg.
+    const bool foot_ik = !no_foot_ik && !figure_fox;
     eng::anim::FootIkConfig ik_left, ik_right;
     ik_left.limb.root = world::kThighL;
     ik_left.limb.mid = world::kShinL;
@@ -2105,7 +2210,9 @@ int main(int argc, char** argv) {
             animator.Update(dt);
 
             const eng::Mat4 to_world = eng::Mat4::Translation(player.Feet()) *
-                                       eng::Mat4::RotationY(facing);
+                                       eng::Mat4::RotationY(facing) *
+                                       eng::Mat4::RotationY(figure_yaw) *
+                                       eng::Mat4::Scale(figure_scale);
             eng::anim::Pose pose = animator.CurrentPose();
 
             // FOOT IK, which is the reason this demo is the right place for a

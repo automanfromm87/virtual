@@ -27,6 +27,7 @@ cc_binary(
         ":humanoid",
         "//engine/anim",
         "//engine/app",
+        "//engine/asset",
         "//engine/asset:png",
         "//engine/asset:soundgen",
         "//engine/audio:system",

@@ -6,3 +6,5 @@
 # `git add docs/hero.png` too, which is the kind of thing that gets diagnosed
 # six weeks later as "the README image never worked".
 !docs/*.png
+# The fox is a checked-in asset, not a capture.
+!assets/fox/*.png
