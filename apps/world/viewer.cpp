@@ -129,6 +129,43 @@ struct Chunk {
 
 }  // namespace
 
+// The asset lives in the source tree, but neither `bazel run` nor a test
+// harness starts with the workspace root as the working directory. Walk up
+// from the cwd and from the binary itself; the first tree containing the
+// asset wins. A harness with no assets finds nothing and keeps the
+// procedural fallback.
+std::string ResolveAsset(const std::string& rel, int argc, char** argv) {
+    const std::string argv0 = argc > 0 ? argv[0] : "";
+    const std::string bases[2] = {std::filesystem::current_path().string(),
+                                  std::filesystem::path(argv0).parent_path().string()};
+    for (const std::string& base : bases) {
+        std::error_code ec;
+        std::filesystem::path dir = std::filesystem::canonical(base, ec);
+        if (ec) dir = std::filesystem::path(base);
+        for (int up = 0; up < 8; ++up) {
+            const std::string cand = (dir / rel).string();
+            std::ifstream probe(cand, std::ios::binary);
+            if (probe.good()) return cand;
+            dir = dir.parent_path();
+        }
+    }
+    return rel;
+}
+
+// Reads a .gltf (siblings resolved next to it) or a .glb into a Document.
+// A missing file is an error string, not a crash: callers fall back.
+eng::gltf::Document LoadAssetDoc(const std::string& path, std::string& error) {
+    std::ifstream f(path, std::ios::binary);
+    std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(f),
+                                    std::istreambuf_iterator<char>()};
+    if (!f) {
+        error = "gltf: cannot open " + path;
+        return {};
+    }
+    if (eng::gltf::IsGlb(bytes)) return eng::gltf::ParseGlb(bytes, error);
+    return eng::gltf::LoadGltfFile(path, error);
+}
+
 int main(int argc, char** argv) {
     // CAPTURE MODE. Renders a fixed number of frames into a readable target and
     // writes a PNG instead of opening on the drawable.
@@ -144,6 +181,11 @@ int main(int argc, char** argv) {
     // fallback, not a failure: the valley gate runs the same binary with no
     // assets beside it and must see exactly the old figure.
     std::string fox_path = "assets/fox/Fox.gltf";
+    // Crowd boulders: Kenney rocks (CC0, OBJ converted to .glb once --
+    // flat facet normals kept as authored), alternating for variety.
+    // Missing files keep spheres.
+    std::string rock_path = "assets/rock/rock_tallA.glb";
+    std::string rock_path2 = "assets/rock/rock_largeA.glb";
     bool start_fog = true;
     // For measuring temporal aliasing. Two captures a fraction of a pixel apart
     // should differ by a fraction of a pixel's worth of colour; anything that
@@ -274,6 +316,8 @@ int main(int argc, char** argv) {
             shot_path = argv[++i];
         else if (std::strcmp(argv[i], "--fox") == 0 && i + 1 < argc)
             fox_path = argv[++i];
+        else if (std::strcmp(argv[i], "--rock") == 0 && i + 1 < argc)
+            rock_path = argv[++i];
         else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
             shot_frames = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--nofog") == 0) start_fog = false;
@@ -1302,6 +1346,26 @@ int main(int argc, char** argv) {
         const eng::MaterialHandle crowd_mat =
             app->Draw().CreateMaterial(crowd_md, error);
         if (!eng::Valid(crowd_mat)) return Fail(error);
+        eng::MeshHandle crowd_mesh[2] = {unit_sphere, unit_sphere};
+        {
+            const std::string paths[2] = {rock_path, rock_path2};
+            for (int r = 0; r < 2; ++r) {
+                std::string rock_error;
+                const eng::gltf::Document rock_doc = LoadAssetDoc(
+                    ResolveAsset(paths[r], argc, argv), rock_error);
+                const eng::MeshHandle rock_up =
+                    rock_error.empty() && !rock_doc.Empty()
+                        ? app->Draw().UploadMesh(rock_doc.primitives[0].mesh)
+                        : eng::MeshHandle{};
+                if (eng::Valid(rock_up)) {
+                    crowd_mesh[r] = rock_up;
+                    std::printf("crowd: loaded rock (%s)\n", paths[r].c_str());
+                } else {
+                    std::printf("crowd: unit sphere (%s)\n",
+                                rock_error.empty() ? "rock unusable" : rock_error.c_str());
+                }
+            }
+        }
         std::mt19937 rng(1234);
         std::uniform_real_distribution<float> unit(0.0f, 1.0f);
         const float kPi = 3.14159265f;
@@ -1315,11 +1379,18 @@ int main(int argc, char** argv) {
             const float z = std::sin(angle) * radius;
             const float s = 0.5f + 1.6f * unit(rng);
             eng::Instance b;
-            b.mesh = unit_sphere;
+            // Alternate the two rocks; either missing file falls back to its
+            // sphere slot, so a half-present assets/ degrades gracefully.
+            b.mesh = crowd_mesh[i % 2];
             b.material = crowd_mat;
             const float ground = terrain.HeightAt(x, z);
-            b.model = eng::Mat4::Translation(
-                          eng::Vec3{x, ground + 0.5f * s * 0.55f, z}) *
+            // The rocks sit base-down (their files start at y = 0); the
+            // sphere floated on its centre, hence the two offsets.
+            const float yoff = (b.mesh == unit_sphere)
+                                   ? 0.5f * s * 0.55f
+                                   : -0.05f * s;
+            b.model = eng::Mat4::Translation(eng::Vec3{x, ground + yoff, z}) *
+                      eng::Mat4::RotationY(unit(rng) * 2.0f * kPi) *
                       eng::Mat4::Scale(s);
             const float shade = 0.82f + 0.30f * unit(rng);
             b.tint = eng::Vec4{shade, shade, shade * 0.99f, 1.0f};
@@ -1352,43 +1423,9 @@ int main(int argc, char** argv) {
     float body_metallic = 0.0f;
     eng::rhi::TextureId figure_tex{};
     {
-        // The asset lives in the source tree, but neither `bazel run` nor a
-        // test harness starts with the workspace root as the working
-        // directory. Walk up from the cwd and from the binary itself; the
-        // first tree containing the asset wins. A harness with no assets
-        // (notably the valley gate) finds nothing and keeps the humanoid.
-        std::string resolved;
-        {
-            const std::string argv0 = argc > 0 ? argv[0] : "";
-            const std::string bases[2] = {
-                std::filesystem::current_path().string(),
-                std::filesystem::path(argv0).parent_path().string()};
-            for (const std::string& base : bases) {
-                std::error_code ec;
-                std::filesystem::path dir = std::filesystem::canonical(base, ec);
-                if (ec) dir = std::filesystem::path(base);
-                for (int up = 0; up < 8 && resolved.empty(); ++up) {
-                    const std::string cand = (dir / fox_path).string();
-                    std::ifstream probe(cand, std::ios::binary);
-                    if (probe.good()) resolved = cand;
-                    dir = dir.parent_path();
-                }
-                if (!resolved.empty()) break;
-            }
-            if (resolved.empty()) resolved = fox_path;
-        }
         std::string fox_error;
-        std::ifstream fox_file(resolved, std::ios::binary);
-        std::vector<std::uint8_t> fox_bytes{
-            std::istreambuf_iterator<char>(fox_file),
-            std::istreambuf_iterator<char>()};
-        eng::gltf::Document fox_doc;
-        if (!fox_file)
-            fox_error = "gltf: cannot open " + resolved;
-        else if (eng::gltf::IsGlb(fox_bytes))
-            fox_doc = eng::gltf::ParseGlb(fox_bytes, fox_error);
-        else
-            fox_doc = eng::gltf::LoadGltfFile(resolved, fox_error);
+        eng::gltf::Document fox_doc =
+            LoadAssetDoc(ResolveAsset(fox_path, argc, argv), fox_error);
         const bool fox_usable =
             fox_error.empty() && !fox_doc.Empty() && !fox_doc.skins.empty() &&
             fox_doc.animations.size() >= 3 && !fox_doc.images.empty() &&
