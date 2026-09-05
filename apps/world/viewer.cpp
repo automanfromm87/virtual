@@ -186,6 +186,10 @@ int main(int argc, char** argv) {
     // Missing files keep spheres.
     std::string rock_path = "assets/rock/rock_tallA.glb";
     std::string rock_path2 = "assets/rock/rock_largeA.glb";
+    // Forest trees: Kenney oak and pine (CC0, OBJ converted to .glb once,
+    // one primitive per material). Missing files grow the procedural forest.
+    std::string oak_path = "assets/tree/oak.glb";
+    std::string pine_path = "assets/tree/pine.glb";
     bool start_fog = true;
     // For measuring temporal aliasing. Two captures a fraction of a pixel apart
     // should differ by a fraction of a pixel's worth of colour; anything that
@@ -320,6 +324,10 @@ int main(int argc, char** argv) {
             rock_path = argv[++i];
         else if (std::strcmp(argv[i], "--rock2") == 0 && i + 1 < argc)
             rock_path2 = argv[++i];
+        else if (std::strcmp(argv[i], "--oak") == 0 && i + 1 < argc)
+            oak_path = argv[++i];
+        else if (std::strcmp(argv[i], "--pine") == 0 && i + 1 < argc)
+            pine_path = argv[++i];
         else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
             shot_frames = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--nofog") == 0) start_fog = false;
@@ -606,9 +614,90 @@ int main(int argc, char** argv) {
         // Bigger as they get fewer, so the canopy keeps roughly its volume:
         // five at 0.52 and one at 0.95 are within a fifth of each other cubed.
         static const float kLeafSize[kForestLods] = {0.52f, 0.63f, 0.95f};
+        // Loaded trees, one per file: foliage = the primitive whose material
+        // names leaves, trunk = the other. Scaled to stand height at load so
+        // everything below (planting scale, canopy proxies, colliders) works
+        // in metres without knowing where a mesh came from.
+        eng::Tree loaded_trees[2];
+        float loaded_trunk_r[2] = {0.0f, 0.0f};
+        float loaded_trunk_h[2] = {0.0f, 0.0f};
+        int loaded_count = 0;
+        {
+            const std::string paths[2] = {oak_path, pine_path};
+            const float heights[2] = {5.0f, 4.0f};
+            for (int t = 0; t < 2; ++t) {
+                std::string tree_error;
+                const eng::gltf::Document doc = LoadAssetDoc(
+                    ResolveAsset(paths[t], argc, argv), tree_error);
+                if (!tree_error.empty() || doc.Empty()) {
+                    std::printf("trees: procedural (%s)\n",
+                                tree_error.empty() ? "tree unusable" : tree_error.c_str());
+                    break;
+                }
+                eng::Tree tree;
+                bool have_trunk = false, have_leaves = false;
+                for (std::size_t p = 0; p < doc.primitives.size(); ++p) {
+                    const eng::gltf::Primitive& prim = doc.primitives[std::size_t(p)];
+                    std::string mat;
+                    if (prim.material >= 0 &&
+                        std::size_t(prim.material) < doc.materials.size())
+                        mat = doc.materials[std::size_t(prim.material)].name;
+                    eng::Mesh mesh = prim.mesh;
+                    const float s = heights[std::size_t(t)];
+                    for (auto& v : mesh.vertices) {
+                        v.position.x *= s;
+                        v.position.y *= s;
+                        v.position.z *= s;
+                    }
+                    mesh.bounds.center = mesh.bounds.center * s;
+                    mesh.bounds.radius *= s;
+                    if (mat.find("eaf") != std::string::npos) {
+                        tree.foliage = mesh;
+                        have_leaves = true;
+                    } else {
+                        tree.trunk = mesh;
+                        have_trunk = true;
+                    }
+                }
+                if (!have_trunk || !have_leaves) {
+                    std::printf("trees: procedural (%s lacks trunk/leaves)\n",
+                                paths[std::size_t(t)].c_str());
+                    break;
+                }
+                // Trunk half-width and top, for the walk-into collider below.
+                float rx = 0.0f, top = 0.0f;
+                for (const auto& v : tree.trunk.vertices) {
+                    rx = std::max(rx, std::max(std::fabs(v.position.x),
+                                               std::fabs(v.position.z)));
+                    top = std::max(top, v.position.y);
+                }
+                loaded_trunk_r[loaded_count] = rx;
+                loaded_trunk_h[loaded_count] = top;
+                // Union of the two spheres, for placing and culling.
+                const eng::Vec3 c = tree.trunk.bounds.center;
+                const eng::Vec3 d = tree.foliage.bounds.center - c;
+                tree.bounds.center = c;
+                tree.bounds.radius = tree.trunk.bounds.radius +
+                                     eng::Length(d) + tree.foliage.bounds.radius;
+                loaded_trees[loaded_count] = tree;
+                ++loaded_count;
+                std::printf("trees: loaded %s\n", paths[std::size_t(t)].c_str());
+            }
+        }
+        const bool trees_loaded = loaded_count == 2;
+        // Collider size per variant: measured for loaded trees, the
+        // generation parameters for grown ones (unchanged behaviour there).
+        float variant_trunk_r[6];
+        float variant_trunk_h[6];
         eng::Tree variants[kForestLods][6];
         for (int lod = 0; lod < kForestLods; ++lod)
             for (int i = 0; i < 6; ++i) {
+                if (trees_loaded) {
+                    variants[lod][i] = loaded_trees[i % 2];
+                    variant_trunk_r[i] = loaded_trunk_r[i % 2];
+                    variant_trunk_h[i] = loaded_trunk_h[i % 2];
+                    continue;
+                }
                 eng::TreeParams tp;
                 tp.seed = 7919u + std::uint32_t(i) * 104729u;
                 tp.height = 4.4f + float(i) * 0.5f;
@@ -622,6 +711,11 @@ int main(int argc, char** argv) {
                 tp.leaf_clusters = kClusters[lod];
                 tp.leaf_size = kLeafSize[lod];
                 variants[lod][i] = eng::MakeTree(tp);
+                // The old constants, not the parameters: the collider below
+                // historically ignored per-variant height, and the valley
+                // gate screenshots the fallback.
+                variant_trunk_r[i] = 0.17f;
+                variant_trunk_h[i] = 4.4f;
             }
 
         // The same xorshift the generator uses, so the forest is identical on
@@ -731,7 +825,8 @@ int main(int argc, char** argv) {
             // Only the trunk, and only the part a person can walk into. The
             // branches above head height are not worth a collider each, and the
             // canopy is not something you bump into on the ground.
-            trunks.push_back({at, 0.17f * scale * 1.25f, 4.4f * scale});
+            trunks.push_back({at, variant_trunk_r[which] * scale * 1.25f,
+                                variant_trunk_h[which] * scale});
             ++planted;
         }
         // --- undergrowth ---------------------------------------------------
