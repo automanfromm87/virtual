@@ -13,6 +13,14 @@
 namespace eng {
 
 // 0 is always the null handle — never a valid resource.
+//
+// APPEND-ONLY tables: handles are indices into vectors that grow and never
+// shrink or reorder, so an index always names the same resource and a stale
+// handle can only go out of range (which every lookup checks) rather than
+// silently alias a different one. That is why these stay bare indices instead
+// of generation-counted ids like StreamId: nothing here is ever destroyed or
+// recycled, so there is no lifetime for a generation to track. If a destroy
+// API is ever added, these must become generation-counted with it.
 struct MeshHandle {
     std::uint32_t v = 0;
 };

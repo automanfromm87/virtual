@@ -8,6 +8,7 @@ package(default_visibility = ["//visibility:public"])
 cc_test(
     name = "foliage_test",
     size = "small",
+    tags = ["exclusive"],
     srcs = ["main.cpp"],
     target_compatible_with = ["@platforms//os:macos"],
     deps = [

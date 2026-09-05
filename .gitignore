@@ -8,3 +8,6 @@
 !docs/*.png
 # The fox is a checked-in asset, not a capture.
 !assets/fox/*.png
+# Pixel-checksum goldens live with the test that owns them; they are reviewed
+# like code, not ignored like captures.
+!tests/**/golden/**

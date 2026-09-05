@@ -36,9 +36,13 @@ constexpr float Dot(Vec2 a, Vec2 b) { return a.x * b.x + a.y * b.y; }
 // left from a — which is how the triangulator tells convex from reflex.
 constexpr float Cross2(Vec2 a, Vec2 b) { return a.x * b.y - a.y * b.x; }
 inline float Length(Vec2 v) { return std::sqrt(Dot(v, v)); }
+// Degenerate input (zero, NaN, Inf) yields Vec2{}: the length test fails for
+// NaN, and 1e-12 keeps a denormal from producing an Inf direction that reads
+// as a valid vector downstream. Callers that must distinguish "no direction"
+// from a direction should test Length() first rather than this.
 inline Vec2 Normalize(Vec2 v) {
     const float len = Length(v);
-    return len > 0.0f ? v * (1.0f / len) : Vec2{};
+    return len > 1e-12f ? v * (1.0f / len) : Vec2{};
 }
 // Rotated 90 degrees left. Wall thickness runs along this.
 constexpr Vec2 Perp(Vec2 v) { return {-v.y, v.x}; }
@@ -63,9 +67,11 @@ constexpr Vec3 Cross(Vec3 a, Vec3 b) {
 
 inline float Length(Vec3 v) { return std::sqrt(Dot(v, v)); }
 
+// Same degenerate-input contract as Normalize(Vec2): zero/NaN/Inf in yields a
+// zero vector out, never a NaN direction. See above.
 inline Vec3 Normalize(Vec3 v) {
     const float len = Length(v);
-    return len > 0.0f ? v * (1.0f / len) : Vec3{};
+    return len > 1e-12f ? v * (1.0f / len) : Vec3{};
 }
 
 // ---------------------------------------------------------------- Vec4 ----
@@ -278,9 +284,11 @@ struct Quat {
     float x = 0.0f, y = 0.0f, z = 0.0f, w = 1.0f;
 };
 
+// Zero/NaN/Inf input yields identity, never NaN: a NaN quaternion poisons
+// every joint below it and reads as "the rig exploded", not as bad input.
 inline Quat Normalize(Quat q) {
     const float len = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
-    if (len <= 0.0f) return Quat{};
+    if (!(len > 1e-12f)) return Quat{};
     const float inv = 1.0f / len;
     return Quat{q.x * inv, q.y * inv, q.z * inv, q.w * inv};
 }

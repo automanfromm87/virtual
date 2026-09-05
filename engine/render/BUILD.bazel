@@ -5,26 +5,31 @@ package(default_visibility = ["//visibility:public"])
 # cc_library, NOT objc_library — and that is the whole point of the RHI split.
 # This layer decides what to draw and links no Apple framework at all. If a
 # Metal type ever leaks up from engine/rhi, this rule stops compiling.
+#
+# Split into one target per pass family rather than a single god target, so a
+# change to a bloom threshold does not recompile the particle system and a
+# reader can see which passes exist without opening renderer.cc. :render stays
+# as the facade so the thirty demos and tests that consume "the renderer" keep
+# depending on one name.
 cc_library(
-    name = "render",
+    name = "rendergraph",
+    srcs = ["rendergraph.cc"],
+    hdrs = ["rendergraph.h"],
+    deps = ["//engine/rhi"],
+)
+
+cc_library(
+    name = "passes",
     srcs = [
         "decals.cc",
-        "fluid.cc",
         "ibl.cc",
-        "particles.cc",
         "post.cc",
-        "rendergraph.cc",
-        "renderer.cc",
         "volumetric.cc",
     ],
     hdrs = [
         "decals.h",
-        "fluid.h",
         "ibl.h",
-        "particles.h",
         "post.h",
-        "rendergraph.h",
-        "renderer.h",
         "volumetric.h",
     ],
     copts = [
@@ -32,7 +37,49 @@ cc_library(
         "-Wno-c23-extensions",
     ],
     deps = [
+        "//engine/core",
+        "//engine/rhi",
+        "//engine/scene",
+        "//engine/shaders",
+    ],
+)
+
+cc_library(
+    name = "fx",
+    srcs = [
+        "fluid.cc",
+        "particles.cc",
+    ],
+    hdrs = [
+        "fluid.h",
+        "particles.h",
+    ],
+    copts = [
+        # #embed is a C23 feature; clang accepts it in C++ mode but warns.
+        "-Wno-c23-extensions",
+    ],
+    deps = [
+        "//engine/core",
+        "//engine/geometry",
+        "//engine/rhi",
+        "//engine/scene",
+        "//engine/shaders",
+    ],
+)
+
+cc_library(
+    name = "render",
+    srcs = ["renderer.cc"],
+    hdrs = ["renderer.h"],
+    copts = [
+        # #embed is a C23 feature; clang accepts it in C++ mode but warns.
+        "-Wno-c23-extensions",
+    ],
+    deps = [
+        ":fx",
         ":gi",
+        ":passes",
+        ":rendergraph",
         "//engine/anim",
         "//engine/core",
         "//engine/geometry",

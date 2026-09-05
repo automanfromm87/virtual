@@ -1157,7 +1157,8 @@ int main() {
             };
 
             long long sum = 0, fwd_sum = 0, def_sum = 0;
-            int worst = 0, large = 0, large_in_flat = 0, lit_pixels = 0, flat = 0;
+            int worst = 0, worst_flat = 0, large = 0, large_in_flat = 0,
+                lit_pixels = 0, flat = 0;
             for (int y = 0; y < kH; ++y)
                 for (int x = 0; x < kW; ++x) {
                     const std::size_t i = (std::size_t(y) * kW + x) * 4;
@@ -1169,7 +1170,10 @@ int main() {
                     sum += here;
                     worst = std::max(worst, here);
                     const bool edge = at_edge(x, y);
-                    if (!edge) ++flat;
+                    if (!edge) {
+                        ++flat;
+                        worst_flat = std::max(worst_flat, here);
+                    }
                     if (here > 8) {
                         ++large;
                         if (!edge) ++large_in_flat;
@@ -1189,6 +1193,14 @@ int main() {
                         fwd_sum, def_sum, 100.0 * double(def_sum) / double(fwd_sum));
             Check(mean < 0.2, "deferred matches forward on average");
             Check(large_in_flat == 0, "every large difference is on an edge");
+            // The MAX error, not just the mean: a mean bound alone lets one
+            // wrong pixel hide among ten thousand right ones. Reconstruction
+            // error (half-float normal, rebuilt position) is a fraction of a
+            // level in flat regions, so the flat-region worst case is bounded
+            // absolutely. Edge pixels keep only the edge-membership rule above,
+            // where sub-pixel coverage legitimately differs by tens of levels.
+            std::printf("    worst flat-region channel difference: %d\n", worst_flat);
+            Check(worst_flat <= 8, "flat regions match within 8 levels worst case");
             // Without these two the whole comparison would pass on a pair of black
             // images, or on a pair where both paths lost the same light.
             Check(lit_pixels > 100000, "the comparison was made on a lit image");

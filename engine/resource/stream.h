@@ -33,11 +33,21 @@
 namespace eng {
 
 // A handle into the streamer's table. Never zero for a live resource.
+//
+// GENERATION COUNTED: `v` is the table slot and `gen` counts how many times
+// the slot has been recycled by Remove/Add. Two ids are equal only when both
+// fields match, and every lookup verifies the generation, so an id kept past
+// Remove() can never silently name the resource that took its slot -- it
+// simply stops resolving (ResidentLevel/TargetLevel return -1 for it).
 struct StreamId {
     std::uint32_t v = 0;
+    std::uint32_t gen = 0;
 };
 inline bool Valid(StreamId s) { return s.v != 0; }
-inline bool operator==(StreamId a, StreamId b) { return a.v == b.v; }
+inline bool operator==(StreamId a, StreamId b) {
+    return a.v == b.v && a.gen == b.gen;
+}
+inline bool operator!=(StreamId a, StreamId b) { return !(a == b); }
 
 struct StreamConfig {
     // Bytes the resident set may occupy. Exceeded only transiently, while a
@@ -70,6 +80,12 @@ struct StreamConfig {
 // kilometres needs its detail more than a teacup at ten metres.
 class Streamer {
   public:
+    // How many finished loads may wait undrained in the Ready queue before
+    // Update stops issuing new ones. 256 finished levels is many frames of
+    // backlog for any caller that drains per frame, and a caller that never
+    // drains is exactly what the backpressure is for.
+    static constexpr std::size_t kMaxReadyLoads = 256;
+
     // Fills `out` with the bytes of one LEVEL of one resource. Called on a
     // worker thread, so it must not touch anything the main thread owns.
     // Returning false marks the level failed; it will be retried when the
@@ -84,17 +100,38 @@ class Streamer {
     Streamer& operator=(const Streamer&) = delete;
 
     // Registers a resource. `level_bytes` is the ADDITIONAL cost of each level
-    // over the one below it, smallest first.
+    // over the one below it, smallest first. A single resource may not exceed
+    // the budget on its own: a level chain whose smallest cumulative size is
+    // already over budget can never become resident, and Add rejects it
+    // outright (returns an invalid id) rather than admitting a resource that
+    // loads forever and settles nowhere.
     [[nodiscard]] StreamId Add(Vec3 position, float radius,
                                std::span<const std::size_t> level_bytes);
 
+    // Unregisters a resource: cancels its in-flight loads, frees its resident
+    // bytes, drops its undrained Ready entries and recycles the slot for a
+    // later Add. Without this a long session -- a world streamed for hours --
+    // grows the table without bound, since every visited resource stayed
+    // registered forever. Removing an unknown or already-removed id is a
+    // no-op that returns false; ids issued before the call keep their value
+    // but stop resolving (see the generation count on StreamId).
+    [[nodiscard]] bool Remove(StreamId);
+
     // Recomputes what should be resident and issues the work. Returns without
     // blocking; finished loads arrive through NextReady.
+    //
+    // BACKPRESSURE: when the undrained Ready backlog reaches kMaxReadyLoads,
+    // Update still recomputes targets and evicts, but issues no new loads --
+    // a caller that never drains would otherwise turn the budget advisory no
+    // matter how carefully Update accounts for it.
     void Update(Vec3 viewer);
 
     // One finished load, or false when there are none. Drain this every frame
     // on the thread that owns the GPU -- the streamer holds the bytes until
     // then, so leaving them undrained is what makes the budget overshoot.
+    //
+    // At most kMaxReadyLoads entries wait here; past that Update stops issuing
+    // (see above) instead of queueing without bound.
     struct Ready {
         StreamId id;
         int level = 0;

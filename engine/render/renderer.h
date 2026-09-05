@@ -421,6 +421,13 @@ class Renderer {
     // forward afterwards) and no MSAA (storing and lighting every sample costs
     // four times the memory and four times the lighting, which is the thing
     // deferring was for).
+    //
+    // And no EMISSION: the two attachments hold albedo/roughness and
+    // normal/metallic, and there is no third channel for emissive radiance, so
+    // an emissive material lights in forward and goes dark in deferred. The
+    // gallery comparison test sets the lamp bulbs aside for exactly this
+    // reason. Emissive surfaces in a deferred frame must be drawn forward
+    // after the lighting pass, alongside the transparent geometry.
     void DrawGBuffer(rhi::Encoder&, const Scene&, int width, int height);
 
     // `depth` must be the SAMPLEABLE depth target the G-buffer pass wrote.

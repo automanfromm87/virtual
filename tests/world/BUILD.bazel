@@ -27,6 +27,7 @@ cc_library(
 
 cc_test(
     name = "world_test",
+    tags = ["exclusive"],
     srcs = ["offscreen.cpp"],
     target_compatible_with = ["@platforms//os:macos"],
     deps = [

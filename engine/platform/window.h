@@ -95,4 +95,13 @@ class Window {
     std::unique_ptr<Impl> impl_;
 };
 
+// What the display showing `native_layer` can actually do, as a multiple of
+// reference white, or 1 when there is no extended range. Lives here rather
+// than in the RHI because answering it needs NSScreen, and AppKit belongs to
+// the platform layer: this keeps the RHI's link set to Metal + QuartzCore +
+// CoreGraphics + Foundation, with no window-server framework. Read it rather
+// than assuming -- the same machine reports a different headroom depending on
+// the display, the brightness setting and whether it is on battery.
+[[nodiscard]] float DisplayHeadroom(const void* native_layer);
+
 }  // namespace eng::platform

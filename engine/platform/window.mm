@@ -1,6 +1,7 @@
 // Objective-C++. The AppKit boundary: NSWindow, NSView and the event pump.
 // The only package that links AppKit.
 #import <AppKit/AppKit.h>
+#import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CoreAnimation.h>
 
 #include "engine/platform/window.h"
@@ -230,6 +231,19 @@ int Window::FramebufferWidth() const {
 
 int Window::FramebufferHeight() const {
     return int(impl_->view.bounds.size.height * impl_->window.backingScaleFactor);
+}
+
+float DisplayHeadroom(const void* native_layer) {
+    // __bridge, not a transfer: the RHI owns the layer, this only reads it.
+    const CAMetalLayer* layer =
+        (__bridge const CAMetalLayer*)native_layer;
+    if (layer == nil || !layer.wantsExtendedDynamicRangeContent) return 1.0f;
+    NSScreen* screen = [NSScreen mainScreen];
+    if (screen == nil) return 1.0f;
+    const float ratio =
+        float(screen.maximumExtendedDynamicRangeColorComponentValue);
+    // Below 1 is meaningless and 1 means no headroom; both come back as "SDR".
+    return ratio > 1.0f ? ratio : 1.0f;
 }
 
 }  // namespace eng::platform

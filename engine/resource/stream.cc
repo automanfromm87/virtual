@@ -17,6 +17,8 @@ struct Resource {
     std::vector<std::size_t> level_bytes;  // additional cost per level
     std::vector<std::size_t> cumulative;   // bytes for levels 0..i inclusive
 
+    bool alive = false;  // false for the null slot and for removed resources
+    std::uint32_t gen = 0;  // bumped by Remove so stale ids stop resolving
     int resident = -1;   // highest level actually in memory
     int target = -1;     // what Update wants
     int in_flight = -1;  // level currently being loaded, or -1
@@ -42,10 +44,13 @@ struct Streamer::Impl {
     // frame's ordering is stale the moment the viewer moves, and re-sorting a
     // heap in place is more code than rebuilding a sorted vector.
     struct Job {
-        StreamId id;
+        StreamId id;  // generation counted: verified when the load lands
         int level;
         float priority;
     };
+    // Recycled table slots, filled by Remove and consumed by Add. Without
+    // this a streamed world grows the table for every resource it ever visits.
+    std::vector<std::uint32_t> free_slots;
     std::vector<Job> queue;
     std::condition_variable work;
 
@@ -104,6 +109,15 @@ bool Streamer::Impl::RunOne(std::unique_lock<std::mutex>& lock) {
     lock.lock();
 
     Resource& r = res[job.id.v];
+    // A load that lands after its resource was removed is dropped, not
+    // applied: charging its bytes or reporting it resident would attach a dead
+    // resource's level to whatever recycled the slot.
+    if (!r.alive || r.gen != job.id.gen || r.in_flight != job.level) {
+        r.in_flight = -1;
+        --active;
+        if (active == 0 && queue.empty()) idle.notify_all();
+        return true;
+    }
     if (ok) {
         ++loads;
         // Charged when the load LANDS, not when it is issued. The alternative
@@ -135,6 +149,9 @@ StreamId Streamer::Add(Vec3 position, float radius,
                        std::span<const std::size_t> level_bytes) {
     if (level_bytes.empty()) return {};
     std::lock_guard<std::mutex> g(impl_->mu);
+    // A resource that cannot fit even its smallest level can never settle, so
+    // refuse it here rather than loading into a residency it never reaches.
+    if (level_bytes.front() > impl_->cfg.budget) return {};
     Resource r;
     r.position = position;
     r.radius = std::max(radius, 1e-4f);
@@ -144,8 +161,42 @@ StreamId Streamer::Add(Vec3 position, float radius,
         total += b;
         r.cumulative.push_back(total);
     }
-    impl_->res.push_back(std::move(r));
-    return StreamId{std::uint32_t(impl_->res.size() - 1)};
+    r.alive = true;
+    std::uint32_t slot;
+    if (!impl_->free_slots.empty()) {
+        slot = impl_->free_slots.back();
+        impl_->free_slots.pop_back();
+        r.gen = impl_->res[slot].gen;  // Remove already bumped it
+        impl_->res[slot] = std::move(r);
+    } else {
+        slot = std::uint32_t(impl_->res.size());
+        impl_->res.push_back(std::move(r));
+    }
+    return StreamId{slot, impl_->res[slot].gen};
+}
+
+bool Streamer::Remove(StreamId id) {
+    std::lock_guard<std::mutex> g(impl_->mu);
+    if (!Valid(id) || id.v >= impl_->res.size()) return false;
+    Resource& r = impl_->res[id.v];
+    if (!r.alive || r.gen != id.gen) return false;
+    // Queued-but-unstarted work dies here; a worker already inside the load
+    // call lands into the generation check in RunOne and is dropped there.
+    impl_->queue.erase(
+        std::remove_if(impl_->queue.begin(), impl_->queue.end(),
+                       [&](const Impl::Job& j) { return j.id == id; }),
+        impl_->queue.end());
+    // Undrained completions for it are dead bytes, not future residency.
+    impl_->ready.erase(
+        std::remove_if(impl_->ready.begin(), impl_->ready.end(),
+                       [&](const Ready& rd) { return rd.id == id; }),
+        impl_->ready.end());
+    if (r.resident >= 0)
+        impl_->resident_bytes -= r.cumulative[std::size_t(r.resident)];
+    r = Resource{};  // clears levels, priorities and the in-flight marker
+    r.gen = id.gen + 1;
+    impl_->free_slots.push_back(id.v);
+    return true;
 }
 
 void Streamer::Update(Vec3 viewer) {
@@ -162,6 +213,7 @@ void Streamer::Update(Vec3 viewer) {
     wants.reserve(std::size_t(n));
     for (int i = 1; i < n; ++i) {
         Resource& r = impl_->res[std::size_t(i)];
+        if (!r.alive) continue;
         const Vec3 d = r.position - viewer;
         // The ANGLE the resource subtends, near enough: radius over distance.
         // Distance alone gets the ordering wrong in the case that matters --
@@ -185,7 +237,27 @@ void Streamer::Update(Vec3 viewer) {
     // priority order means the budget is spent on what matters, and a resource
     // that does not fit at all gets target -1 rather than a partial level --
     // levels are cumulative, so half of level 3 is not a usable anything.
+    // The budget covers what is COMMITTED, not just what is resident: bytes
+    // already in flight and bytes landed-but-undrained are spent whether or
+    // not Update admits it. Ignoring them let a burst of issued loads push the
+    // real footprint past the budget every time the viewer moved fast.
+    //
+    // Already-RESIDENT bytes are deliberately NOT seeded here: the walk below
+    // costs each resource's new target in full, exactly as it always has, so
+    // the targets are a pure function of priority and budget -- and therefore
+    // a stable fixed point. (Seeding the resident set as well double-charges
+    // the same bytes through a one-frame lag: evictions apply the clamped
+    // target immediately while the loads that justify it arrive a frame
+    // later, so the targets chase their own tail -- evict one frame, reload
+    // the next, forever. Measured, not theorised: 180 loads over 60 static
+    // frames before this comment existed.)
     std::size_t used = 0;
+    for (int i = 1; i < n; ++i) {
+        const Resource& r = impl_->res[std::size_t(i)];
+        if (r.alive && r.in_flight >= 0)
+            used += r.level_bytes[std::size_t(r.in_flight)];
+    }
+    for (const Ready& rd : impl_->ready) used += rd.bytes.size();
     for (const Want& w : wants) {
         Resource& r = impl_->res[std::size_t(w.index)];
         const int levels = int(r.level_bytes.size());
@@ -247,16 +319,25 @@ void Streamer::Update(Vec3 viewer) {
     // moment the viewer moves, and a job for a resource that has since dropped
     // out of the wanted set is work nobody will use.
     impl_->queue.clear();
-    for (const Want& w : wants) {
-        Resource& r = impl_->res[std::size_t(w.index)];
-        if (r.failed || r.in_flight >= 0) continue;
-        if (r.target <= r.resident) continue;
-        // ONE LEVEL at a time, the next one up. Levels are cumulative and the
-        // smaller ones are nearly free, so loading level 0 first puts something
-        // usable on screen while the rest arrives -- jumping straight to the
-        // target means the object is missing for the whole load instead.
-        impl_->queue.push_back(Impl::Job{StreamId{std::uint32_t(w.index)},
-                                         r.resident + 1, r.priority});
+    // BACKPRESSURE. A caller that stopped draining leaves finished bytes
+    // parked in `ready`, already charged above; issuing more work on top of a
+    // full backlog is how the budget becomes advisory. Targets and evictions
+    // above still ran, so the scheduler's decisions stay current -- only new
+    // loads wait for the drain.
+    if (impl_->ready.size() < kMaxReadyLoads) {
+        for (const Want& w : wants) {
+            Resource& r = impl_->res[std::size_t(w.index)];
+            if (r.failed || r.in_flight >= 0) continue;
+            if (r.target <= r.resident) continue;
+            // ONE LEVEL at a time, the next one up. Levels are cumulative and
+            // the smaller ones are nearly free, so loading level 0 first puts
+            // something usable on screen while the rest arrives -- jumping
+            // straight to the target means the object is missing for the whole
+            // load instead.
+            impl_->queue.push_back(
+                Impl::Job{StreamId{std::uint32_t(w.index), r.gen},
+                          r.resident + 1, r.priority});
+        }
     }
     // Ascending, because RunOne takes from the back.
     std::sort(impl_->queue.begin(), impl_->queue.end(),
@@ -298,15 +379,24 @@ void Streamer::Wait() {
                      [this] { return impl_->queue.empty() && impl_->active == 0; });
 }
 
+namespace {
+
+bool Resolves(const std::vector<Resource>& res, StreamId id) {
+    return Valid(id) && id.v < res.size() && res[id.v].alive &&
+           res[id.v].gen == id.gen;
+}
+
+}  // namespace
+
 int Streamer::ResidentLevel(StreamId id) const {
     std::lock_guard<std::mutex> g(impl_->mu);
-    if (!Valid(id) || id.v >= impl_->res.size()) return -1;
+    if (!Resolves(impl_->res, id)) return -1;
     return impl_->res[id.v].resident;
 }
 
 int Streamer::TargetLevel(StreamId id) const {
     std::lock_guard<std::mutex> g(impl_->mu);
-    if (!Valid(id) || id.v >= impl_->res.size()) return -1;
+    if (!Resolves(impl_->res, id)) return -1;
     return impl_->res[id.v].target;
 }
 
@@ -319,7 +409,7 @@ Streamer::Stats Streamer::GetStats() const {
     s.failures = impl_->failures;
     s.in_flight = int(impl_->queue.size()) + impl_->active + int(impl_->ready.size());
     for (std::size_t i = 1; i < impl_->res.size(); ++i)
-        if (impl_->res[i].resident >= 0) ++s.resident;
+        if (impl_->res[i].alive && impl_->res[i].resident >= 0) ++s.resident;
     return s;
 }
 

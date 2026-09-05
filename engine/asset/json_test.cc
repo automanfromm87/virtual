@@ -140,6 +140,35 @@ int main() {
         CHECK(wide.Size() == 5000);
     }
 
+    // --- strict accessors fail loudly on required fields ----------------------
+    {
+        std::printf("strict accessors\n");
+        std::string error;
+        const Value doc =
+            Parse(R"({"name":"fox","count":3,"tags":["a"]})", error);
+        CHECK(error.empty());
+
+        const Value* name = doc.Find("name");
+        CHECK(name != nullptr && name->Str() == "fox");
+        CHECK(doc.Find("missing") == nullptr);
+        CHECK(doc.Find("name") != nullptr);  // present, any type
+        const Value* count = doc.Find("count");
+        CHECK(count != nullptr && count->Int(-1) == 3);
+
+        const Value* out = nullptr;
+        CHECK(doc.At("count", Value::Type::Number, out, error));
+        CHECK(out == count);
+        CHECK(!doc.At("absent", Value::Type::Number, out, error));
+        std::printf("    missing field: \"%s\"\n", error.c_str());
+        CHECK(error.find("absent") != std::string::npos);
+        CHECK(!doc.At("name", Value::Type::Number, out, error));
+        std::printf("    wrong type: \"%s\"\n", error.c_str());
+        CHECK(error.find("name") != std::string::npos &&
+              error.find("number") != std::string::npos);
+        // The lenient path is untouched: optional reads still yield fallbacks.
+        CHECK(doc["absent"].Number(-2.5) == -2.5);
+    }
+
     if (g_failures == 0) std::printf("json_test: all checks passed\n");
     return g_failures == 0 ? 0 : 1;
 }

@@ -1358,15 +1358,6 @@ std::unique_ptr<Swapchain> Device::CreateSwapchain(Format format,
     return sc;
 }
 
-float Device::DisplayHeadroom(const Swapchain& sc) const {
-    if (!sc.impl_->layer.wantsExtendedDynamicRangeContent) return 1.0f;
-    NSScreen* screen = sc.impl_->layer.contentsScale > 0 ? [NSScreen mainScreen] : nil;
-    if (!screen) return 1.0f;
-    const float ratio = float(screen.maximumExtendedDynamicRangeColorComponentValue);
-    // Below 1 is meaningless and 1 means no headroom; both come back as "SDR".
-    return ratio > 1.0f ? ratio : 1.0f;
-}
-
 TextureId Device::AcquireDrawable(Swapchain& sc) { @autoreleasepool {
     // Blocks until a drawable frees up — this is what paces a windowed app to
     // vsync. nil means the frame was dropped.

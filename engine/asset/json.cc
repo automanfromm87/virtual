@@ -27,6 +27,44 @@ bool Value::Has(std::string_view key) const {
     return object_.find(key) != object_.end();
 }
 
+const Value* Value::Find(std::string_view key) const {
+    if (type_ != Type::Object) return nullptr;
+    const auto it = object_.find(key);
+    return it == object_.end() ? nullptr : &it->second;
+}
+
+namespace {
+
+const char* TypeName(Value::Type t) {
+    switch (t) {
+        case Value::Type::Null: return "null";
+        case Value::Type::Bool: return "bool";
+        case Value::Type::Number: return "number";
+        case Value::Type::String: return "string";
+        case Value::Type::Array: return "array";
+        case Value::Type::Object: return "object";
+    }
+    return "unknown";
+}
+
+}  // namespace
+
+bool Value::At(std::string_view key, Type expected, const Value*& out,
+               std::string& error) const {
+    const Value* v = Find(key);
+    if (v == nullptr) {
+        error = "missing required field '" + std::string(key) + "'";
+        return false;
+    }
+    if (v->GetType() != expected) {
+        error = "field '" + std::string(key) + "' must be " +
+                TypeName(expected) + ", got " + TypeName(v->GetType());
+        return false;
+    }
+    out = v;
+    return true;
+}
+
 class Parser {
   public:
     Parser(std::string_view text, std::string& error) : s_(text), error_(error) {}

@@ -457,8 +457,20 @@ struct Renderer::Impl {
     int shadow_overflowed = 0;
     int shadow_map_size = Renderer::kDirectionalShadowSize;
     // Reused across frames so a steady-state frame allocates nothing.
+    // Capacities are established once in Renderer::Create (see the reserve
+    // block there): every push_back below must be into capacity that already
+    // exists, or the frame pays a reallocation exactly when the scene is
+    // biggest.
     std::vector<DrawItem> visible;
     std::vector<int> draw_order;
+    // Scratch world-space bounds spheres, 1:1 with scene.instances, xyz =
+    // centre and w = radius. w < 0 marks an entry the shadow passes must not
+    // cull on (invalid mesh, or a skinned caster whose bind-pose bounds the
+    // pose may have left). Refilled by FillWorldSpheres once per shadow pass
+    // and reused across every cascade/face, so the model-matrix multiply and
+    // MaxScale happen once per instance instead of once per cascade per face.
+    std::vector<Vec4> world_spheres;
+    void FillWorldSpheres(const Scene& scene);
 
     // Bump allocator inside the current frame's ring slot. Multiple Draw* calls
     // in one frame must each get their own slice, or the second would overwrite
@@ -1435,6 +1447,16 @@ std::unique_ptr<Renderer> Renderer::Create(rhi::Device& dev, rhi::Format color,
         error = "failed to allocate the uniform ring buffer";
         return nullptr;
     }
+
+    // Frame-scratch capacities, established once so the frame loop never
+    // grows. kMaxInstancesPerFrame bounds every one of these lists: visible
+    // and draw_order hold at most one entry per instance, world_spheres is
+    // 1:1 with the instances, and the cull mask below matches them.
+    r->impl_->visible.reserve(Renderer::kMaxInstancesPerFrame);
+    r->impl_->draw_order.reserve(Renderer::kMaxInstancesPerFrame);
+    r->impl_->world_spheres.reserve(Renderer::kMaxInstancesPerFrame);
+    r->impl_->batched_mask.reserve(Renderer::kMaxInstancesPerFrame);
+    r->impl_->cull_keys.reserve(256);
     return r;
 }
 
@@ -1446,11 +1468,39 @@ void Renderer::SetShadowMapSize(int size) {
 }
 int Renderer::ShadowMapSize() const { return impl_->shadow_map_size; }
 
+// World-space bounds spheres for every instance, computed ONCE per shadow
+// pass. Both shadow passes used to rebuild each sphere inside their innermost
+// loop -- once per cascade (up to 4x) in DrawShadow, once per light face (up
+// to 16 tiles x instances) in DrawLightShadows -- for a matrix multiply and a
+// MaxScale that do not depend on the cascade or the face at all.
+void Renderer::Impl::FillWorldSpheres(const Scene& scene) {
+    world_spheres.resize(scene.instances.size());
+    for (std::size_t n = 0; n < scene.instances.size(); ++n) {
+        const Instance& inst = scene.instances[n];
+        if (!Valid(inst.mesh) || inst.mesh.v >= meshes.size()) {
+            world_spheres[n] = Vec4{0.0f, 0.0f, 0.0f, -1.0f};
+            continue;
+        }
+        const GpuMesh& gm = meshes[inst.mesh.v];
+        // Same exemption as the passes themselves: gm.bounds is the BIND pose
+        // and a pose may leave it, so a skinned caster is never culled on it.
+        if (IsSkinned(gm, inst, scene)) {
+            world_spheres[n] = Vec4{0.0f, 0.0f, 0.0f, -1.0f};
+            continue;
+        }
+        const Vec4 bc = inst.model * Vec4{gm.bounds.center.x, gm.bounds.center.y,
+                                          gm.bounds.center.z, 1.0f};
+        world_spheres[n] = Vec4{bc.x, bc.y, bc.z,
+                                gm.bounds.radius * MaxScale(inst.model)};
+    }
+}
+
 void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
     impl_->shadow_draws = 0;
     impl_->shadow_culled = 0;
     impl_->shadow_overflowed = 0;
     if (scene.shadowExtent <= 0.0f) return;
+    impl_->FillWorldSpheres(scene);
     // Cascades tile the map. One cascade uses the whole thing, which is the
     // behaviour this had before they existed.
     const int cascades = std::clamp(scene.shadowCascades, 1, 4);
@@ -1526,9 +1576,10 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
 
         const GpuMesh& gm = impl_->meshes[inst.mesh.v];
         const bool skinned = IsSkinned(gm, inst, scene);
-        // Object-space bounds into world space, the same way the camera cull
-        // does it: the bounds are a sphere precisely so that a transform is a
-        // moved centre and a scaled radius, with no re-fitting.
+        // Bounds come from the per-pass table, not from a matrix multiply
+        // here: this body runs once per cascade and the sphere does not depend
+        // on the cascade. w < 0 is the skinned/invalid sentinel, which is
+        // exactly the set the old !skinned test exempted.
         //
         // NOT FOR A SKINNED CASTER. gm.bounds is the BIND pose, and a pose is
         // free to leave it -- an arm raised over the head is outside the bounds
@@ -1536,12 +1587,10 @@ void Renderer::DrawShadow(rhi::Encoder& enc, const Scene& scene) {
         // the cascade, and the symptom is a shadow that blinks out at one point
         // in an animation. Skinned instances are a handful next to the statics
         // this test exists to reject, so exempting them costs nothing.
-        if (!skinned) {
-            const Vec4 bc = inst.model * Vec4{gm.bounds.center.x, gm.bounds.center.y,
-                                              gm.bounds.center.z, 1.0f};
+        const Vec4& sphere = impl_->world_spheres[n];
+        if (sphere.w >= 0.0f) {
             if (!light_frustum.IntersectsSphere(
-                    Vec3{bc.x, bc.y, bc.z},
-                    gm.bounds.radius * MaxScale(inst.model))) {
+                    Vec3{sphere.x, sphere.y, sphere.z}, sphere.w)) {
                 ++impl_->shadow_culled;
                 continue;
             }
@@ -1606,6 +1655,9 @@ void Renderer::DrawLightShadows(rhi::Encoder& enc, const Scene& scene) {
     impl_->shadow_tile_of_light.assign(scene.lights.size(), -1);
     impl_->shadow_tiles_used = 0;
     if (!Valid(ShadowAtlas())) return;
+    // Once for the whole atlas, not once per face: the face loop below runs up
+    // to 16 tiles x instances and the sphere is face-independent.
+    impl_->FillWorldSpheres(scene);
 
     constexpr int kTile = kShadowAtlasSize / kShadowTilesPerSide;
     enc.SetPipeline(impl_->shadow);
@@ -1662,7 +1714,8 @@ void Renderer::DrawLightShadows(rhi::Encoder& enc, const Scene& scene) {
             }
             enc.SetVertexBuffer(impl_->uniforms, pass_offset, kUniformSlot);
             enc.SetFragmentBuffer(impl_->uniforms, pass_offset, kUniformSlot);
-            for (const Instance& inst : scene.instances) {
+            for (std::size_t n = 0; n < scene.instances.size(); ++n) {
+                const Instance& inst = scene.instances[n];
                 if (!Valid(inst.mesh) || inst.mesh.v >= impl_->meshes.size()) continue;
                 if (Valid(inst.material) && inst.material.v < impl_->materials.size() &&
                     impl_->materials[inst.material.v].transparent)
@@ -1671,13 +1724,12 @@ void Renderer::DrawLightShadows(rhi::Encoder& enc, const Scene& scene) {
                 const bool skinned = IsSkinned(gm, inst, scene);
                 // Skinned casters exempt for the same reason as the sun's
                 // cascades: gm.bounds is the bind pose and a pose may leave it.
-                if (!skinned) {
-                    const Vec4 bc = inst.model * Vec4{gm.bounds.center.x,
-                                                      gm.bounds.center.y,
-                                                      gm.bounds.center.z, 1.0f};
+                // The sphere is the per-pass table entry (w < 0 sentinel covers
+                // exactly the skinned/invalid set), not a multiply here.
+                const Vec4& sphere = impl_->world_spheres[n];
+                if (sphere.w >= 0.0f) {
                     if (!face_frustum.IntersectsSphere(
-                            Vec3{bc.x, bc.y, bc.z},
-                            gm.bounds.radius * MaxScale(inst.model))) {
+                            Vec3{sphere.x, sphere.y, sphere.z}, sphere.w)) {
                         ++impl_->shadow_culled;
                         continue;
                     }
@@ -1974,12 +2026,22 @@ void Renderer::Impl::DrawGeometry(rhi::Encoder& enc, const Scene& scene,
     //  * Transparent: strictly BACK-TO-FRONT, and only after every opaque
     //    object. Blending is not commutative, so here the order IS the result —
     //    and with depth writes off there is nothing else to sort it out.
-    std::sort(visible.begin(), visible.end(),
+    //
+    // Partitioned first so each range sorts under ONE rule: the old single
+    // comparator dragged every opaque item through the transparent branch's
+    // depth comparisons (and vice versa), paying O(N log N) over the union
+    // for what are two independent orders.
+    const auto opaque_end = std::partition(
+        visible.begin(), visible.end(),
+        [](const DrawItem& item) { return !item.transparent; });
+    std::sort(visible.begin(), opaque_end,
               [](const DrawItem& a, const DrawItem& b) {
-                  if (a.transparent != b.transparent) return b.transparent;
-                  if (a.transparent) return a.depth > b.depth;  // far first
                   if (a.pipeline != b.pipeline) return a.pipeline < b.pipeline;
                   return a.depth < b.depth;
+              });
+    std::sort(opaque_end, visible.end(),
+              [](const DrawItem& a, const DrawItem& b) {
+                  return a.depth > b.depth;  // far first
               });
 
     // --- submit --------------------------------------------------------------
@@ -2394,8 +2456,10 @@ void Renderer::DrawDeferredLight(rhi::Encoder& enc, const Scene& scene,
                         scene.ambientSky.z, 0.0f};
     u.ambientGround = Vec4{scene.ambientGround.x, scene.ambientGround.y,
                            scene.ambientGround.z, 0.0f};
-    // No material here: a fullscreen lighting pass reads the G-buffer,
-    // and emission was already added by the pass that wrote it.
+    // No material here: a fullscreen lighting pass reads the G-buffer, which
+    // has no emission channel -- an emissive surface goes dark in deferred
+    // (see the DrawGBuffer contract in renderer.h) and must be drawn forward
+    // afterwards. Zero here so the lighting pass adds nothing of its own.
     u.emissive = Vec4{0.0f, 0.0f, 0.0f, 1.0f};
     u.giOrigin = impl_->gi_origin;
     u.giSpacing = impl_->gi_spacing;

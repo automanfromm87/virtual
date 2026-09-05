@@ -5,6 +5,7 @@
 // for every input luminance, and extended-range linear has an exact answer too:
 // it is the identity below the roll-off. Those are what get checked.
 #include "engine/geometry/mesh.h"
+#include "engine/platform/window.h"
 #include "engine/render/renderer.h"
 #include "engine/rhi/rhi.h"
 #include "engine/scene/scene.h"
@@ -277,7 +278,8 @@ int main() {
         Check(good != nullptr, "and a half-float one is accepted");
         if (good)
             std::printf("    this display's headroom: %.2fx reference white\n",
-                        double(dev->DisplayHeadroom(*good)));
+                        double(eng::platform::DisplayHeadroom(
+                            good->NativeLayer())));
     }
 
     std::printf(g_failures == 0 ? "\nhdr_test: all checks passed\n"

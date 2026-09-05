@@ -47,6 +47,18 @@ class Value {
     [[nodiscard]] const Value& operator[](std::string_view key) const;
     [[nodiscard]] bool Has(std::string_view key) const;
 
+    // Strict accessors for REQUIRED fields. The lenient operator[] above is
+    // for optional glTF fields; a required field read through it silently
+    // yields Null/0/false on a malformed file and the failure surfaces ten
+    // calls later as wrong geometry. These fail loudly at the read site.
+    // Returns a pointer to the member, or nullptr when the key is missing
+    // (or this value is not an object at all).
+    [[nodiscard]] const Value* Find(std::string_view key) const;
+    // Required-field read: fills `error` and returns false when the key is
+    // missing or has the wrong type. `expected` names the type for the message.
+    [[nodiscard]] bool At(std::string_view key, Type expected,
+                          const Value*& out, std::string& error) const;
+
   private:
     friend class Parser;
     friend Value Parse(std::string_view, std::string&);

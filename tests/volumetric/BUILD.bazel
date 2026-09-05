@@ -6,6 +6,8 @@ package(default_visibility = ["//visibility:public"])
 # replaces cannot do: a shaft, a glow, and forward scattering.
 cc_test(
     name = "volumetric_test",
+    tags = ["exclusive"],
+    target_compatible_with = ["@platforms//os:macos"],
     srcs = ["main.cpp"],
     deps = [
         "//engine/geometry",

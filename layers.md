@@ -18,7 +18,7 @@
 
 | 层 | 一句话 | 比如 |
 |---|---|---|
-| L6 产品与集成 | 这个程序要**组合**哪些系统？ | `apps/world2` 把 terrain + nav + sky + fog 装到一起 |
+| L6 产品与集成 | 这个程序要**组合**哪些系统？ | `apps/world` 把 terrain + nav + sky + fog 装到一起 |
 | L5 运行时宿主 | 怎样**启动并持续推进**一帧？ | window、swapchain、帧循环、input、clock |
 | L4 帧渲染 | 一帧**画什么、pass 什么顺序**？ | renderer、IBL、post、rendergraph、volumetrics |
 | L3 内容与离线组合 | 多个领域的数据怎样**导入、烘焙、打包**？ | glTF 导入、资源包、GI 烘焙、场景存档 |

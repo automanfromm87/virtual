@@ -67,6 +67,12 @@ enum class Filter : std::uint8_t { Nearest, Linear };
 enum class Wrap : std::uint8_t { Clamp, Repeat };
 
 // Opaque handles. 0 is always the null handle — never a valid resource.
+//
+// Same append-only contract as engine/resource/handles.h: the device's tables
+// grow and never shrink or reorder, so an index always names the same GPU
+// object and a stale handle fails a bounds check rather than aliasing another
+// object. No destroy API exists, so no generation counting is needed; adding
+// one would require generation-counting these with it.
 struct BufferId {
     std::uint32_t v = 0;
 };
@@ -686,12 +692,6 @@ class Device {
     [[nodiscard]] std::unique_ptr<Swapchain> CreateSwapchain(Format,
                                                              std::string& error,
                                                              bool hdr = false);
-    // What the display can actually do, as a multiple of reference white, or 1
-    // when there is no extended range. Read it rather than assuming: the same
-    // machine reports a different headroom depending on the display, the
-    // brightness setting and whether it is on battery.
-    [[nodiscard]] float DisplayHeadroom(const Swapchain&) const;
-
     // --- submission ----------------------------------------------------------
     // Returns a null handle when no drawable is available; skip the frame.
     [[nodiscard]] TextureId AcquireDrawable(Swapchain&);

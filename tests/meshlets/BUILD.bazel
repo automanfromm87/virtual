@@ -6,6 +6,8 @@ package(default_visibility = ["//visibility:public"])
 # stage draws the same picture and that the culling culls.
 cc_test(
     name = "meshlet_render_test",
+    tags = ["exclusive"],
+    target_compatible_with = ["@platforms//os:macos"],
     srcs = ["main.cpp"],
     deps = [
         "//engine/geometry",

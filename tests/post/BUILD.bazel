@@ -6,6 +6,8 @@ package(default_visibility = ["//visibility:public"])
 # changes the whole image, so any of them can hide any other being wrong.
 cc_test(
     name = "post_test",
+    tags = ["exclusive"],
+    target_compatible_with = ["@platforms//os:macos"],
     srcs = ["offscreen.cpp"],
     deps = [
         "//engine/geometry",

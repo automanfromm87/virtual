@@ -17,10 +17,18 @@
 #include "engine/app/actions.h"
 #include "engine/app/clock.h"
 #include "engine/app/targets.h"
-#include "engine/render/renderer.h"
 #include "engine/rhi/rhi.h"
 
-namespace eng::app {
+namespace eng {
+
+// Forward-declared on purpose: the renderer is L4 and this host is L5, so the
+// host must not include the renderer's header. Only references cross this
+// boundary (Draw() returns Renderer&); app.cc includes the full header where
+// the calls actually happen. (rhi.h above is fine -- the RHI is L0 shared
+// vocabulary, same as the math types.)
+class Renderer;
+
+namespace app {
 
 struct Config {
     std::string title = "virtual";
@@ -122,4 +130,5 @@ class App {
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace eng::app
+}  // namespace app
+}  // namespace eng

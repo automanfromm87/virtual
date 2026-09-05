@@ -6,9 +6,12 @@ package(default_visibility = ["//visibility:public"])
 # brighter". PQ has an exact answer for every input luminance.
 cc_test(
     name = "hdr_test",
+    tags = ["exclusive"],
+    target_compatible_with = ["@platforms//os:macos"],
     srcs = ["main.cpp"],
     deps = [
         "//engine/geometry",
+        "//engine/platform",
         "//engine/render",
         "//engine/rhi",
         "//engine/scene",

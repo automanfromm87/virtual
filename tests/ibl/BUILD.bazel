@@ -6,6 +6,8 @@ package(default_visibility = ["//visibility:public"])
 # furnace has an exact expected result at every stage; a picture does not.
 cc_test(
     name = "ibl_test",
+    tags = ["exclusive"],
+    target_compatible_with = ["@platforms//os:macos"],
     srcs = ["offscreen.cpp"],
     deps = [
         "//engine/geometry",

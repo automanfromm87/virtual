@@ -364,6 +364,51 @@ int main() {
         Check(sync_bytes == par_bytes, "down to the byte");
     }
 
+    {
+        std::printf("\nRemove recycles the slot and retires the id\n");
+        StreamConfig cfg;
+        cfg.threads = 0;
+        cfg.budget = 1024 * 1024;
+        auto s = Streamer::Create(cfg, loader);
+        const std::vector<std::size_t> levels = MipLevels(3, 1024);
+        StreamId a = s->Add(Vec3{0.0f, 0.0f, 0.0f}, 4.0f, levels);
+        Check(Valid(a), "Add hands out a valid id");
+        s->Update(Vec3{1.0f, 0.0f, 0.0f});
+        DrainAll(*s);
+        Check(s->ResidentLevel(a) >= 0, "and it becomes resident");
+        const std::size_t bytes_before = s->GetStats().resident_bytes;
+        Check(bytes_before > 0, "holding real bytes");
+
+        Check(s->Remove(a), "Remove reports success");
+        Check(!s->Remove(a), "removing it twice reports failure");
+        Check(s->ResidentLevel(a) == -1, "the old id stops resolving");
+        Check(s->TargetLevel(a) == -1, "for both level queries");
+        Check(s->GetStats().resident_bytes < bytes_before,
+              "and its bytes are freed");
+
+        StreamId b = s->Add(Vec3{0.0f, 0.0f, 0.0f}, 4.0f, levels);
+        Check(b.v == a.v && b.gen != a.gen,
+              "the slot is recycled with a new generation");
+        Check(s->ResidentLevel(a) == -1,
+              "so the retired id cannot alias the new resource");
+        s->Update(Vec3{1.0f, 0.0f, 0.0f});
+        DrainAll(*s);
+        Check(s->ResidentLevel(b) >= 0, "and the new id resolves normally");
+    }
+
+    {
+        std::printf("\nan oversized resource is refused at Add\n");
+        StreamConfig cfg;
+        cfg.threads = 0;
+        cfg.budget = 64 * 1024;
+        auto s = Streamer::Create(cfg, loader);
+        // Level 0 alone is already twice the budget: it could never settle.
+        const std::vector<std::size_t> huge = {128 * 1024, 128 * 1024};
+        StreamId big = s->Add(Vec3{0.0f, 0.0f, 0.0f}, 4.0f, huge);
+        Check(!Valid(big), "Add returns an invalid id");
+        Check(s->ResidentLevel(big) == -1, "which resolves to nothing");
+    }
+
     std::printf(g_failures == 0 ? "\nstream_test: all checks passed\n"
                                 : "\nstream_test: %d FAILED\n",
                 g_failures);

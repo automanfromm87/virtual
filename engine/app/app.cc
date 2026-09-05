@@ -3,6 +3,7 @@
 #include <chrono>
 
 #include "engine/platform/window.h"
+#include "engine/render/renderer.h"
 
 namespace eng::app {
 namespace {
@@ -45,17 +46,26 @@ std::unique_ptr<App> App::Create(const Config& config, std::string& error) {
     Impl& s = *app->impl_;
 
     s.device = rhi::Device::Create(error);
-    if (!s.device) return nullptr;
+    if (!s.device) {
+        if (error.empty()) error = "App: GPU device creation failed";
+        return nullptr;
+    }
     s.headless = config.headless;
     s.fixed_dt = config.fixed_dt;
     s.width = config.width;
     s.height = config.height;
     if (!s.headless) {
         s.swapchain = s.device->CreateSwapchain(config.color, error);
-        if (!s.swapchain) return nullptr;
+        if (!s.swapchain) {
+            if (error.empty()) error = "App: swapchain creation failed";
+            return nullptr;
+        }
         s.window = platform::Window::Create(config.title.c_str(), config.width,
                                             config.height, error);
-        if (!s.window) return nullptr;
+        if (!s.window) {
+            if (error.empty()) error = "App: window creation failed";
+            return nullptr;
+        }
         s.window->HostLayer(s.swapchain->NativeLayer());
         s.swapchain->Resize(s.window->FramebufferWidth(),
                             s.window->FramebufferHeight());
@@ -64,7 +74,10 @@ std::unique_ptr<App> App::Create(const Config& config, std::string& error) {
     }
 
     s.renderer = Renderer::Create(*s.device, config.color, error, config.samples);
-    if (!s.renderer) return nullptr;
+    if (!s.renderer) {
+        if (error.empty()) error = "App: renderer creation failed";
+        return nullptr;
+    }
     s.targets = std::make_unique<FrameTargets>(*s.device, config.color,
                                                config.samples);
     s.clock.max_dt = config.max_dt;

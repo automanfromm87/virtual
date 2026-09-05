@@ -6,6 +6,8 @@ package(default_visibility = ["//visibility:public"])
 # Each is checked by the quantity it is supposed to move, not by a screenshot.
 cc_test(
     name = "surface_test",
+    tags = ["exclusive"],
+    target_compatible_with = ["@platforms//os:macos"],
     srcs = ["main.cpp"],
     deps = [
         "//engine/asset:png",

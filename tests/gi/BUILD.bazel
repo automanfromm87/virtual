@@ -6,6 +6,8 @@ package(default_visibility = ["//visibility:public"])
 # the screen, which is a different claim and a different set of mistakes.
 cc_test(
     name = "gi_render_test",
+    tags = ["exclusive"],
+    target_compatible_with = ["@platforms//os:macos"],
     srcs = ["main.cpp"],
     deps = [
         "//engine/geometry",
