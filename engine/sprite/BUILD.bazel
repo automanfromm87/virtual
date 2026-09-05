@@ -1,0 +1,22 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# 2D sprites, phase 1 of the 2D gameplay set. Pure C++20: quads in, quads
+# out, no GPU types -- uploading and drawing belong to a later phase.
+cc_library(
+    name = "sprite",
+    srcs = ["sprite.cc"],
+    hdrs = ["sprite.h"],
+    deps = [
+        "//engine/core",
+        "//engine/geometry",
+        "//engine/shaders",
+    ],
+)
+
+cc_test(
+    name = "sprite_test",
+    srcs = ["sprite_test.cc"],
+    deps = [":sprite"],
+)
