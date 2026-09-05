@@ -210,6 +210,10 @@ int main(int argc, char** argv) {
     float shaft_ext = 0.004f;
     int tour_start = 0;
     float headless_walk = 0.0f, headless_heading = 0.0f;
+    // A synthetic click for headless captures: walks the click path (and
+    // shows the marker) with no window. Same FindPath call as a real click.
+    float click_x = 0.0f, click_z = 0.0f;
+    bool click_set = false;
     bool no_foot_ik = false;
     float pitch_start = 0.26f;
     float focus_start = 1.0f;
@@ -356,6 +360,11 @@ int main(int argc, char** argv) {
             no_foot_ik = true;
         else if (std::strcmp(argv[i], "--walk") == 0)
             headless_walk = world::kWalkSpeed;
+        else if (std::strcmp(argv[i], "--click") == 0 && i + 2 < argc) {
+            click_x = float(std::atof(argv[++i]));
+            click_z = float(std::atof(argv[++i]));
+            click_set = true;
+        }
         else if (std::strcmp(argv[i], "--run") == 0)
             headless_walk = world::kRunSpeed;
         else if (std::strcmp(argv[i], "--heading") == 0 && i + 1 < argc)
@@ -1435,6 +1444,11 @@ int main(int argc, char** argv) {
     // boulder; CullScene puts the whole lot into one batch and the scene pass
     // draws it with one indirect draw. Fixed seed, so --crowd 600 looks the
     // same every run and screenshots compare.
+    // Every visual boulder's body, for the self-check below: spheres skip
+    // the downward probe (a half-buried ball cannot be exited by moving
+    // down), so their guarantee is structural -- one sphere each, matched.
+    std::vector<int> boulder_bodies;
+    std::vector<float> boulder_radii;
     if (crowd_count > 0) {
         eng::MaterialDesc crowd_md;
         crowd_md.shading = eng::Shading::Lit;
@@ -1492,6 +1506,16 @@ int main(int argc, char** argv) {
             const float shade = 0.82f + 0.30f * unit(rng);
             b.tint = eng::Vec4{shade, shade, shade * 0.99f, 1.0f};
             scene.instances.push_back(b);
+            // And SOLID, which they never were: six hundred visual boulders
+            // with no bodies is a field the character walks straight through.
+            // A sphere per boulder -- the rock is a metre-ish lump, and a
+            // capsule would only matter for something tall enough to tip over.
+            eng::physics::Body cb;
+            cb.shape = eng::physics::Shape::MakeSphere(0.5f * s);
+            cb.position = eng::Vec3{x, ground + yoff + 0.4f * s, z};
+            cb.SetMass(0.0f);
+            boulder_bodies.push_back(world.Add(cb));
+            boulder_radii.push_back(0.5f * s);
         }
         std::printf("crowd: %d boulders\n", crowd_count);
     }
@@ -1698,15 +1722,20 @@ int main(int argc, char** argv) {
     const std::initializer_list<const eng::anim::FootIkConfig*> kBothFeet{&ik_left, &ik_right};
     const std::initializer_list<const eng::anim::FootIkConfig*> kNoFeet{};
 
-    // A marker at the destination, so a click has visible feedback even before
-    // the character starts moving.
+    // A marker at the destination: a flat disc pinned to the ground, not the
+    // floating green ball it was -- a ball at knee height reads as a second
+    // character standing where you clicked. It shrinks as the character
+    // closes in and parks underground on arrival (see the frame loop).
     eng::MaterialDesc marker_md;
     marker_md.shading = eng::Shading::Lit;
-    marker_md.base_color = eng::Vec4{0.2f, 0.9f, 0.4f, 1.0f};
-    marker_md.roughness = 0.3f;
+    marker_md.base_color = eng::Vec4{0.35f, 1.0f, 0.55f, 1.0f};
+    marker_md.emissive = eng::Vec3{0.10f, 0.35f, 0.15f};
+    marker_md.roughness = 0.4f;
     const eng::MaterialHandle marker_mat = app->Draw().CreateMaterial(marker_md, error);
+    const eng::MeshHandle marker_disc = app->Draw().UploadMesh(
+        eng::MakeBox(eng::Vec3{0.45f, 0.03f, 0.45f}, eng::Vec4{1, 1, 1, 1}));
     eng::Instance marker;
-    marker.mesh = capsule_mesh;
+    marker.mesh = eng::Valid(marker_disc) ? marker_disc : capsule_mesh;
     marker.material = marker_mat;
     const std::size_t marker_instance = scene.instances.size();
     scene.instances.push_back(marker);
@@ -1762,6 +1791,15 @@ int main(int argc, char** argv) {
         int tested = 0, stuck = 0, phantom = 0;
         const int n = world.Count();
         for (int i = 1; i < n; ++i) {
+            // Boulders skip the downward probe: a sphere half-buried in the
+            // ground cannot be exited by moving down, and sideways escape is
+            // what walking does. Spheres blocking a character is covered by
+            // engine/physics/heightfield_test.cc; what THIS scene must
+            // guarantee is that every visual boulder has its body, which the
+            // structural check after the loop asserts.
+            if (std::find(boulder_bodies.begin(), boulder_bodies.end(), i) !=
+                boulder_bodies.end())
+                continue;
             const eng::physics::Body& body = world[i];
             const float ground = terrain.HeightAt(body.position.x, body.position.z);
             // Out of a walking character's reach -- a lantern four metres up is
@@ -1873,6 +1911,15 @@ int main(int argc, char** argv) {
                         std::atan(raw_worst) * 180.0f / world::kPi,
                         cc.slope_limit_degrees, blocked);
         }
+        int boulder_bad = 0;
+        for (std::size_t k = 0; k < boulder_bodies.size(); ++k) {
+            const eng::physics::Body& b = world[boulder_bodies[k]];
+            if (b.shape.type != eng::physics::ShapeType::Sphere ||
+                std::fabs(b.shape.radius - boulder_radii[k]) > 1e-4f)
+                ++boulder_bad;
+        }
+        std::printf("  %zu boulder bodies, %d mismatched\n", boulder_bodies.size(),
+                    boulder_bad);
         std::printf("  stood inside %d of the world's %d bodies: %d did not push "
                     "back, %d were not where they claim to be\n", tested, n, stuck,
                     phantom);
@@ -2216,6 +2263,20 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // On the first EXECUTED frame, not f.index == 0: BeginFrame swallows
+        // the first frames at startup, so by the time this body runs the
+        // index has already moved on.
+        if (click_set && navmesh.Valid()) {
+            click_set = false;
+            const eng::Vec3 hit{click_x, terrain.HeightAt(click_x, click_z), click_z};
+            std::vector<eng::Vec3> found;
+            if (navmesh.FindPath(player.Feet(), hit, &found) && found.size() > 1) {
+                path = found;
+                path_at = 1;
+            }
+            std::printf("click: %s (%zu points)\n", path.empty() ? "no path" : "path set",
+                        path.size());
+        }
 
         // --- movement ---------------------------------------------------------
         //
@@ -2470,11 +2531,24 @@ int main(int argc, char** argv) {
             scene.instances[body_instance].palette = 0;
             scene.instances[body_instance].model = to_world;
         }
+        bool marker_shown = false;
         if (path_at < path.size()) {
-            scene.instances[marker_instance].model =
-                eng::Mat4::Translation(path.back() + eng::Vec3{0.0f, 0.45f, 0.0f}) *
-                eng::Mat4::Scale(0.6f);
-        } else {
+            const eng::Vec3& target = path.back();
+            const float dist =
+                eng::Length(eng::Vec3{target.x - player.Feet().x, 0.0f,
+                                      target.z - player.Feet().z});
+            if (dist >= 0.6f) {
+                const float s = std::clamp(dist * 0.12f, 0.25f, 0.7f);
+                scene.instances[marker_instance].model =
+                    eng::Mat4::Translation(
+                        eng::Vec3{target.x,
+                                  terrain.HeightAt(target.x, target.z) + 0.04f,
+                                  target.z}) *
+                    eng::Mat4::Scale(s);
+                marker_shown = true;
+            }
+        }
+        if (!marker_shown) {
             // Parked underground rather than removed: the instance list's
             // indices are held by everything above, and compacting it would
             // invalidate them.
