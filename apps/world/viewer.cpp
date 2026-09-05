@@ -318,6 +318,8 @@ int main(int argc, char** argv) {
             fox_path = argv[++i];
         else if (std::strcmp(argv[i], "--rock") == 0 && i + 1 < argc)
             rock_path = argv[++i];
+        else if (std::strcmp(argv[i], "--rock2") == 0 && i + 1 < argc)
+            rock_path2 = argv[++i];
         else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
             shot_frames = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--nofog") == 0) start_fog = false;
